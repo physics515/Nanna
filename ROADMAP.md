@@ -2999,6 +2999,30 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   `0.0658` at index 19 and `0.1542` at index 20) — settle that against `rs-fsrs`
                   source before touching anything. Source:
                   [FSRS algorithm wiki](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
+                  *(2026-09-20)* **Decided, and it is the second option — with the missing fact
+                  that makes it the right one: 13 of the 21 weights are not read by anything.**
+                  The item offered "adopt FSRS-6's table with an A/B" or "rename the constant and
+                  its doc to say what the table actually is", and an A/B is meaningless for a
+                  parameter nothing consumes. Measured rather than grepped: new
+                  `only_the_live_weights_change_any_fsrs_output` sets each slot in turn to a probe
+                  value and fingerprints every number `FsrsParameters` can influence — the five
+                  read-only scores plus the stability and difficulty `record_access` produces for
+                  all four ratings. Exactly **`w6..=w12` and `w20`** move anything; `w0..=w5` and
+                  `w13..=w19` move nothing, including the non-zero `w0 = 0.4072` and
+                  `w16 = 2.2035` that make the table look live. So the six zeroed entries were
+                  never the anomaly — they sit in the same dead range as six non-zero ones.
+                  Fixed the honest way: the module heading no longer claims to be "an FSRS-6
+                  implementation" (what is borrowed is FSRS-6's **power-law forgetting curve**,
+                  which is precisely why `w20`'s published constant transfers and the rest do not —
+                  the stability/difficulty updates are Nanna's own, because FSRS schedules graded
+                  study reviews and this schedules decay under incidental recall), and the struct
+                  doc now states the dead set and points at the test. Deliberately **not** deleted:
+                  the slot *numbering* is FSRS's, and renumbering would make every reference to
+                  "w20" ambiguous against the published algorithm.
+                  Verified the guard bites — claiming `w16` is live makes it fail and print both
+                  the live and dead sets. Same class as the "dead fields that look like features"
+                  ledger below: a public, serializable surface that reads as configuration and
+                  configures nothing.
             *(2026-07-24)* **Proven, not just read — `crates/nanna-storage/tests/vector_functions.rs`.**
             A registered SQL function is not a working one, and this decision is too load-bearing to rest
             on a source grep, so 3 tests now assert it end to end through the pinned dependency:

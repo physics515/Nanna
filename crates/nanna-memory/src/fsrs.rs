@@ -1,7 +1,21 @@
-//! FSRS-6 (Free Spaced Repetition Scheduler) implementation
+//! Cognitive memory decay, in FSRS's *shape* — not an FSRS-6 implementation.
 //!
-//! Based on the FSRS-6 algorithm: <https://github.com/open-spaced-repetition/fsrs4anki>
-//! Power law forgetting curve optimized on 700M+ Anki reviews.
+//! The heading this module carried for a long time said "FSRS-6 implementation,
+//! based on the FSRS-6 algorithm", and that overclaimed in a way that made the
+//! weight table below look like a transcription bug. What is actually borrowed
+//! is FSRS-6's **power-law forgetting curve**, `R(t, S) = (1 + factor*t/S)^-decay`
+//! — the one formula whose published constant therefore transfers directly, and
+//! the reason `w20` carries FSRS-6's decay while the rest of the table does not.
+//! See <https://github.com/open-spaced-repetition/fsrs4anki> for the real thing.
+//!
+//! The stability and difficulty updates are Nanna's own: FSRS schedules *study
+//! reviews* of cards a person grades, while this schedules the decay of
+//! memories whose "review" is an incidental recall. Same curve, different
+//! update rules — so FSRS's fitted weights for those rules are not this
+//! module's to adopt, and the ones sitting in [`FsrsParameters`] unread are
+//! evidence of that history rather than of a table waiting to be finished.
+//! `only_the_live_weights_change_any_fsrs_output` pins exactly which eight of
+//! the twenty-one are wired to anything.
 //!
 //! Key concepts:
 //! - Stability (S): Time (in days) for retrievability to drop to 90%
@@ -14,11 +28,22 @@ use serde::{Deserialize, Serialize};
 /// The 21 FSRS weights, in FSRS-6's slot order.
 ///
 /// [`Default`] is **not** FSRS-6's published weight table — only `w20` is (see
-/// its field doc). The rest are FSRS-5 values with six slots zeroed, and only
-/// `w6..=w12` and `w20` are read at all. Adopting the published table for the
-/// others is an open decision (ROADMAP P13), not an oversight: Nanna's
-/// stability update is not FSRS's, so transcribing its constants into a
-/// differently-shaped formula would be cargo-culting, not correctness.
+/// its field doc). The rest are FSRS-5 values with six slots zeroed.
+///
+/// **Only eight slots are read by anything: `w6..=w12` and `w20`.** The other
+/// thirteen are public, serializable fields that look like tuning knobs and
+/// turn nothing — and several are non-zero (`w0 = 0.4072`, `w16 = 2.2035`),
+/// which is what makes the appearance convincing. That is measured, not
+/// asserted: `only_the_live_weights_change_any_fsrs_output` perturbs every
+/// slot and checks whether any observable number moves, so this doc cannot go
+/// stale without a test failing.
+///
+/// They are kept rather than deleted because the slot *order* is FSRS's and
+/// renumbering it would make every reference to "w20" ambiguous against the
+/// published algorithm. Adopting the published table for the unread ones is an
+/// open decision (ROADMAP P13), not an oversight: Nanna's stability update is
+/// not FSRS's, so transcribing its constants into a differently-shaped formula
+/// would be cargo-culting, not correctness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsrsParameters {
     /// Initial stability for first review (w0-w3 for different ratings)
@@ -400,6 +425,159 @@ mod tests {
         assert_eq!(MemoryState::from_accessibility(0.5), MemoryState::Dormant);
         assert_eq!(MemoryState::from_accessibility(0.2), MemoryState::Silent);
         assert_eq!(MemoryState::from_accessibility(0.05), MemoryState::Unavailable);
+    }
+
+    /// The weight slots this crate's formulas actually read.
+    ///
+    /// Not a grep result — [`only_the_live_weights_change_any_fsrs_output`]
+    /// re-derives it behaviourally on every run.
+    const LIVE_WEIGHT_SLOTS: [usize; 8] = [6, 7, 8, 9, 10, 11, 12, 20];
+
+    /// Set slot `i` to `value`. Exists so a test can sweep the table without
+    /// twenty-one hand-written cases going quietly out of step with the struct.
+    fn set_weight_slot(p: &mut FsrsParameters, i: usize, value: f32) {
+        match i {
+            0 => p.w0 = value,
+            1 => p.w1 = value,
+            2 => p.w2 = value,
+            3 => p.w3 = value,
+            4 => p.w4 = value,
+            5 => p.w5 = value,
+            6 => p.w6 = value,
+            7 => p.w7 = value,
+            8 => p.w8 = value,
+            9 => p.w9 = value,
+            10 => p.w10 = value,
+            11 => p.w11 = value,
+            12 => p.w12 = value,
+            13 => p.w13 = value,
+            14 => p.w14 = value,
+            15 => p.w15 = value,
+            16 => p.w16 = value,
+            17 => p.w17 = value,
+            18 => p.w18 = value,
+            19 => p.w19 = value,
+            20 => p.w20 = value,
+            other => panic!("FsrsParameters has 21 slots, asked for w{other}"),
+        }
+    }
+
+    /// Every number `FsrsParameters` can influence, for one fixed starting
+    /// state: the five read-only scores, plus the stability and difficulty
+    /// `record_access` produces for each of the four ratings.
+    ///
+    /// `anchor` fixes `last_access`, so the only thing that varies between two
+    /// fingerprints is the parameter table.
+    fn fsrs_fingerprint(params: &FsrsParameters, anchor: i64) -> Vec<f32> {
+        let fresh = || FsrsState {
+            stability: 2.5,
+            difficulty: 6.0,
+            last_access: anchor,
+            access_count: 3,
+            importance: 1.2,
+            storage_strength: 0.4,
+            generation: 1,
+        };
+
+        let base = fresh();
+        let mut out = vec![
+            base.retrievability(params),
+            base.retrieval_strength(params),
+            base.accessibility(params),
+            base.weight(params),
+            // `state` is a bucketing of accessibility; include it as a number
+            // so a weight that only moves a memory across a band still counts.
+            match base.state(params) {
+                MemoryState::Active => 3.0,
+                MemoryState::Dormant => 2.0,
+                MemoryState::Silent => 1.0,
+                MemoryState::Unavailable => 0.0,
+            },
+        ];
+
+        for rating in [Rating::Again, Rating::Hard, Rating::Good, Rating::Easy] {
+            let mut s = fresh();
+            s.record_access(params, rating);
+            out.push(s.stability);
+            out.push(s.difficulty);
+        }
+        out
+    }
+
+    /// The largest relative move between two fingerprints.
+    fn largest_relative_move(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "fingerprints must be the same shape");
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let scale = x.abs().max(y.abs()).max(1.0);
+                (x - y).abs() / scale
+            })
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// **13 of the 21 FSRS weights change nothing, and this proves it by
+    /// perturbing them rather than by reading the code.**
+    ///
+    /// `FsrsParameters` presents twenty-one public, serializable `wN` fields —
+    /// a tuning surface. Only eight of them are wired to a formula. The rest
+    /// are a table transcribed from FSRS's published parameters for a
+    /// stability update that this crate does not implement, so they look like
+    /// knobs and turn nothing. Several are *non-zero* (`w0 = 0.4072`,
+    /// `w16 = 2.2035`), which is what makes the appearance convincing.
+    ///
+    /// A grep would answer this too, and would rot the first time someone
+    /// wired one up. This sweeps every slot, moves it, and asks whether any
+    /// observable number moved with it — so the day a formula starts reading
+    /// `w16`, this test fails and names the slot.
+    /// The value every slot is moved to during the sweep. Distinct from every
+    /// default in the table, and inside the decay clamp so the `w20` case
+    /// probes the real path instead of a rejected parameter — checked below at
+    /// compile time, so editing either the probe or the clamps cannot silently
+    /// turn that case into a no-op.
+    const PROBE: f32 = 0.37;
+    const _: () = assert!(
+        PROBE > DECAY_MIN && PROBE < DECAY_MAX,
+        "the probe must be a legal decay, or the w20 case tests nothing"
+    );
+
+    #[test]
+    fn only_the_live_weights_change_any_fsrs_output() {
+        // Far enough in the past that retrievability is well off its ceiling,
+        // so a decay change has room to show. Fixed, so wall-clock drift
+        // between fingerprints cannot masquerade as a parameter effect.
+        let anchor = now() - 30 * 86400;
+        let baseline = fsrs_fingerprint(&FsrsParameters::default(), anchor);
+
+        let mut live = Vec::new();
+        let mut dead = Vec::new();
+        for slot in 0..21 {
+            let mut params = FsrsParameters::default();
+            set_weight_slot(&mut params, slot, PROBE);
+            let moved = largest_relative_move(&baseline, &fsrs_fingerprint(&params, anchor));
+            if moved > 1e-4 {
+                live.push(slot);
+            } else {
+                dead.push(slot);
+            }
+        }
+
+        assert_eq!(
+            live, LIVE_WEIGHT_SLOTS,
+            "the set of FSRS weights that affect behaviour changed.\n             live now: {live:?}\ndead now: {dead:?}\n             If a formula started reading a new slot, update LIVE_WEIGHT_SLOTS \
+             and the `FsrsParameters` doc that says which weights are read. If a \
+             slot went dead, say why in the doc rather than leaving a field that \
+             looks like a knob and turns nothing."
+        );
+
+        // The harness itself must be stable, or "unchanged" means nothing:
+        // re-fingerprint the untouched defaults and require an exact match on
+        // the same tolerance the sweep used.
+        let baseline_again = fsrs_fingerprint(&FsrsParameters::default(), anchor);
+        assert!(
+            largest_relative_move(&baseline, &baseline_again) <= 1e-4,
+            "the fingerprint is not reproducible, so no verdict above is trustworthy"
+        );
     }
 
     #[test]
