@@ -92,7 +92,7 @@ pub use chunking::{chunk_text, derive_chunk_params, Chunk, ChunkParams, CHUNKER_
 pub use consolidation::{
     ConsolidationConfig, ConsolidationResult, CompressionLevel,
     WeightThresholds, ClusteringWeights, MemoryCluster, cluster_memories,
-    create_consolidated_entry, composite_cluster_score,
+    create_consolidated_entry, composite_cluster_score, cluster_score_ceiling,
     cluster_content_bytes_for_context, FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS,
     is_verbatim_pinned, FACT_TYPE_METADATA_KEY,
 };

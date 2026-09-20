@@ -166,6 +166,54 @@ changes the shape is **comparing fewer pairs**, which is exactly what the indexe
 item proposes and exactly what this measurement now supports with a number rather than an
 assumption.
 
+### 2026-09-20 — an `aged` arm, because the other two run at a timescale production never uses
+
+The dense and sparse arms space memories one second apart while leaving
+`time_span_minutes` at its 1440-minute default, so `age_proximity` never leaves the top of
+its range. `MemoryService::with_store_timescale` does not do that: it sets the span to the
+store's own oldest-to-newest gap, which is what makes a mature store discriminate at week
+scale rather than minute scale. The two arms also use `FsrsState::default()` for every
+memory, which pins `access_count` at 0 and `importance` at 1.0 — so `recall_affinity` and
+`importance_proximity` are identically 1.0 *by construction*, the exact degeneracy the
+2026-09-09 similarity-veto bug turned on.
+
+The new **aged** arm keeps the sparse vectors and fixes both: 90 days of spread, the
+production timescale rule, and FSRS state that varies. Same N, same vectors, same `pairs`.
+
+### 2026-09-20 — pruning pairs before the cosine: 16-22%, and it is lossless by construction
+
+`score_or_prune` computes the three scalar terms first and skips the cosine when the pair's
+**ceiling** — the score it would get with a perfect cosine of 1.0 — is already below
+`cluster_threshold`. Each cheap term is bounded above by 1.0 by construction, so the ceiling
+is a true upper bound and the skipped pairs are exactly the pairs that would have been
+rejected. Not a heuristic and not a tolerance: `pruning_never_changes_a_cluster` clusters a
+randomized corpus with and without it and requires identical output, plus exact `f32`
+equality on every pair that is *not* pruned.
+
+On the aged arm it rejects **21.9% of all pairs** before touching an embedding. A/B on the
+identical corpus through the identical code path (the prune disabled with a `black_box`
+false so nothing else changes), **two samples each**:
+
+| N (aged) | no prune | with prune | delta |
+| --- | --- | --- | --- |
+| 1,000 | 12.7 / 13.7 | 11.4 / 10.4 | **-17.4%** |
+| 2,000 | 48.6 / 54.6 | 43.4 / 43.4 | **-15.9%** |
+| 4,000 | 198.3 / 211.5 | 174.2 / 171.4 | **-15.7%** |
+| 8,000 | 783.4 / 866.4 | 704.0 / 676.5 | **-16.3%** |
+| 16,000 | 4,111.7 / 3,865.5 | 3,291.2 / 2,943.0 | **-21.9%** |
+
+**How much it saves is data-dependent, and the honest version of that is: it does nothing
+on the dense and sparse arms.** There every cheap term sits at 1.0, the ceiling never falls
+below the threshold, and the prune cannot fire — which is why the aged arm had to exist
+before this could be measured at all. A store written in one sitting gets nothing; a
+long-lived store, which the roadmap calls the realistic case, gets a fifth of its pairs back.
+
+**It does not change the conclusion above.** 21.9% fewer pairs is a constant factor on a
+quadratic: 500k goes from ~60 min to roughly ~47 min. Still not a dream cycle. The two
+2026-09-20 passes together are the argument for the index — they took every cheap win
+available without one (a third of the arithmetic, a fifth of the pairs) and the wall is
+still there.
+
 > **Two earlier readings of this table were wrong, and both for the same reason — the
 > configuration underneath moved.** The first (pre-fix `cluster_threshold` 0.45) showed
 > `pairs` growing *linearly*, because the non-semantic floor (0.50) sat above the threshold

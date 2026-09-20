@@ -2891,6 +2891,28 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       from ~73 min to ~60 min, which is not a fix. **Fewer pairs is the only lever**, which is
       what this item already proposes — now supported by a measurement instead of an
       assumption.
+      **(2026-09-20, same run) Then took the other cheap win: prune pairs before the cosine.**
+      `score_or_prune` evaluates the three scalar terms first and skips the embedding entirely
+      when the pair's **ceiling** — its score with a perfect cosine of 1.0 — is already below
+      `cluster_threshold`. Every cheap term is bounded above by 1.0 by construction, so this is
+      an exact upper bound and the skipped pairs are precisely the ones that would have been
+      rejected; `pruning_never_changes_a_cluster` clusters a randomized corpus with and without
+      it and requires identical output. Worth **16-22%** on the new `aged` arm, where it rejects
+      **21.9%** of all pairs before touching an embedding.
+      **Two caveats, both load-bearing.** (1) It does *nothing* on the dense and sparse arms —
+      there every cheap term is 1.0 and the ceiling never falls below threshold. The gain is
+      real only for a store spread across time with varying FSRS state, i.e. the long-lived one.
+      (2) It is still a constant factor on a quadratic: ~60 min -> ~47 min at 500k.
+      **Together the two 2026-09-20 passes are the argument for the index**: they took every
+      cheap win available without one — a third of the arithmetic, a fifth of the pairs — and
+      the wall is still standing.
+      **A fixture correction went with it.** The dense and sparse arms space memories one second
+      apart and leave `time_span_minutes` at its 1440-minute default, and they give every memory
+      `FsrsState::default()`. Production does neither: `with_store_timescale` sets the span from
+      the store's own oldest-to-newest gap, and real memories differ in access count and
+      importance. So those arms hold all three non-semantic terms pinned at 1.0 — the exact
+      degeneracy behind the 2026-09-09 similarity-veto bug — and cannot show any effect that
+      depends on them. The new `aged` arm fixes both.
       **(2026-09-09) Baselined first — `bench/BASELINE.md` Suite 3b — and the two regimes are
       the finding.** Cost is governed by **match density**, not by N. *Dense* (clusters fill, so
       `max_cluster_memories` breaks the inner loop): **N^1.45**, 16k memories in 39 ms. *Sparse*
