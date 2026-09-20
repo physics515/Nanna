@@ -397,8 +397,7 @@ fn format_exception(
     let msg = obj
         .str(vm)
         .ok()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|s| s.to_string_lossy().into_owned());
 
     if msg.is_empty() {
         class_name

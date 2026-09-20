@@ -613,12 +613,11 @@ impl AgentRegistry {
 
         ws_agents
             .get(workspace)
-            .map(|ids| {
+            .map_or_default(|ids| {
                 ids.iter()
                     .filter_map(|id| agents.get(id).cloned())
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     /// Get children of an agent
@@ -628,12 +627,11 @@ impl AgentRegistry {
 
         children
             .get(agent_id)
-            .map(|ids| {
+            .map_or_default(|ids| {
                 ids.iter()
                     .filter_map(|id| agents.get(id).cloned())
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     /// Get all active (non-terminal) agents

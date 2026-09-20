@@ -514,7 +514,7 @@ mod ollama_probe_tests {
         config.llm.model = "claude-sonnet-5".to_string();
         config.llm.model_priority.clear();
         config.memory.embedding_priority.clear();
-        assert!(configured_ollama_models(&config).is_empty());
+        assert_eq!(configured_ollama_models(&config), Vec::<String>::new());
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod ollama_probe_tests {
         match serde_json::from_value::<Action>(raw).expect("must parse") {
             Action::System(SystemAction::ProbeOllama { base_url, models }) => {
                 assert_eq!(base_url, None);
-                assert!(models.is_empty());
+                assert_eq!(models, Vec::<String>::new());
             }
             other => panic!("expected probe_ollama, got {other:?}"),
         }

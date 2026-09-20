@@ -136,8 +136,7 @@ impl TelegramListener {
                     sender
                         .last_name
                         .as_ref()
-                        .map(|l| format!(" {l}"))
-                        .unwrap_or_default()
+                        .map_or_default(|l| format!(" {l}"))
                 )),
                 username: sender.username.clone(),
             },

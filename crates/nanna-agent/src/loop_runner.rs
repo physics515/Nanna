@@ -2821,7 +2821,7 @@ fn text_streams_prose_tool_calls(text: &str) -> bool {
             format!(
                 "{}\u{1}{}",
                 c.written_name.to_lowercase(),
-                c.params.as_ref().map(ToString::to_string).unwrap_or_default()
+                c.params.as_ref().map_or_default(ToString::to_string)
             )
         })
         .collect();

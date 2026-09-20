@@ -1,7 +1,7 @@
 //! Live validation of a provider API key the user just typed.
 //!
 //! One minimal, cheap, read-only request per provider — a `GET` of the
-//! model catalogue (or, for OpenRouter, the key's own info endpoint) — sent
+//! model catalogue (or, for `OpenRouter`, the key's own info endpoint) — sent
 //! with the key **as supplied by the caller**. This module never reads the
 //! keyring and never persists anything: it answers the single question
 //! "does this string open the door?", so onboarding and Settings can say so

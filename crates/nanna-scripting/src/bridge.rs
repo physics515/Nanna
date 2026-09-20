@@ -1501,7 +1501,7 @@ pub struct LogEntry {
 /// `LD_LIBRARY_PATH`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScrubbedLibraryPath {
-    /// Not running from an AppImage, or the variable carries none of the
+    /// Not running from an `AppImage`, or the variable carries none of the
     /// bundle's directories: the child inherits it as-is.
     Unchanged,
     /// Every entry was the bundle's: the child gets no `LD_LIBRARY_PATH` at all,
@@ -1511,10 +1511,10 @@ enum ScrubbedLibraryPath {
     Narrowed(std::ffi::OsString),
 }
 
-/// Drop the AppImage bundle's own directories from an inherited
-/// `LD_LIBRARY_PATH`. `appdir` is the mount AppRun exported (`$APPDIR`); an
+/// Drop the `AppImage` bundle's own directories from an inherited
+/// `LD_LIBRARY_PATH`. `appdir` is the mount `AppRun` exported (`$APPDIR`); an
 /// entry is the bundle's when it lies under that mount. Pure, so the three
-/// outcomes can be pinned without an AppImage on the machine.
+/// outcomes can be pinned without an `AppImage` on the machine.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn scrub_appimage_library_path(
     appdir: Option<&std::ffi::OsStr>,

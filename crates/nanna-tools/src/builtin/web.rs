@@ -109,8 +109,7 @@ impl Tool for WebSearchTool {
 
         let results = search_result
             .web
-            .map(|w| w.results)
-            .unwrap_or_default();
+            .map_or_default(|w| w.results);
 
         if results.is_empty() {
             return Ok(ToolResult::success("No results found."));
@@ -239,7 +238,7 @@ impl Tool for WebSearchBatchTool {
                         let json: Result<BraveSearchResponse, _> = resp.json().await;
                         match json {
                             Ok(data) => {
-                                let results = data.web.map(|w| w.results).unwrap_or_default();
+                                let results = data.web.map_or_default(|w| w.results);
                                 Some((query, results))
                             }
                             Err(_) => None,
