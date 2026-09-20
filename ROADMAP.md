@@ -2939,6 +2939,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   index earns nothing at today's corpus size. The real trigger is the **O(N^2)
                   clustering in dreaming**, not recall. Source:
                   [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+                  *(2026-09-20 — **the trigger now has a number, from Suite 2c.**)* This item
+                  already said "do not schedule this on recall grounds"; what it lacked was the N
+                  at which it *should* be scheduled. The recall-path measurement supplies both
+                  halves. On latency there is no case at all — the in-RAM exact scan costs 10.89 ms
+                  at 50k and the SQL alternative 98.3 ms, so an index would not be competing with
+                  anything slow. On **residency** it becomes real at ~350k memories (1.43 GiB of
+                  f32 at 768-dim by 500k), roughly **7x** today's ceiling, and there SQL k-NN's
+                  ~2 µs/element extrapolates to ~690 ms per query — i.e. the escape hatch stops
+                  being an escape. So the schedule is: **the O(N^2) dreaming clustering first** (the
+                  trigger this shortlist was always keyed to), and recall-side ANN only if the
+                  corpus approaches ~350k. Shortlist re-checked 2026-09-20, unchanged —
+                  `hnswlib-rs` still decouples the graph from vector storage (the property that
+                  keeps Turso owning the f32 BLOBs), with `usearch` and the shadow-table
+                  `sqlite-vector-rs` as the references beside it.
                   - [ ] *(research 2026-09-07)* **Recall is now measured across the shortlist, and it
                         confirms the "do not schedule on recall grounds" call rather than
                         challenging it.** Published comparisons put `usearch` at 0.987 recall /
@@ -6949,6 +6963,26 @@ keep the phases readable; promote individual items into a phase when they become
       remove the toggle — not guessed at in a nightly run. Precedence note: an `OPENAI_API_KEY`
       exported before launch now wins over a key typed into Settings in the GUI process, as it
       already did in the daemon (`load_secrets_from_store` prefers env).
+- [ ] *(found 2026-09-20, during the nightly smoke run)* **This host cannot embed at all, so no
+      unattended run can verify recall through the real binary — and the three candidates fail for
+      three different reasons.** Checked rather than assumed, from an isolated scratch daemon
+      (`HOME`/`XDG_DATA_HOME`/`NANNA_CONFIG_PATH` redirected, ports 5248/5249):
+      - **OpenAI:** no key. The daemon says so precisely and then says what it means — *"No
+        embedding provider available — memory runs WITHOUT vectors: writes persist and queue for
+        backfill, recall is unavailable"*. That message is doing its job; the gap is the host, not
+        the code.
+      - **Local Ollama:** not installed (`command -v ollama` empty, nothing on `localhost:11434`).
+      - **The remote Ollama IS reachable and has exactly one model, which cannot embed.**
+        `https://mummu.basicautomation.io/ollama/api/tags` answers 200 anonymously and lists a
+        single entry, `qwen3.8-27b-ud-q4ks` (15.4 GB, qwen35). `POST /api/embed` against it returns
+        **`{"error":"embeddings are not supported by the mummu-serve shim"}`** — a shim limitation,
+        not a model one, and worth knowing before someone adds an embedding model there and expects
+        it to serve.
+      Consequence for every future run: a memory/recall change can be verified by unit tests, by
+      the Suite 2c criterion body, and by a daemon boot — but **not** by a live recall turn, and no
+      run should imply otherwise. Cheapest fixes, in order: teach `mummu-serve` the `/api/embed`
+      route (it is Mummu's, and Mummu already ships a MiniLM-class CPU embedder — file it there),
+      or pull a small embedding model onto a local Ollama once one is installed.
 - [ ] *(found 2026-09-17)* **The AppImage does not bundle on this Arch host — two host-tool causes,
       neither in our code.** `pnpm tauri build` produced `nanna-gui` and `Nanna_0.3.21_amd64.deb`, then
       `failed to run linuxdeploy`. Run by hand: (1) linuxdeploy's bundled `strip` rejects Arch's system
@@ -7243,6 +7277,20 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      Vulkan is the backend `wgpu` already picks, so a CubeCL-Vulkan Mummu would land on a path Nanna
      has bench numbers for. File the actual port in Mummu.
      Source: [tracel-ai/burn](https://github.com/tracel-ai/burn).
+   - *(2026-09-20 re-check)* `turso` is **still** `0.8.0-pre.11` — now **nine days** unchanged
+     (published 2026-09-11), still no stable 0.8.0, still no changelog past 0.7.0. The exact
+     `=0.7.2` pin holds; never a pre-release on an exact pin.
+     **And the "no dense ANN" fact is now confirmed by the vendor, not just by our source grep.**
+     Turso's own post [*Indexing sparse vectors with Turso*](https://turso.tech/blog/indexing-sparse-vectors-with-turso)
+     describes what their indexing work actually shipped: a **sparse** inverted index
+     (`toy_vector_sparse_ivf`, Weighted Jaccard, with adaptive length filtering and frequency-based
+     component selection) as of 0.3.0 — while **dense** vectors got *"SIMD acceleration, allowing
+     for faster exact search"* and **no ANN index at all**. That is exactly the split the
+     2026-07-24 note inferred from reading `index_method/`, so the roadmap's load-bearing claim is
+     now corroborated by the people who wrote the engine. Two consequences worth stating: waiting
+     for a Turso release to supply dense ANN is waiting for something nobody has announced, and
+     Turso's dense answer (SIMD exact search) is the *same* answer Nanna already runs in RAM —
+     which is consistent with Suite 2c finding SQL k-NN 9-14x slower rather than faster.
    - *(2026-09-14 re-check)* `turso` is **still** `0.8.0-pre.11` — unchanged since 2026-09-11, no new
      pre-release in three days, still no changelog past 0.7.0. The exact `=0.7.2` pin holds; nothing
      to re-evaluate until 0.8.0 goes stable. `fsrs 6.6.2`, `boa_engine 0.22.0` and `tantivy 0.26.2`
@@ -8108,9 +8156,36 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  Stated tradeoffs in the issue: dependency count 153 → 276, Turso is WAL-only
                  (`PRAGMA wal_checkpoint(TRUNCATE)` folds the WAL for shipping), and no
                  URI/immutable read-only mode.
+                 *(re-checked 2026-09-20 — **it has moved from "In Progress" to reviewable code**,
+                 which is the first time this watch has had something concrete to point at.)*
+                 #1608 is still open, but its timeline now carries the work rather than the intent,
+                 all by the same assignee (**jwric**), all verified through the GitHub API rather
+                 than a search snippet:
+                 - **[cubecl#1643 "Refactor/async turso storage"](https://github.com/tracel-ai/cubecl/pull/1643)
+                   — OPEN**, created 2026-09-14, last updated **2026-09-18**. Switches the SQLite
+                   backend from `rusqlite` to `turso` and unifies the store API across web and
+                   native. Note precisely what it does and does not claim: the description says the
+                   *backend* changes, **not** that `rusqlite` leaves `cubecl-environment`'s manifest.
+                   Nanna's guard fails on the **lockfile**, so "the backend now uses turso" is not
+                   yet the same as "the dependency is gone" — re-check the resolved lockfile, not
+                   the PR title, before declaring this unblocked.
+                 - **[cubecl#1645 "refactor(bundle): drop the SQLite bundle format"](https://github.com/tracel-ai/cubecl/pull/1645)
+                   — closed**, removing `BundleFormat`/`SqliteBundle` and with them the journal-mode
+                   and attach complexity the WAL-only tradeoff created.
+                 - **The precedent landed**: [burn#5546](https://github.com/tracel-ai/burn/pull/5546),
+                   **merged 2026-09-09**, replaced `rusqlite` + `r2d2_sqlite` + `serde_rusqlite`
+                   with Turso in `burn-dataset` and took its dependency count **153 → 44**. That is
+                   the "a similar migration was completed in the burn project" line in #1608, now
+                   with a number attached.
+                 - The root issue is **[cubecl#1488](https://github.com/tracel-ai/cubecl/issues/1488)**:
+                   `cubecl-environment`'s unconditional SQLite cache forces `libsqlite3-sys` on
+                   every consumer. Worth having the issue number too — #1608 is the remedy, #1488 is
+                   the defect, and a future run may find one closed without the other.
                  **So: watch #1608 before spending the owner's decision on the two options below.**
                  Re-check it at the top of each run — this is now the cheapest thing standing
-                 between P12 and its first real consumer.
+                 between P12 and its first real consumer. The concrete check is one command once
+                 #1643 merges: add `mummu` and see whether `no_banned_database_crates_in_lockfile`
+                 still fails.
            - [ ] ~~Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
                  clear.~~ **Superseded by #1608 above** — removing the C engine beats gating it.
            - [ ] Narrow `dep_guard`'s ban to Nanna's *own* storage path, explicitly permitting a
