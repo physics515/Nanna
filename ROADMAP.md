@@ -3063,7 +3063,12 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             width check cannot catch — and the old comparator handed it to `partial_cmp`, got
             `None`, and treated it as `Equal`, which is intransitive and could seat it in the
             returned results. 4 new tests, one of which pins the new ranking against the old stable
-            sort element-for-element on a deliberately tie-heavy fixture.
+            sort element-for-element on a deliberately tie-heavy fixture, plus two that drive the
+            **shipped** `VectorStore::search` rather than the ranking function in isolation (an
+            all-ties store must return the same five rows in the same order across repeated calls;
+            a zero-magnitude row must never outrank a real, if weak, match). **The suite was checked
+            against the defect, not just against the fix**: regressing `rank_order` back to the
+            similarity-only comparator makes all five fail, the two end-to-end ones included.
       - [x] *(2026-07-25)* **`MemoryRepository::delete`/`bulk_delete` now destroy the embedding on disk — the
             "today, before any HNSW" half of Ghost Vectors is closed.** Proven, not assumed: the negative
             control test (`raw_delete_leaves_embedding_on_disk`) confirms a plain `DELETE` **does** leave the

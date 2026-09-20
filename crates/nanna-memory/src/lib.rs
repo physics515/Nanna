@@ -2864,6 +2864,100 @@ mod tests {
     /// A queued row in the store must be skipped by search, not panic it: the
     /// raw SIMD cosine asserts equal widths and this crate aborts on panic, so
     /// before the fix one queued row took the daemon down on the next recall.
+    /// The ranking properties, proven through the **shipped** `search` rather
+    /// than through `rank_top_k` in isolation. The unit tests above pin the
+    /// ranking function; this one pins that `search` actually uses it, and that
+    /// `top_k` really does bound what comes back out of a larger store.
+    #[tokio::test]
+    async fn search_ranks_ties_deterministically_and_honours_top_k() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+
+        // Twenty rows, all with the SAME embedding, so every score ties and the
+        // order is decided entirely by the index tiebreak. Insertion order is
+        // the index order, so the answer must be the first `top_k` inserted.
+        for i in 0..20 {
+            store
+                .add(MemoryEntry {
+                    embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    ..entry_dim8(&format!("tied-{i:02}"))
+                })
+                .await
+                .unwrap();
+        }
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let ranked_ids = |r: &[(MemoryEntry, f32)]| -> Vec<String> {
+            r.iter().map(|(e, _)| e.id.clone()).collect()
+        };
+
+        let first = store.search(&query, 5).await;
+        assert_eq!(first.len(), 5, "top_k bounds the result");
+        assert_eq!(
+            ranked_ids(&first),
+            ["tied-00", "tied-01", "tied-02", "tied-03", "tied-04"],
+        );
+
+        // Repeat it: an unstable selection without the tiebreak would be free
+        // to return a different five, or the same five in another order.
+        for _ in 0..8 {
+            assert_eq!(
+                ranked_ids(&store.search(&query, 5).await),
+                ranked_ids(&first),
+                "an all-ties ranking must be stable across calls"
+            );
+        }
+    }
+
+    /// A zero-magnitude embedding of the RIGHT width yields cosine `0/0` = NaN.
+    /// The width check cannot catch it — the vector is the correct length, it
+    /// is the content that is degenerate — so the ranking is the only thing
+    /// standing between a NaN and the results. It must lose to a real match.
+    #[tokio::test]
+    async fn search_never_returns_a_nan_scored_row_ahead_of_a_real_match() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        // Right width, zero magnitude — this is the row that produces NaN.
+        store
+            .add(MemoryEntry {
+                embedding: vec![0.0; 8],
+                ..entry_dim8("zero-magnitude")
+            })
+            .await
+            .unwrap();
+        store
+            .add(MemoryEntry {
+                embedding: vec![0.2, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ..entry_dim8("weak-match")
+            })
+            .await
+            .unwrap();
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        // Asked for one: it must be the real row, never the degenerate one.
+        let top = store.search(&query, 1).await;
+        assert_eq!(top.len(), 1);
+        assert_eq!(
+            top[0].0.id, "weak-match",
+            "a NaN-scoring row must not outrank a real, if weak, match"
+        );
+
+        // Asked for both: the degenerate row comes last, and its score is not
+        // a NaN leaking out to callers that compare it against a threshold.
+        let all = store.search(&query, 10).await;
+        assert_eq!(
+            all.iter().map(|(e, _)| e.id.as_str()).collect::<Vec<_>>(),
+            ["weak-match", "zero-magnitude"],
+        );
+    }
+
     #[tokio::test]
     async fn search_skips_queued_rows_instead_of_panicking() {
         let store = VectorStore::new(VectorStoreConfig {
