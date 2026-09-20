@@ -80,22 +80,77 @@ fn cosine_or_stale(query: &[f32], embedding: &[f32]) -> f32 {
 /// last one is O(N log N) on top of the O(N) cosine and is invisible in
 /// Suite 2's `simd_batch` row.
 fn ram_scan_top_k(query: &[f32], vectors: &[Vec<f32>], top_k: usize) -> Vec<(usize, f32)> {
-	debug_assert!(!query.is_empty(), "query embedding must not be empty");
-	debug_assert!(top_k > 0, "top_k must be positive");
+	let mut ranked = ram_scan_candidates(query, vectors);
 
-	let _comparable = vectors.iter().filter(|v| v.len() == query.len()).count();
-
-	let similarities: Vec<f32> = vectors
-		.iter()
-		.map(|v| cosine_or_stale(query, v))
-		.collect();
-
-	let mut ranked: Vec<(usize, f32)> = similarities.into_iter().enumerate().collect();
-	ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-	ranked.truncate(top_k);
+	// The shipped selection: partition in O(N), order only the kept prefix.
+	if top_k < ranked.len() {
+		ranked.select_nth_unstable_by(top_k, rank_order);
+		ranked.truncate(top_k);
+	}
+	ranked.sort_by(rank_order);
 
 	debug_assert!(ranked.len() <= top_k, "returned more than top_k");
 	ranked
+}
+
+/// Control A — **sort** all N with the *same* comparator, then `truncate`.
+///
+/// Isolates one variable: selection versus sorting. "Selection is faster than
+/// sorting" is the kind of claim that should cost a bench row rather than an
+/// argument, and holding the comparator fixed is what makes the row mean that
+/// and nothing else.
+fn ram_scan_top_k_sort_same_cmp(
+	query: &[f32],
+	vectors: &[Vec<f32>],
+	top_k: usize,
+) -> Vec<(usize, f32)> {
+	let mut ranked = ram_scan_candidates(query, vectors);
+	ranked.sort_by(rank_order);
+	ranked.truncate(top_k);
+	ranked
+}
+
+/// Control B — the **literal** pre-change ranking: a stable sort on similarity
+/// alone, then `truncate`.
+///
+/// Control A alone would overstate the change. The shipped comparator is
+/// strictly more work per comparison than the one it replaced — two finiteness
+/// checks and an index tiebreak — so a reader comparing A to `ram_scan` sees
+/// the algorithmic win with that cost already paid by both arms. This arm is
+/// what the daemon actually ran before, cheap intransitive comparator and all,
+/// so `ram_scan` against *this* is the honest end-to-end delta.
+fn ram_scan_top_k_prior_code(
+	query: &[f32],
+	vectors: &[Vec<f32>],
+	top_k: usize,
+) -> Vec<(usize, f32)> {
+	let mut ranked = ram_scan_candidates(query, vectors);
+	ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+	ranked.truncate(top_k);
+	ranked
+}
+
+/// The part both ranking arms share: the coverage count and the cosine map.
+fn ram_scan_candidates(query: &[f32], vectors: &[Vec<f32>]) -> Vec<(usize, f32)> {
+	debug_assert!(!query.is_empty(), "query embedding must not be empty");
+
+	let _comparable = vectors.iter().filter(|v| v.len() == query.len()).count();
+
+	vectors
+		.iter()
+		.map(|v| cosine_or_stale(query, v))
+		.enumerate()
+		.collect()
+}
+
+/// `nanna_memory::VectorStore::rank_order`, reproduced for the same reason
+/// `cosine_or_stale` is: the benched shape must be the shipped shape.
+fn rank_order(a: &(usize, f32), b: &(usize, f32)) -> std::cmp::Ordering {
+	let sa = if a.1.is_finite() { a.1 } else { f32::NEG_INFINITY };
+	let sb = if b.1.is_finite() { b.1 } else { f32::NEG_INFINITY };
+	sb.partial_cmp(&sa)
+		.unwrap_or(std::cmp::Ordering::Equal)
+		.then_with(|| a.0.cmp(&b.0))
 }
 
 /// A fixture memory row carrying one embedding.
@@ -184,6 +239,21 @@ fn recall_path(c: &mut Criterion) {
 			let mut q = query.clone();
 			nanna_simd::normalize_f32(&mut q);
 			let ram = ram_scan_top_k(&q, &vectors, LIMIT);
+			// Selection and the sort it replaced must produce the same answer,
+			// or the speed-up below is measuring a different function.
+			assert_eq!(
+				ram,
+				ram_scan_top_k_sort_same_cmp(&q, &vectors, LIMIT),
+				"selection and full-sort ranking disagree at N={n}"
+			);
+			// The fixture has no ties and no NaN, so the prior ranking must
+			// agree too — which is what makes control B a like-for-like row
+			// rather than a measurement of a different answer.
+			assert_eq!(
+				ram,
+				ram_scan_top_k_prior_code(&q, &vectors, LIMIT),
+				"selection and the prior ranking disagree at N={n}"
+			);
 			let sql = runtime
 				.block_on(repo.search_by_embedding_sql(&query, LIMIT, None))
 				.expect("sql knn warm-up");
@@ -220,6 +290,32 @@ fn recall_path(c: &mut Criterion) {
 				let mut q = query.clone();
 				nanna_simd::normalize_f32(&mut q);
 				black_box(ram_scan_top_k(black_box(&q), black_box(&vectors), LIMIT))
+			});
+		});
+
+		// Control A: same comparator, sorted instead of selected.
+		group.bench_with_input(BenchmarkId::new("ram_scan_sort_same_cmp", n), &n, |b, &_n| {
+			b.iter(|| {
+				let mut q = query.clone();
+				nanna_simd::normalize_f32(&mut q);
+				black_box(ram_scan_top_k_sort_same_cmp(
+					black_box(&q),
+					black_box(&vectors),
+					LIMIT,
+				))
+			});
+		});
+
+		// Control B: the ranking the daemon actually ran before the change.
+		group.bench_with_input(BenchmarkId::new("ram_scan_prior_code", n), &n, |b, &_n| {
+			b.iter(|| {
+				let mut q = query.clone();
+				nanna_simd::normalize_f32(&mut q);
+				black_box(ram_scan_top_k_prior_code(
+					black_box(&q),
+					black_box(&vectors),
+					LIMIT,
+				))
 			});
 		});
 

@@ -3047,7 +3047,23 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             cosine map: the comparable-width count, and **a full `sort_by` of all N similarities before
             `truncate(top_k)`**, O(N log N) on top of the O(N) cosine, for a `top_k` that is 10.
             `remember_scoped` runs a search on **every ingest**, so this is on the write path too.
-            Fixed by selection instead of sorting — see the item below.
+            **Fixed the same run:** `VectorStore::rank_top_k` selects with `select_nth_unstable_by`
+            and sorts only the kept prefix. Measured end to end against the literal prior ranking,
+            all arms in one run — **-13.6% / -18.4% / -5.6%** off the *whole* recall path (cosine
+            included) at 1k / 10k / 50k; holding the comparator fixed to isolate the algorithm alone
+            it is -20.4% / -24.4% / -22.7%. The smaller figure is the one to quote: the new
+            comparator is deliberately *more* work per comparison, so crediting the predecessor with
+            it would overstate the win. Two honest caveats are recorded with the table — the 10k row
+            has a ~±5% CI, and the 50k saving does not scale the way an O(N log N) → O(N) change
+            alone predicts (cache behaviour, not comparison count, sets the pace at 400 KB of
+            similarities). Also a correctness fix, tested rather than measured: ties now resolve
+            deterministically by ascending index instead of leaning on sort stability (selection is
+            unstable), and a **NaN similarity now ranks last instead of anywhere**. NaN was
+            reachable — a zero-magnitude embedding of the right width gives cosine `0/0`, which the
+            width check cannot catch — and the old comparator handed it to `partial_cmp`, got
+            `None`, and treated it as `Equal`, which is intransitive and could seat it in the
+            returned results. 4 new tests, one of which pins the new ranking against the old stable
+            sort element-for-element on a deliberately tie-heavy fixture.
       - [x] *(2026-07-25)* **`MemoryRepository::delete`/`bulk_delete` now destroy the embedding on disk — the
             "today, before any HNSW" half of Ghost Vectors is closed.** Proven, not assumed: the negative
             control test (`raw_delete_leaves_embedding_on_disk`) confirms a plain `DELETE` **does** leave the
