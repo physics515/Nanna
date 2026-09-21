@@ -2695,7 +2695,9 @@ async fn a_blank_message_is_refused_and_starts_no_turn() {
     let ollama = ScriptedOllama::start(vec!["Hello there.\nTASK COMPLETE".to_string()]).await;
     let host = ollama.base_url.clone();
     let daemon = TestDaemon::start_with(tempfile::tempdir().unwrap(), move |b| {
-        b.with_model(STUB_MODEL).with_ollama_host(host).with_scheduler(false)
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
     })
     .await;
     let client = daemon.connect_client().await;
@@ -2720,6 +2722,45 @@ async fn a_blank_message_is_refused_and_starts_no_turn() {
         converse(&client, &session, "hi").await,
         "Hello there.",
         "the scripted reply was not spent on the blank message"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A pasted log far longer than the model's window fails honestly. It used
+/// to blame "num_ctx was demoted under GPU memory pressure … free GPU memory
+/// and resume" — a demotion that never happened, and a remedy that cannot
+/// help: the request itself does not fit.
+#[tokio::test]
+async fn a_request_longer_than_the_window_says_so() {
+    let ollama = ScriptedOllama::start(vec!["Summarized.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().unwrap(), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("paste".into()))
+            .await
+            .unwrap(),
+    );
+    let log_line = "2026-09-21 ERROR worker 7 failed to connect to db at 10.0.0.5:5432\n";
+    let request = format!("Summarize this log:\n{}", log_line.repeat(4_000));
+
+    let reply = converse(&client, &session, &request).await;
+    assert!(
+        reply.contains("request itself is longer than this window"),
+        "{reply}"
+    );
+    assert!(
+        !reply.contains("GPU memory"),
+        "no demotion happened: {reply}"
     );
 
     client.disconnect().await;
