@@ -2008,6 +2008,10 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             completes). Also probed: a model calling a tool it never discovered still gets it run
             (the registry resolves every registered tool) — not a defect, noted so it is not
             re-investigated.
+      - [ ] **IPC `session.clear` has no running-turn guard.** The chat apps' `/new` refuses while a
+            turn is running ("Send /stop first, then /new"); the IPC `Clear` the GUI uses clears anyway,
+            so the running turn's reply lands in the freshly-cleared conversation. Mirror `/new`'s
+            guard (or stop the turn, as delete now does) — check what the GUI shows for either answer.
       - [x] *(2026-09-21)* **Deleting a session left its turn running.** Probed: the model kept
             generating for the deleted conversation (a mission would have kept calling tools, for
             hours), and its reply was persisted into nothing. `session.delete` and `delete_all` now stop
