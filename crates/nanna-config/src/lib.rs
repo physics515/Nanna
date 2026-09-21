@@ -24,6 +24,8 @@ mod provider_key;
 /// Channel secrets (bot tokens, signing and webhook secrets) in the secure
 /// store, and out of `config.toml`.
 mod channel_secrets;
+/// `[server].webhook_secret` in the secure store, and out of `config.toml`.
+mod server_secret;
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
@@ -423,6 +425,11 @@ pub struct ServerConfig {
     // unchanged (no `#[serde(deny_unknown_fields)]`, so serde ignores the stale
     // key). Covered by `legacy_server_host_key_still_loads`.
     pub port: u16,
+    /// The shared secret `nanna server`'s generic webhook requires; without it
+    /// the endpoint refuses to serve.
+    ///
+    /// Secret: in the secure store, not `config.toml` (`server_secret.rs`).
+    /// From `NANNA_WEBHOOK_SECRET` when the file does not set it.
     pub webhook_secret: Option<String>,
 }
 
@@ -803,6 +810,42 @@ fn retired_ollama_url_notice(content: &str, config: &Config) -> Option<String> {
     ))
 }
 
+/// File in `store` under `key` a secret `config.toml` itself holds — `held`,
+/// trimmed and not blank — as the file loads, so that the save which next
+/// strips it from the file loses nothing ([`channel_secrets::adopt`],
+/// [`server_secret::adopt`]). A different stored value is replaced: every load
+/// of the file runs with the file's, so the one kept must be the file's, or
+/// that save would switch to another. Each load says the line can be deleted.
+///
+/// `field` names the secret in `config.toml` and `env_var` is where else it can
+/// come from, for the messages (never the value).
+fn adopt_file_secret(field: &str, env_var: &str, key: &str, held: &str, store: &SecureStore) {
+    let stored = store.get(key);
+    if stored.as_deref().is_ok_and(|stored| stored == held) {
+        warn!(
+            "config.toml holds {field} in plain text. It is in the secure store, so the line \
+             can be deleted; the next save of the settings removes it."
+        );
+        return;
+    }
+    match store.set(key, held) {
+        Ok(()) => warn!(
+            "config.toml holds {field} in plain text. It is now filed in the secure store{}, so \
+             the line can be deleted; the next save of the settings removes it.",
+            if stored.is_ok() {
+                " in place of the one there"
+            } else {
+                ""
+            }
+        ),
+        Err(e) => tracing::error!(
+            "config.toml holds {field} in plain text and it cannot be filed in the secure store \
+             ({e}). This process runs with it; once the settings are next saved it is no longer \
+             in config.toml, and must be set again or supplied as {env_var}."
+        ),
+    }
+}
+
 impl Config {
     /// Load config from default location.
     ///
@@ -846,9 +889,10 @@ impl Config {
 
     /// Read and parse the config file at `path`, with a non-Anthropic
     /// `[llm].provider`'s key filed under its own name
-    /// ([`provider_key::refile_provider_key`]) and each channel secret the
-    /// file itself holds filed in `store` ([`channel_secrets::adopt`]) —
-    /// before any secret is hydrated, so only a key the old layout left
+    /// ([`provider_key::refile_provider_key`]) and each channel secret and the
+    /// webhook secret the file itself holds filed in `store`
+    /// ([`channel_secrets::adopt`], [`server_secret::adopt`]) — before any
+    /// secret is hydrated, so only a key the old layout left
     /// behind is moved and only the file's own secrets are filed. The file's
     /// text comes back too, for what only the raw text can show.
     fn parse_file(
@@ -860,6 +904,7 @@ impl Config {
         info!("Loaded config from {path:?}");
         provider_key::refile_provider_key(&mut config.llm, store);
         channel_secrets::adopt(&mut config.channels, store);
+        server_secret::adopt(&mut config.server, store);
         Ok((config, content))
     }
 
@@ -903,6 +948,7 @@ impl Config {
         self.llm.anthropic_oauth_token = None;
         self.llm.ollama_api_key = None;
         self.tools.brave_api_key = None;
+        self.server.webhook_secret = None;
         channel_secrets::strip(&mut self.channels);
     }
 
@@ -943,6 +989,7 @@ impl Config {
         put(keys::OPENROUTER_API_KEY, &mut self.llm.openrouter_api_key)?;
         put(keys::GITHUB_TOKEN, &mut self.llm.github_token)?;
         put(keys::BRAVE_API_KEY, &mut self.tools.brave_api_key)?;
+        put(keys::SERVER_WEBHOOK_SECRET, &mut self.server.webhook_secret)?;
         // OAuth token + ollama key share the store under theirs-named keys too.
         if let Some(v) = self.llm.anthropic_oauth_token.take() {
             let trimmed = v.trim();
@@ -1042,6 +1089,11 @@ impl Config {
         fill(&mut self.llm.openrouter_api_key, keys::OPENROUTER_API_KEY, "OPENROUTER_API_KEY");
         fill(&mut self.llm.github_token, keys::GITHUB_TOKEN, "GITHUB_TOKEN");
         fill(&mut self.tools.brave_api_key, keys::BRAVE_API_KEY, "BRAVE_API_KEY");
+        fill(
+            &mut self.server.webhook_secret,
+            keys::SERVER_WEBHOOK_SECRET,
+            server_secret::WEBHOOK_SECRET_ENV,
+        );
         fill(&mut self.llm.anthropic_oauth_token, keys::ANTHROPIC_OAUTH_TOKEN, "ANTHROPIC_OAUTH_TOKEN");
         self.hydrate_ollama_token(store, env, unbound);
         channel_secrets::fill(&mut self.channels, store, env);
@@ -1896,6 +1948,29 @@ webhook_secret = "s3cret"
         let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
         assert_eq!(config.server.port, 4100, "the keys beside it still land");
         assert_eq!(config.server.webhook_secret.as_deref(), Some("s3cret"));
+
+        // The webhook secret beside it is hand-written, the only way it was
+        // ever set. It still takes effect, and as a secret it is filed in the
+        // secure store as the file loads (`server_secret.rs`): the next save
+        // drops it from config.toml and the load after that still has it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, legacy).expect("write");
+        let store = SecureStore::file_only_at(dir.path().join("store"));
+        let no_env = |_: &str| None;
+        let loaded = Config::load_from_with(&path, &store, no_env).expect("legacy config loads");
+        assert_eq!(loaded.server.port, 4100);
+        assert_eq!(loaded.server.webhook_secret.as_deref(), Some("s3cret"));
+        loaded.save_to(&path).expect("save");
+        let saved = std::fs::read_to_string(&path).expect("config.toml");
+        assert!(!saved.contains("s3cret"), "the secret left config.toml: {saved}");
+        let next = Config::load_from_with(&path, &store, no_env).expect("saved config loads");
+        assert_eq!(next.server.port, 4100);
+        assert_eq!(
+            next.server.webhook_secret.as_deref(),
+            Some("s3cret"),
+            "the save lost nothing"
+        );
 
         // And it is gone for good: a config written from today's defaults no
         // longer carries a key that looks like it controls the bind.

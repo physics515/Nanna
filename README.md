@@ -321,6 +321,9 @@ model = "qwen3.5:9b"
 
 [server]
 port = 3000               # `nanna server` port; the PORT env var or --port override it
+# webhook_secret = "..."  # /webhooks/generic's shared secret. Kept in the keyring: one written
+#                         # here is filed there when the file loads, and the next save drops
+#                         # the line. Or set NANNA_WEBHOOK_SECRET.
 
 [[mcp.servers]]           # repeat per server; tools show up as mcp__files__<tool>
 name = "files"
@@ -366,6 +369,7 @@ can also come from the environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECR
 | `BRAVE_API_KEY` | Web search tool |
 | `TELEGRAM_BOT_TOKEN` | Telegram channel's bot token, with `TELEGRAM_WEBHOOK_URL` / `TELEGRAM_WEBHOOK_SECRET`; a `[channels.telegram]` section keeps every setting they don't name (`allowed_users` included) |
 | `DISCORD_BOT_TOKEN` | Discord channel's bot token, with `DISCORD_APPLICATION_ID` / `DISCORD_PUBLIC_KEY` (all three needed when there is no `[channels.discord]` section) |
+| `NANNA_WEBHOOK_SECRET` | `nanna server`'s `/webhooks/generic` shared secret (used over the keyring's) |
 | `NANNA_CONFIG_PATH` | Load config from this file instead of the default location above |
 
 **Ports:** Health HTTP `5148` (`/health`, `/status`, and Prometheus `/metrics`) · WebSocket IPC `5149`

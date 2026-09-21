@@ -70,6 +70,9 @@ pub mod keys {
     pub const WHATSAPP_VERIFY_TOKEN: &str = "whatsapp_verify_token";
     pub const WHATSAPP_APP_SECRET: &str = "whatsapp_app_secret";
     pub const ELEVENLABS_API_KEY: &str = "elevenlabs_api_key";
+    /// `[server].webhook_secret`: the shared secret `nanna server`'s generic
+    /// webhook requires (`server_secret.rs`).
+    pub const SERVER_WEBHOOK_SECRET: &str = "server_webhook_secret";
 }
 
 /// Credential errors
@@ -317,6 +320,7 @@ impl SecureStore {
             keys::WHATSAPP_VERIFY_TOKEN,
             keys::WHATSAPP_APP_SECRET,
             keys::ELEVENLABS_API_KEY,
+            keys::SERVER_WEBHOOK_SECRET,
         ];
 
         known_keys
