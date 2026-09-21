@@ -1397,39 +1397,79 @@ impl Config {
 
     /// Override config with environment variables
     #[must_use] 
-    pub fn with_env_overrides(mut self) -> Self {
-        self.override_llm_keys(process_env);
+    pub fn with_env_overrides(self) -> Self {
+        self.with_env_overrides_from(process_env)
+    }
+
+    /// [`Self::with_env_overrides`] against a given environment, so the
+    /// override rules are testable without the process environment.
+    fn with_env_overrides_from(mut self, env: impl Fn(&str) -> Option<String>) -> Self {
+        self.override_llm_keys(&env);
 
         // Server config
-        if let Ok(port) = std::env::var("PORT")
-            && let Ok(p) = port.parse() {
-                self.server.port = p;
-            }
-
-        // Telegram
-        if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
-            self.channels.telegram = Some(TelegramConfig {
-                bot_token: token,
-                webhook_url: std::env::var("TELEGRAM_WEBHOOK_URL").ok(),
-                allowed_users: None,
-                webhook_secret: std::env::var("TELEGRAM_WEBHOOK_SECRET").ok(),
-            });
+        if let Some(port) = env("PORT")
+            && let Ok(p) = port.parse()
+        {
+            self.server.port = p;
         }
 
-        // Discord
-        if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN")
-            && let (Ok(app_id), Ok(pub_key)) = (
-                std::env::var("DISCORD_APPLICATION_ID"),
-                std::env::var("DISCORD_PUBLIC_KEY"),
-            ) {
+        self.override_channels(&env);
+        self
+    }
+
+    /// The channel settings [`Self::with_env_overrides`] takes from `env`.
+    ///
+    /// A channel's bot token opens its overrides, and each variable replaces
+    /// only the field it names: a configured section keeps the rest. Only a
+    /// missing section is built from the environment alone. Until 2026-09-21
+    /// the token replaced the whole section, so exporting it dropped
+    /// Telegram's `allowed_users` (anyone could then drive the bot) and its
+    /// webhook secret (the webhook then refused every request).
+    ///
+    /// A blank variable names nothing: an env-file line left empty must not
+    /// blank a configured token or secret.
+    fn override_channels(&mut self, env: impl Fn(&str) -> Option<String>) {
+        let var = |name: &str| env(name).filter(|value| !value.trim().is_empty());
+
+        if let Some(token) = var("TELEGRAM_BOT_TOKEN") {
+            let telegram = self
+                .channels
+                .telegram
+                .get_or_insert_with(|| TelegramConfig {
+                    bot_token: String::new(),
+                    webhook_url: None,
+                    allowed_users: None,
+                    webhook_secret: None,
+                });
+            telegram.bot_token = token;
+            if let Some(url) = var("TELEGRAM_WEBHOOK_URL") {
+                telegram.webhook_url = Some(url);
+            }
+            if let Some(secret) = var("TELEGRAM_WEBHOOK_SECRET") {
+                telegram.webhook_secret = Some(secret);
+            }
+        }
+
+        if let Some(token) = var("DISCORD_BOT_TOKEN") {
+            let application_id = var("DISCORD_APPLICATION_ID");
+            let public_key = var("DISCORD_PUBLIC_KEY");
+            if let Some(discord) = &mut self.channels.discord {
+                discord.bot_token = token;
+                if let Some(id) = application_id {
+                    discord.application_id = id;
+                }
+                if let Some(key) = public_key {
+                    discord.public_key = key;
+                }
+            } else if let (Some(application_id), Some(public_key)) = (application_id, public_key) {
+                // Built only whole: a Discord bot is nothing without all three.
                 self.channels.discord = Some(DiscordConfig {
                     bot_token: token,
-                    application_id: app_id,
-                    public_key: pub_key,
+                    application_id,
+                    public_key,
                 });
             }
-
-        self
+        }
     }
 
     /// The LLM keys [`Self::with_env_overrides`] takes from `env`.
@@ -1857,6 +1897,227 @@ ollama_host = "http://localhost:11434"
         let without = "[memory]\nollama_host = \"http://gpu-box:11434\"\n";
         let config: Config = toml::from_str(without).expect("parses");
         assert_eq!(retired_ollama_url_notice(without, &config), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Channel sections under environment overrides
+    // -----------------------------------------------------------------
+
+    /// An environment holding exactly `vars`.
+    fn env_of<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    fn with_telegram() -> Config {
+        let mut config = Config::default();
+        config.channels.telegram = Some(TelegramConfig {
+            bot_token: "cfg-token".into(),
+            webhook_url: Some("https://cfg.example/hook".into()),
+            allowed_users: Some(vec![42]),
+            webhook_secret: Some("cfg-secret".into()),
+        });
+        config
+    }
+
+    fn with_discord() -> Config {
+        let mut config = Config::default();
+        config.channels.discord = Some(DiscordConfig {
+            bot_token: "cfg-token".into(),
+            application_id: "cfg-app".into(),
+            public_key: "cfg-key".into(),
+        });
+        config
+    }
+
+    /// The token names the bot, not the section: the allowlist, the webhook
+    /// URL and the webhook secret stay as configured.
+    #[test]
+    fn a_telegram_token_from_the_environment_keeps_the_configured_section() {
+        let config =
+            with_telegram().with_env_overrides_from(env_of(&[("TELEGRAM_BOT_TOKEN", "env-token")]));
+        let telegram = config.channels.telegram.expect("section kept");
+        assert_eq!(telegram.bot_token, "env-token");
+        assert_eq!(
+            telegram.allowed_users,
+            Some(vec![42]),
+            "the allowlist survives"
+        );
+        assert_eq!(
+            telegram.webhook_url.as_deref(),
+            Some("https://cfg.example/hook")
+        );
+        assert_eq!(telegram.webhook_secret.as_deref(), Some("cfg-secret"));
+    }
+
+    #[test]
+    fn telegram_webhook_variables_override_only_their_own_fields() {
+        let config = with_telegram().with_env_overrides_from(env_of(&[
+            ("TELEGRAM_BOT_TOKEN", "env-token"),
+            ("TELEGRAM_WEBHOOK_URL", "https://env.example/hook"),
+            ("TELEGRAM_WEBHOOK_SECRET", "env-secret"),
+        ]));
+        let telegram = config.channels.telegram.expect("section kept");
+        assert_eq!(telegram.bot_token, "env-token");
+        assert_eq!(
+            telegram.webhook_url.as_deref(),
+            Some("https://env.example/hook")
+        );
+        assert_eq!(telegram.webhook_secret.as_deref(), Some("env-secret"));
+        assert_eq!(
+            telegram.allowed_users,
+            Some(vec![42]),
+            "the allowlist survives"
+        );
+    }
+
+    /// With no `[channels.telegram]` the environment is the whole section.
+    #[test]
+    fn a_telegram_section_is_built_from_the_environment_when_absent() {
+        let config = Config::default().with_env_overrides_from(env_of(&[
+            ("TELEGRAM_BOT_TOKEN", "env-token"),
+            ("TELEGRAM_WEBHOOK_URL", "https://env.example/hook"),
+            ("TELEGRAM_WEBHOOK_SECRET", "env-secret"),
+        ]));
+        let telegram = config.channels.telegram.expect("section built");
+        assert_eq!(telegram.bot_token, "env-token");
+        assert_eq!(
+            telegram.webhook_url.as_deref(),
+            Some("https://env.example/hook")
+        );
+        assert_eq!(telegram.webhook_secret.as_deref(), Some("env-secret"));
+        assert_eq!(telegram.allowed_users, None);
+
+        let config = Config::default()
+            .with_env_overrides_from(env_of(&[("TELEGRAM_BOT_TOKEN", "env-token")]));
+        let telegram = config.channels.telegram.expect("section built");
+        assert_eq!(telegram.bot_token, "env-token");
+        assert_eq!(telegram.webhook_url, None);
+        assert_eq!(telegram.webhook_secret, None);
+    }
+
+    #[test]
+    fn a_discord_token_from_the_environment_keeps_the_configured_section() {
+        let config =
+            with_discord().with_env_overrides_from(env_of(&[("DISCORD_BOT_TOKEN", "env-token")]));
+        let discord = config.channels.discord.expect("section kept");
+        assert_eq!(discord.bot_token, "env-token");
+        assert_eq!(discord.application_id, "cfg-app");
+        assert_eq!(discord.public_key, "cfg-key");
+
+        let config = with_discord().with_env_overrides_from(env_of(&[
+            ("DISCORD_BOT_TOKEN", "env-token"),
+            ("DISCORD_PUBLIC_KEY", "env-key"),
+        ]));
+        let discord = config.channels.discord.expect("section kept");
+        assert_eq!(discord.bot_token, "env-token");
+        assert_eq!(discord.application_id, "cfg-app");
+        assert_eq!(discord.public_key, "env-key");
+
+        let config = with_discord().with_env_overrides_from(env_of(&[
+            ("DISCORD_BOT_TOKEN", "env-token"),
+            ("DISCORD_APPLICATION_ID", "env-app"),
+        ]));
+        let discord = config.channels.discord.expect("section kept");
+        assert_eq!(discord.application_id, "env-app");
+        assert_eq!(discord.public_key, "cfg-key");
+    }
+
+    /// With no `[channels.discord]` the environment must name all three
+    /// fields: a section missing its application ID or public key is no
+    /// Discord bot.
+    #[test]
+    fn a_discord_section_is_built_from_the_environment_only_when_complete() {
+        let config = Config::default().with_env_overrides_from(env_of(&[
+            ("DISCORD_BOT_TOKEN", "env-token"),
+            ("DISCORD_APPLICATION_ID", "env-app"),
+            ("DISCORD_PUBLIC_KEY", "env-key"),
+        ]));
+        let discord = config.channels.discord.expect("section built");
+        assert_eq!(discord.bot_token, "env-token");
+        assert_eq!(discord.application_id, "env-app");
+        assert_eq!(discord.public_key, "env-key");
+
+        let config = Config::default().with_env_overrides_from(env_of(&[
+            ("DISCORD_BOT_TOKEN", "env-token"),
+            ("DISCORD_APPLICATION_ID", "env-app"),
+        ]));
+        assert!(config.channels.discord.is_none());
+    }
+
+    /// The bot token opens a channel's overrides: without it the environment
+    /// neither builds a section nor edits the configured one.
+    #[test]
+    fn without_a_bot_token_the_environment_leaves_the_channel_alone() {
+        let env = [
+            ("TELEGRAM_WEBHOOK_URL", "https://env.example/hook"),
+            ("TELEGRAM_WEBHOOK_SECRET", "env-secret"),
+            ("DISCORD_APPLICATION_ID", "env-app"),
+            ("DISCORD_PUBLIC_KEY", "env-key"),
+        ];
+        let config = Config::default().with_env_overrides_from(env_of(&env));
+        assert!(config.channels.telegram.is_none());
+        assert!(config.channels.discord.is_none());
+
+        let mut config = with_telegram();
+        config.channels.discord = with_discord().channels.discord;
+        let config = config.with_env_overrides_from(env_of(&env));
+        let telegram = config.channels.telegram.expect("section kept");
+        assert_eq!(
+            telegram.webhook_url.as_deref(),
+            Some("https://cfg.example/hook")
+        );
+        assert_eq!(telegram.webhook_secret.as_deref(), Some("cfg-secret"));
+        let discord = config.channels.discord.expect("section kept");
+        assert_eq!(discord.application_id, "cfg-app");
+        assert_eq!(discord.public_key, "cfg-key");
+    }
+
+    /// A variable exported empty (`TELEGRAM_WEBHOOK_SECRET=` in an env file)
+    /// names nothing. Taken as a value it would blank the configured one — a
+    /// blank webhook secret shuts the webhook — or build a bot around an
+    /// empty token.
+    #[test]
+    fn a_blank_channel_variable_names_nothing() {
+        let config = with_telegram().with_env_overrides_from(env_of(&[
+            ("TELEGRAM_BOT_TOKEN", "env-token"),
+            ("TELEGRAM_WEBHOOK_URL", ""),
+            ("TELEGRAM_WEBHOOK_SECRET", "  "),
+        ]));
+        let telegram = config.channels.telegram.expect("section kept");
+        assert_eq!(
+            telegram.webhook_url.as_deref(),
+            Some("https://cfg.example/hook")
+        );
+        assert_eq!(telegram.webhook_secret.as_deref(), Some("cfg-secret"));
+
+        let config = with_telegram().with_env_overrides_from(env_of(&[("TELEGRAM_BOT_TOKEN", "")]));
+        assert_eq!(
+            config.channels.telegram.expect("section kept").bot_token,
+            "cfg-token"
+        );
+        let config =
+            Config::default().with_env_overrides_from(env_of(&[("TELEGRAM_BOT_TOKEN", " ")]));
+        assert!(config.channels.telegram.is_none());
+
+        let config = with_discord().with_env_overrides_from(env_of(&[
+            ("DISCORD_BOT_TOKEN", ""),
+            ("DISCORD_APPLICATION_ID", "env-app"),
+        ]));
+        let discord = config.channels.discord.expect("section kept");
+        assert_eq!(discord.bot_token, "cfg-token");
+        assert_eq!(discord.application_id, "cfg-app");
+        let config = with_discord().with_env_overrides_from(env_of(&[
+            ("DISCORD_BOT_TOKEN", "env-token"),
+            ("DISCORD_PUBLIC_KEY", ""),
+        ]));
+        assert_eq!(
+            config.channels.discord.expect("section kept").public_key,
+            "cfg-key"
+        );
     }
 
     // -----------------------------------------------------------------
