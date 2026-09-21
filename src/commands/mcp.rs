@@ -139,14 +139,13 @@ fn enabled_tool_names(listing: &Value) -> Vec<String> {
     listing
         .get("tools")
         .and_then(Value::as_array)
-        .map(|tools| {
+        .map_or_default(|tools| {
             tools
                 .iter()
                 .filter(|t| t.get("enabled").and_then(Value::as_bool) != Some(false))
                 .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// One daemon tool as an MCP tool definition, from `tool.get`. `None` (and a
