@@ -2527,3 +2527,82 @@ async fn a_checked_task_is_verified_by_the_environment_and_reported_as_passing()
     client.disconnect().await;
     daemon.stop();
 }
+
+/// Deleting a session stops its running turn, as Stop would. It used to
+/// leave the turn running: the model kept generating — and a mission would
+/// have kept calling tools — for a conversation that no longer existed.
+#[tokio::test]
+async fn deleting_a_session_stops_its_running_turn() {
+    let ollama = ScriptedOllama::start(vec![
+        "WAIT 1500 Late answer.\nTASK COMPLETE".to_string(),
+        "Other answer.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let doomed = session_id_of(
+        &client
+            .sessions()
+            .create(Some("doomed".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(doomed.clone());
+    client
+        .chat()
+        .send(&doomed, "question")
+        .await
+        .expect("chat.send is accepted");
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        while ollama.chat_bodies.lock().await.len() < 2 {
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the step is in flight");
+    client
+        .sessions()
+        .delete(&doomed)
+        .await
+        .expect("sessions.delete answers");
+
+    let ended = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::MessageDelta { delta, .. })
+                    if delta.contains("Late answer") =>
+                {
+                    panic!("the deleted session's turn kept generating: {delta:?}")
+                }
+                Ok(nanna_client::Event::MessageEnd { content, .. }) => return content,
+                Ok(_) => {}
+                Err(e) => panic!("the event stream ended before the turn did: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the turn ends");
+    assert!(!ended.contains("Late answer"), "{ended:?}");
+
+    // And the daemon is fine: another session answers normally.
+    let next = session_id_of(
+        &client
+            .sessions()
+            .create(Some("next".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    assert_eq!(
+        converse(&client, &next, "hello").await.trim(),
+        "Other answer."
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

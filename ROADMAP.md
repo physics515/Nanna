@@ -2008,6 +2008,11 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             completes). Also probed: a model calling a tool it never discovered still gets it run
             (the registry resolves every registered tool) — not a defect, noted so it is not
             re-investigated.
+      - [x] *(2026-09-21)* **Deleting a session left its turn running.** Probed: the model kept
+            generating for the deleted conversation (a mission would have kept calling tools, for
+            hours), and its reply was persisted into nothing. `session.delete` and `delete_all` now stop
+            the session's running turn first, through the same path as Stop. e2e
+            `deleting_a_session_stops_its_running_turn` (fails without the call: the late reply streams).
       - [x] *(2026-09-21)* **A stopped turn is persisted the way the GUI shows it.** The GUI appends
             `[Stopped by user]` to the live bubble and lets `message_end` replace it, expecting the
             daemon to persist the same marker (its own comment says so). The harness path persisted

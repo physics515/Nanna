@@ -712,12 +712,28 @@ Your task: {task}")
         }
     }
 
+    /// Stop a session's running turn before the session is deleted — the same
+    /// path as Stop. Deleting used to leave the turn running: the model kept
+    /// generating (and a mission kept calling tools, for hours) for a
+    /// conversation that no longer existed, and its reply was persisted into
+    /// nothing.
+    async fn stop_running_turn(&self, id: &str) {
+        if let Some(ref agent) = self.agent
+            && agent.cancel(id).await
+        {
+            info!(session_id = %id, "stopped the running turn of a session being deleted");
+        }
+    }
+
     /// `SessionAction::DeleteAll`: delete every session, announcing each deletion.
     async fn delete_all_sessions(&self) -> Value {
         // The store reports only a count, so read the ids first. A session created in
         // the gap between the two calls is deleted without an event; clients re-fetch
         // the list on any deletion, so the window costs one stale row at most.
         let ids: Vec<crate::SessionId> = self.sessions.list().await.into_iter().map(|s| s.id).collect();
+        for id in &ids {
+            self.stop_running_turn(id).await;
+        }
         let count = self.sessions.delete_all().await;
         for id in ids {
             self.notify_session_event(Event::SessionDeleted { id });
@@ -760,6 +776,7 @@ Your task: {task}")
 
     /// `SessionAction::Delete`: delete a session and announce it.
     async fn session_delete(&self, id: String) -> Value {
+        self.stop_running_turn(&id).await;
         if self.sessions.delete(&id).await {
             self.notify_session_event(Event::SessionDeleted { id: id.clone() });
             json!({ "status": "deleted", "id": id })
