@@ -5331,6 +5331,35 @@ fn stream_error_event(e: LlmError) -> StreamEvent {
 // Ollama streaming: NDJSON translation
 // ============================================================================
 
+/// A tool-use id for a provider that sends none (Ollama).
+///
+/// Unique for the life of the process. These ids used to be a per-response
+/// counter (`toolu_00000001` for the first call of EVERY response), so one
+/// step's context held several different calls under one id: consumers keyed
+/// by id had to learn to tolerate collisions (the timeline journal and the
+/// GUI both carry workarounds), and a request replaying that context to a
+/// provider that requires unique ids — Anthropic, on a fallback mid-step —
+/// would be refused. Seeded from the clock so a restarted daemon does not
+/// begin again at the ids its persisted timelines already hold.
+fn synthesized_tool_use_id() -> String {
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: LazyLock<AtomicU64> = LazyLock::new(|| {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() << 20);
+        AtomicU64::new(seed)
+    });
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    debug_assert!(
+        n < u64::MAX,
+        "the counter cannot wrap within a process lifetime"
+    );
+    let id = format!("toolu_{n:016x}");
+    debug_assert_eq!(id.len(), "toolu_".len() + 16, "fixed-width ids");
+    id
+}
+
 /// One routed piece of a content stream: reasoning or reply.
 #[derive(Debug, PartialEq, Eq)]
 enum ContentSegment {
@@ -5675,8 +5704,7 @@ impl OllamaStreamState {
             self.next_block_index += 1;
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
             let args = tc["function"]["arguments"].to_string();
-            let tool_block_count = self.tool_block_count;
-            let id = tc["id"].as_str().map_or_else(|| format!("toolu_{tool_block_count:08x}"), String::from);
+            let id = tc["id"].as_str().map_or_else(synthesized_tool_use_id, String::from);
             items.push(Ok(StreamEvent::ContentBlockStart {
                 index: block_idx,
                 content_type: "tool_use".to_string(),
@@ -6345,11 +6373,11 @@ fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
 
     // Tool calls (Ollama v0.5+ format)
     if let Some(tool_calls) = message["tool_calls"].as_array() {
-        for (i, tc) in tool_calls.iter().enumerate() {
+        for tc in tool_calls {
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
             let input = tc["function"]["arguments"].clone();
             // Ollama doesn't provide tool call IDs, generate one
-            let id = format!("toolu_{i:08x}");
+            let id = synthesized_tool_use_id();
             content.push(ContentBlock::ToolUse { id, name, input });
         }
     }
@@ -7965,6 +7993,38 @@ mod inline_think_tests {
                 "still going and going".to_string()
             )]
         );
+    }
+
+    /// Synthesized tool-use ids never repeat: not within one response, and
+    /// not across responses — the per-response counter they replaced gave the
+    /// first call of every response the same id.
+    #[test]
+    fn synthesized_tool_use_ids_are_unique_across_responses() {
+        let call = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    { "function": { "name": "a", "arguments": {} } },
+                    { "function": { "name": "b", "arguments": {} } },
+                ],
+            },
+            "done": true,
+        });
+        let mut ids = Vec::new();
+        for _response in 0..3 {
+            let mut state = OllamaStreamState::default();
+            let (items, _) = state.on_object(&call, 0);
+            ids.extend(items.into_iter().filter_map(|item| match item {
+                Ok(StreamEvent::ContentBlockStart {
+                    tool_id: Some(id), ..
+                }) => Some(id),
+                _ => None,
+            }));
+        }
+        assert_eq!(ids.len(), 6, "two calls per response, three responses");
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "ids repeat: {ids:?}");
     }
 
     /// Through the NDJSON translator: the reply's text deltas carry no tag

@@ -811,21 +811,10 @@ impl ScriptedOllama {
         let base_url = format!("http://{}", listener.local_addr().expect("stub address"));
         let chat_bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let seen = std::sync::Arc::clone(&chat_bodies);
-        let answer = |content: &str| {
-            serde_json::json!({
-                "model": STUB_MODEL,
-                "message": { "role": "assistant", "content": content },
-                "done": true,
-                "done_reason": "stop",
-                "prompt_eval_count": 20,
-                "eval_count": 8,
-            })
-            .to_string()
-        };
-        let plan = answer(
+        let plan = scripted_reply(
             r#"[{"title":"Answer the question","description":"Reply directly.","acceptance":null}]"#,
         );
-        let steps: Vec<String> = steps.iter().map(|text| answer(text)).collect();
+        let steps: Vec<String> = steps.iter().map(|text| scripted_reply(text)).collect();
         tokio::spawn(async move {
             let mut step_index = 0_usize;
             while let Ok((mut socket, _)) = listener.accept().await {
@@ -853,6 +842,33 @@ impl ScriptedOllama {
             chat_bodies,
         }
     }
+}
+
+/// One scripted model message as an Ollama NDJSON line. `CALL <tool> <json>`
+/// is a tool call with those arguments; anything else is reply text.
+fn scripted_reply(script: &str) -> String {
+    let message = match script.strip_prefix("CALL ") {
+        Some(call) => {
+            let (name, arguments) = call.split_once(' ').unwrap_or((call, "{}"));
+            let arguments: serde_json::Value =
+                serde_json::from_str(arguments).expect("scripted tool arguments are JSON");
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{ "function": { "name": name, "arguments": arguments } }],
+            })
+        }
+        None => serde_json::json!({ "role": "assistant", "content": script }),
+    };
+    serde_json::json!({
+        "model": STUB_MODEL,
+        "message": message,
+        "done": true,
+        "done_reason": "stop",
+        "prompt_eval_count": 20,
+        "eval_count": 8,
+    })
+    .to_string()
 }
 
 /// Read one HTTP/1.1 request; returns (request line, body).
@@ -1324,6 +1340,72 @@ async fn a_claimed_completion_with_nothing_said_is_stated_not_silent() {
     assert!(
         !reply.contains("TASK COMPLETE"),
         "the marker stays plumbing"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A tool-using turn end to end: the model discovers a tool, calls it, and
+/// reports — and the persisted reply records both calls, each under its own
+/// id. Ollama sends no call ids; the synthesized ones used to restart per
+/// response, so both calls here were `toolu_00000001`.
+#[tokio::test]
+async fn a_tool_using_turn_records_each_call_under_its_own_id() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"CALL discover_tools {"query":"echo"}"#.to_string(),
+        r#"CALL echo {"text":"hello from echo"}"#.to_string(),
+        "The echo tool said hello from echo.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("tools".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let reply = converse(&client, &session, "Echo hello.").await;
+    assert_eq!(reply.trim(), "The echo tool said hello from echo.");
+
+    let history = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("sessions.history answers");
+    let timeline = history["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().find(|m| m["role"] == "assistant"))
+        .and_then(|reply| reply["timeline"].as_array())
+        .unwrap_or_else(|| panic!("the reply is persisted with a timeline: {history}"));
+    let calls: Vec<(&str, &str, bool)> = timeline
+        .iter()
+        .filter(|item| item["kind"] == "tool")
+        .map(|item| {
+            (
+                item["name"].as_str().unwrap_or_default(),
+                item["call_id"].as_str().unwrap_or_default(),
+                item["success"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!((calls[0].0, calls[1].0), ("discover_tools", "echo"));
+    assert!(
+        calls.iter().all(|call| call.2),
+        "both calls succeeded: {calls:?}"
+    );
+    assert_ne!(
+        calls[0].1, calls[1].1,
+        "each call has its own id: {calls:?}"
     );
 
     client.disconnect().await;

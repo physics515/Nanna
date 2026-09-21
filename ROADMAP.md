@@ -1955,6 +1955,19 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             tool calls, never on a cancel (an empty stopped turn is what Stop asked for). E2e
             `a_claimed_completion_with_nothing_said_is_stated_not_silent`; with the call removed
             the reply is `""`.
+      - [x] *(2026-09-21)* **Ollama tool calls got the same id in every response.** Ollama sends
+            no call ids; the synthesized ones were a per-response counter, so the first call of
+            *every* response was `toolu_00000001` — a tool-using turn persisted `discover_tools` and
+            `echo` under one id, and one step's context carried both. The timeline journal and the
+            GUI had each grown a workaround ("match only OPEN items, ids recur"), but anything
+            replaying that context to a provider requiring unique `tool_use` ids — Anthropic on a
+            mid-step fallback — would be refused. Now `synthesized_tool_use_id`: a process-wide
+            counter, clock-seeded so a restarted daemon does not begin again at ids its persisted
+            timelines already hold; same `toolu_` + hex shape, both synthesis sites (stream and
+            non-stream). Unit test across three translated responses (fails by name with a constant
+            id) + e2e `a_tool_using_turn_records_each_call_under_its_own_id` (discover → call →
+            report, both calls succeed, distinct ids). The two workarounds stay: they are correct
+            and cost nothing.
             - [ ] **The converging repeat is still streamed.** The user sees the answer twice
                   (paragraph-separated) — down from seven, but the second copy is the signal and
                   cannot be recognized until it has finished streaming. Options: hold back a
