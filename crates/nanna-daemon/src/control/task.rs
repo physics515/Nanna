@@ -470,6 +470,12 @@ impl ControlPlane {
             degradations: self.degradations.clone(),
             // A task run is not answering a message: nothing was attached.
             attachments: Arc::default(),
+            // Background runs fall back down the priority list like chat.
+            model_chain: {
+                let models = agent.chat_model_chain().await;
+                (!models.is_empty())
+                    .then(|| Arc::new(crate::tasks::ModelChain::new(models, router)))
+            },
         };
         let mut config = LongHorizonConfig::default();
         if let Some(secs) = max_wall_clock_secs {

@@ -207,6 +207,8 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         // No daemon provider plumbing in the eval — no transitions to report.
         degradations: None,
         attachments: std::sync::Arc::default(),
+        // The eval measures ONE model: a fallback would score another.
+        model_chain: None,
     };
     EvalEnv { storage, runner }
 }

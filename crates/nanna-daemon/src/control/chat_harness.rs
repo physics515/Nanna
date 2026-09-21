@@ -873,6 +873,21 @@ impl ChatTurn {
         let is_pinned = chat_model.is_some();
         let agent_config =
             turn_agent_config(self.agent.agent_config().await, chat_model);
+        // The fallback walk down the priority list. A pinned chat gets none:
+        // answering on a model the user did not pick, with the pin still
+        // showing, is the silent substitution the pin exists to rule out.
+        let model_chain = if is_pinned {
+            None
+        } else {
+            let mut models = self.agent.chat_model_chain().await;
+            if models.first() != Some(&agent_config.model) {
+                models.retain(|m| m != &agent_config.model);
+                models.insert(0, agent_config.model.clone());
+            }
+            Some(Arc::new(
+                crate::tasks::ModelChain::new(models, &self.router).announcing_to(sink.clone()),
+            ))
+        };
 
         // SAY which model won, for the same reason the workspace
         // resolution above says which workspace won: an override
@@ -913,6 +928,7 @@ impl ChatTurn {
             // next tool result (P22 Tier 4).
             degradations: self.this.degradations.clone(),
             attachments: Arc::clone(&self.attachments),
+            model_chain,
         };
         // The planner shares the step runner's provider handling
         // but must not stream its JSON into the transcript —
@@ -961,7 +977,9 @@ impl ChatTurn {
         // nothing saying so, which is the silent-substitution class
         // this project has already been bitten by. So name the pin,
         // say it is THIS chat's, and say how to drop it.
-        let model = step_runner.agent_config.model.clone();
+        // The model the run will actually START on: the first one in the
+        // priority list a provider serves (see `ModelChain::new`).
+        let model = step_runner.active_model();
         self.live.set_model(&model);
         // A blank name is no model at all. It must be caught here, not by the
         // provider check below: an unprefixed name resolves to whichever
@@ -2470,6 +2488,9 @@ fn planner_runner_for(step_runner: &AgentStepRunner) -> AgentStepRunner {
         // The planner answers in JSON about the request's text; the images
         // are for the steps that do the work.
         attachments: Arc::default(),
+        // One walk per run: a model the planner saw fail is not retried
+        // by the next step, and the other way round.
+        model_chain: step_runner.model_chain.clone(),
     }
 }
 
@@ -3923,6 +3944,7 @@ fn fresh_step_runner(previous: &AgentStepRunner) -> AgentStepRunner {
         gpu_fault_count: previous.gpu_fault_count.clone(),
         degradations: previous.degradations.clone(),
         attachments: Arc::clone(&previous.attachments),
+        model_chain: previous.model_chain.clone(),
     }
 }
 

@@ -6178,6 +6178,17 @@ impl DaemonBuilder {
         self
     }
 
+    /// The chat model priority list, head first — what `[llm]
+    /// model_priority` sets, so a test can exercise the fallback walk.
+    #[must_use]
+    pub fn with_model_priority(mut self, models: Vec<String>) -> Self {
+        if let Some(head) = models.first() {
+            self.config.agent.model.clone_from(head);
+        }
+        self.config.agent.model_priority = models;
+        self
+    }
+
     /// Point the chat router's Ollama provider at `host` — the only provider
     /// a hermetic test can stand up locally, so it is what lets an end-to-end
     /// test run a real conversation turn against a scripted server.
