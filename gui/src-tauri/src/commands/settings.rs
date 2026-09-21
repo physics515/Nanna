@@ -504,14 +504,13 @@ pub async fn set_provider_api_key(
 
     // Durable storage is the OS keyring; config.toml never receives secrets.
     // (claude-proxy is a URL, not a secret — strip_secrets leaves it alone.)
-    if provider != "claude-proxy" {
-        if let Err(e) = state_guard.config.migrate_secrets_to_keyring() {
-            error!("Failed to store API key in keyring: {e}");
-            return Err(format!("failed to store API key securely: {e}"));
-        }
-        // migrate_secrets_to_keyring() blanks every secret it stores; refill so
-        // in-memory state (and the OAuth badge) keeps the session's credentials.
-        state_guard.config.load_secrets_from_store();
+    // store_secrets() refills what it stores, so in-memory state (and the OAuth
+    // badge) keeps the session's credentials.
+    if provider != "claude-proxy"
+        && let Err(e) = state_guard.config.store_secrets()
+    {
+        error!("Failed to store API key in keyring: {e}");
+        return Err(format!("failed to store API key securely: {e}"));
     }
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);

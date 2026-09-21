@@ -2,8 +2,9 @@
 
 use console::{Emoji, style};
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
+use nanna_config::credentials::CredentialError;
 use nanna_config::{Config, DiscordConfig, LlmConfig, SlackConfig, TelegramConfig};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 static MOON: Emoji<'_, '_> = Emoji("🌙 ", "");
 static CHECK: Emoji<'_, '_> = Emoji("✓ ", "[ok] ");
@@ -103,14 +104,56 @@ fn store_entered_key(llm: &mut LlmConfig, key: String) {
 }
 
 /// Persist config: secrets → keyring, non-secrets → config.toml.
-fn persist_config(config: &mut Config) -> anyhow::Result<()> {
-    if let Err(e) = config.migrate_secrets_to_keyring() {
+///
+/// Returns whether the chat key held going in came back from the secure store (see
+/// [`persist_config_to`]).
+fn persist_config(config: &mut Config) -> anyhow::Result<bool> {
+    persist_config_to(
+        config,
+        &Config::default_config_path()?,
+        Config::store_secrets,
+    )
+}
+
+/// [`persist_config`] to `path`, filing secrets with `store_secrets`.
+///
+/// The config is handed back to the caller, which builds the chat client from it straight away,
+/// so the secrets must still be held once stored (`store_secrets` refills them). A store can
+/// accept a write and then have nothing to read back (a locked or absent secret service): the
+/// chat key held going in is then kept for this run, and `false` returned, since the next run will
+/// not find it. Another key coming back (the environment's, which a load prefers) is the one later
+/// runs use too, so it stays.
+fn persist_config_to(
+    config: &mut Config,
+    path: &Path,
+    store_secrets: impl FnOnce(&mut Config) -> Result<(), CredentialError>,
+) -> anyhow::Result<bool> {
+    let entered = config
+        .llm
+        .provider_api_key()
+        .map(|key| key.trim().to_owned());
+    if let Err(e) = store_secrets(config) {
         // Don't write secrets to disk as a consolation prize.
         config.strip_secrets_for_disk();
         return Err(anyhow::anyhow!("failed to store secrets securely: {e}"));
     }
-    config.save()?;
-    Ok(())
+    config.save_to(path)?;
+    match entered {
+        Some(entered) if config.llm.provider_api_key().is_none() => {
+            store_entered_key(&mut config.llm, entered);
+            Ok(false)
+        }
+        _ => Ok(true),
+    }
+}
+
+/// Say that the key just entered was stored but did not come back from the secure store.
+fn warn_key_not_read_back(env_var: &str) {
+    println!(
+        "{}The API key was stored, but the secure store could not give it back: it is used for \
+         this run only, and the next run will ask for it again. Set {env_var} to keep it.",
+        style("⚠️  ").yellow()
+    );
 }
 
 
@@ -335,7 +378,11 @@ pub fn run_onboarding() -> anyhow::Result<Config> {
 
     // Save config
     println!("\n{CHECK}{}", style("Saving configuration...").bold());
-    persist_config(&mut config)?;
+    if !persist_config(&mut config)? {
+        warn_key_not_read_back(
+            provider_api_key_env(&config.llm.provider).unwrap_or("ANTHROPIC_API_KEY"),
+        );
+    }
 
     let config_path = Config::default_config_path()?;
     println!(
@@ -381,9 +428,11 @@ pub fn quick_setup(config: &mut Config) -> anyhow::Result<()> {
     }
 
     store_entered_key(&mut config.llm, api_key);
-    persist_config(config)?;
-
-    println!("{CHECK}API key saved to the OS keychain.");
+    if persist_config(config)? {
+        println!("{CHECK}API key saved to the OS keychain.");
+    } else {
+        warn_key_not_read_back(env_var);
+    }
     Ok(())
 }
 
@@ -466,7 +515,11 @@ pub fn show_status(config: &Config) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_api_key_in, has_api_key_with, provider_api_key_env, store_entered_key};
+    use super::{
+        has_api_key_in, has_api_key_with, persist_config_to, provider_api_key_env,
+        store_entered_key,
+    };
+    use nanna_config::credentials::{SecureStore, keys};
     use nanna_config::{Config, LlmConfig};
     use std::collections::HashMap;
 
@@ -595,5 +648,94 @@ mod tests {
 
         config.llm.openrouter_api_key = Some("sk-or-v1-own".to_string());
         assert!(has_api_key_in(&config, env_of(&[])));
+    }
+
+    #[test]
+    fn a_key_entered_at_setup_is_still_held_once_persisted() {
+        // `quick_setup` (and the first-run wizard) persist the key just entered and hand the same
+        // config to the chat client. Storing it used to blank it, so that first chat failed with
+        // "API key required" and only the next run, loading it back, worked.
+        for (provider, entry) in [
+            ("anthropic", keys::ANTHROPIC_API_KEY),
+            ("openai", keys::OPENAI_API_KEY),
+            ("openrouter", keys::OPENROUTER_API_KEY),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = SecureStore::file_only_at(dir.path().join("store"));
+            let path = dir.path().join("config.toml");
+            let mut config = Config::default();
+            config.llm.provider = provider.to_owned();
+            store_entered_key(&mut config.llm, "sk-entered".to_owned());
+
+            let read_back = persist_config_to(&mut config, &path, |config| {
+                config.store_secrets_in(&store, env_of(&[]))
+            })
+            .expect("persisted");
+
+            assert!(read_back, "{provider}");
+            assert_eq!(
+                config.llm.provider_api_key(),
+                Some("sk-entered"),
+                "{provider}: held for the chat"
+            );
+            assert!(has_api_key_in(&config, env_of(&[])), "{provider}");
+            assert_eq!(
+                store.get(entry).ok().as_deref(),
+                Some("sk-entered"),
+                "{provider}: filed in the secure store for the next run"
+            );
+            let on_disk = std::fs::read_to_string(&path).expect("config.toml written");
+            assert!(
+                !on_disk.contains("sk-entered"),
+                "secrets never go into config.toml: {on_disk}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_the_store_cannot_give_back_is_still_held_for_this_run() {
+        // A keyring can accept a write and then have nothing to read back (a locked or absent
+        // secret service). The chat this setup is for still gets the key; only later runs lack it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.llm.provider = "openrouter".to_owned();
+        store_entered_key(&mut config.llm, " sk-entered ".to_owned());
+
+        let read_back = persist_config_to(&mut config, &path, |config| {
+            // Filed, and nothing comes back.
+            config.llm.openrouter_api_key = None;
+            Ok(())
+        })
+        .expect("persisted");
+
+        assert!(
+            !read_back,
+            "the next run will not find it, so setup says so"
+        );
+        assert_eq!(
+            config.llm.openrouter_api_key.as_deref(),
+            Some("sk-entered"),
+            "back in the provider's own field"
+        );
+        assert_eq!(config.llm.api_key, None);
+    }
+
+    #[test]
+    fn a_key_the_environment_supplies_instead_is_not_reported_lost() {
+        // A load prefers the environment's key, so that is the one every later run uses too.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecureStore::file_only_at(dir.path().join("store"));
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        store_entered_key(&mut config.llm, "sk-entered".to_owned());
+
+        let read_back = persist_config_to(&mut config, &path, |config| {
+            config.store_secrets_in(&store, env_of(&[("ANTHROPIC_API_KEY", "sk-env")]))
+        })
+        .expect("persisted");
+
+        assert!(read_back);
+        assert_eq!(config.llm.provider_api_key(), Some("sk-env"));
     }
 }

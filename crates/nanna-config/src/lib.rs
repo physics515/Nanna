@@ -907,8 +907,9 @@ impl Config {
     }
 
     /// Persist any secret fields currently held in-memory into the OS keyring
-    /// (or encrypted file fallback), then blank them on this Config. Call after
-    /// onboarding / GUI key entry so `save()` never writes secrets to disk.
+    /// (or encrypted file fallback), then blank them on this Config. A caller
+    /// that goes on using this Config wants [`Self::store_secrets`], which
+    /// refills it. (`save()` never writes secrets to disk either way.)
     ///
     /// # Errors
     ///
@@ -963,6 +964,37 @@ impl Config {
             }
         }
         channel_secrets::file(&mut self.channels, store)
+    }
+
+    /// File every secret held in memory in the OS keyring (or encrypted file
+    /// fallback) and go on holding it: [`Self::migrate_secrets_to_keyring`],
+    /// then [`Self::load_secrets_from_store`]. This `Config` is left with its
+    /// secrets as the next [`Self::load`] gets them back, so a caller that goes
+    /// on using it (a chat started right after the key was entered) has the
+    /// key; [`Self::save`] still writes none of them to disk.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::migrate_secrets_to_keyring`]; this `Config` is then not
+    /// refilled.
+    pub fn store_secrets(&mut self) -> Result<(), crate::credentials::CredentialError> {
+        self.store_secrets_in(&crate::credentials::SecureStore::new(), process_env)
+    }
+
+    /// [`Self::store_secrets`] into a given store, refilling from it and `env`
+    /// (read as a load reads the process environment).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::store_secrets`].
+    pub fn store_secrets_in(
+        &mut self,
+        store: &crate::credentials::SecureStore,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), crate::credentials::CredentialError> {
+        self.migrate_secrets_to(store)?;
+        self.load_secrets_from(store, env);
+        Ok(())
     }
 
     /// Hydrate secret fields from `SecureStore` + environment if they are unset.
@@ -1769,6 +1801,38 @@ mod tests {
         }
         // In-memory config is untouched so the running process still has the keys.
         assert_eq!(cfg.llm.api_key.as_deref(), Some("sk-secret-anthropic"));
+    }
+
+    #[test]
+    fn storing_secrets_leaves_them_held_as_a_load_gets_them_back() {
+        // Onboarding stores the key just entered and builds the chat client from
+        // the same Config; the migrate alone blanked it, so that chat had no key.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::credentials::SecureStore::file_only_at(dir.path().to_path_buf());
+        let no_env = |_: &str| None;
+        let mut cfg = Config::default();
+        cfg.llm.api_key = Some(" sk-entered ".into());
+        cfg.llm.openai_api_key = Some("sk-openai".into());
+        cfg.llm.ollama_api_key = Some("ollama-token".into());
+        cfg.tools.brave_api_key = Some("brave".into());
+
+        cfg.store_secrets_in(&store, no_env).unwrap();
+
+        assert_eq!(
+            cfg.llm.api_key.as_deref(),
+            Some("sk-entered"),
+            "held as stored"
+        );
+        let mut next_run = Config::default();
+        next_run.load_secrets_from(&store, no_env);
+        assert_eq!(cfg.llm.api_key, next_run.llm.api_key);
+        assert_eq!(cfg.llm.openai_api_key, next_run.llm.openai_api_key);
+        assert_eq!(cfg.llm.ollama_api_key, next_run.llm.ollama_api_key);
+        assert_eq!(cfg.tools.brave_api_key, next_run.tools.brave_api_key);
+        assert!(
+            cfg.llm.ollama_api_key.is_some(),
+            "bound to this server, so held"
+        );
     }
 
     #[test]
