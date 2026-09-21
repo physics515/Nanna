@@ -55,6 +55,18 @@ her memory of the conversation. Large arguments are now summarized the same way 
 **Reasoning stays out of replies.** Models that write `<think>…</think>` inline had their whole
 chain of thought delivered as the answer. It is now kept as reasoning.
 
+**Ctrl+Enter right after typing always sends.** The composer judged whether it was empty from a
+copy of your text that lagged a frame or two behind, so a message sent the instant it was typed
+could stay in the box, unsent and unexplained. It now reads the text itself. Sending with
+Ctrl+Enter also no longer leaves an invisible line break behind that kept the Send button lit.
+
+**Each provider's API key stays with that provider.** A key that `nanna init` saved for OpenRouter
+or OpenAI was also read as the Anthropic key, so a `claude-*` chat or an Anthropic summary could
+send it to Anthropic. Every provider now has its own field and keyring entry. The first time Nanna
+loads a config saved the old way, it moves the key to its provider's entry, once. A key with
+Anthropic's `sk-ant-` prefix is never moved. Neither is a key that disagrees with one already in the
+provider's own place: both are kept, and a warning names the conflict.
+
 **Small things.** Tool errors no longer read `Error: Error: …`; tool calls from Ollama get unique ids;
 a blank message is refused instead of being answered as if you had asked something.
 A message too long for the model's context window now says exactly that, instead of blaming GPU
@@ -84,8 +96,8 @@ audit (RustSec and npm) runs on every lockfile change and weekly.
 
 # Also in this update
 
-Versions 0.3.22 and 0.3.23 were prepared but never published on their own. If you are updating
-from 0.3.21, everything below is new to you as well.
+Version 0.3.23 was prepared but never published on its own, so its notes below are new to you as
+well. Version 0.3.22 was published; its notes are here for anyone updating from 0.3.21.
 
 ## Nanna v0.3.23-beta.32 — Measuring Before Building
 
