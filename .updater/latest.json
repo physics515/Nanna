@@ -1,15 +1,15 @@
 {
-  "version": "0.3.24",
-  "notes": "Plain chat, told straight: answers given once, pictures reach the model, any language survives streaming — plus MCP both ways, remote Ollama with a token, and faster recall",
-  "pub_date": "2026-09-21T16:25:46.321Z",
+  "version": "0.3.25",
+  "notes": "Ctrl+Enter right after typing now always sends: a message typed and sent in the same instant could stay in the box, unsent. And a Telegram or Discord token in the environment no longer wipes that channel's settings, including Telegram's list of who may use the bot.",
+  "pub_date": "2026-09-21T17:31:03Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaW0xR0NnckhTVC94TjZUTWExVHJwait6OE5yRXI2TWR0UExrUG81OXQ4b3N3ek1EcHNCOGFNdUFObk5tS1JVZG5SMG5TRm9UMkVnZ3hxYUdvYVhvNEFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDA3Nzc5CWZpbGU6TmFubmFfMC4zLjI0X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMjQKamE5ODExUVZnNmtiUEpBTEYwNUVYT3o3U0t1bGp2UjlDZnRCVlk0UThnc3ZESUJWTlNXNjFSdnB5T0RHaU9oR2xnMXBRd3ZJUFoyY1JxTk9IRDFaQmc9PQo=",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.24-beta.33/Nanna_0.3.24_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXFEdVNueEU4eEJZMVE4OFhINmRnZXlUVStiNFF3OG04S0hpLzFpaFl4OGZOOTJjT0h2cHFKVURuSFc3UE9IMks2b0JDK3lWSXV4STVsMjNEVGx4blFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDExODExCWZpbGU6TmFubmFfMC4zLjI1X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMjUKY0UzZXhZV2N1aUlSUkJ5MWJXcGZvU0JnY1pWSHZ3dnhGWVlhN0RsSTZEZHFaZk5jMk5WYjVEQ0puYXJaZ3plVkoyckVoNkNwWEdFNVp1ZGgzWHVBRGc9PQo=",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.25-beta.34/Nanna_0.3.25_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXE1bFdhS3hLeTR3RnhSbXJja0oyT3hCSGVPejYzcjEwT3JBOWs0cTJKYUZWbWxkWjhGYUIzUmlJMEJRWDlIUS9WRDB4MUVyaStobTY4d0pnSWdmdVF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDA2OTI1CWZpbGU6TmFubmFfMC4zLjI0X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjI0CmhXMGIxU2VuM3dhSGpLUW5mQTFpd1lJdGtsZDFRcjE5UDg0S3VETG9tcG8zUmNZRE56cE0rQ1dVdU9Gdlpuazd5eUNHUjBWeEdHQzNwcUhhVHhBQ0R3PT0K",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.24-beta.33/Nanna_0.3.24_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXVYWUNJbUNJUzRKSDRjYUFGamMzUEdnd3B5ZHh1NmpjWjNjcW53ZjBmM3pPRk5IejJ0dmpKbE1wUkoxVmxRYlFmdUpsLzlBdTRjRjJrWkh5QXNZRVE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDEwNTI5CWZpbGU6TmFubmFfMC4zLjI1X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjI1ClVqR3E4VThqdWt1RUpIVzBUdkdlWVBOQU9weTkzQzVQNTFWUmtWRHkyMDhJUjRuM2xnR05yUCs1a0llZXF5bTBRcWVBQkVBekZTQVpNYy8vaFVLb0FBPT0K",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.25-beta.34/Nanna_0.3.25_amd64.AppImage"
     }
   }
 }
