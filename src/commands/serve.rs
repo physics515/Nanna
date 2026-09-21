@@ -28,6 +28,24 @@ pub fn server_port(flag: Option<u16>, config: &Config) -> u16 {
     port
 }
 
+/// A channel's bot token: the one its config holds, else `var` from `env`;
+/// `None` when neither holds one that is not blank.
+///
+/// A configured channel's token is filled at load from the environment or the
+/// secure store (it is never in `config.toml`), so a section whose token is in
+/// neither holds an empty one — no token, not a bot to start with `""`.
+fn channel_token(
+    configured: Option<&str>,
+    var: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let set = |token: &String| !token.trim().is_empty();
+    configured
+        .map(str::to_owned)
+        .filter(set)
+        .or_else(|| env(var).filter(set))
+}
+
 /// The [`Nanna`] instance `nanna serve` keeps for backwards compatibility,
 /// on the provider `config` names.
 ///
@@ -83,24 +101,30 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
     let bot = build_bot(config).await?;
 
     // Get Telegram token from config or environment
-    let telegram_token = config
-        .channels
-        .telegram
-        .as_ref()
-        .map(|t| t.bot_token.clone())
-        .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok());
+    let telegram_token = channel_token(
+        config
+            .channels
+            .telegram
+            .as_ref()
+            .map(|t| t.bot_token.as_str()),
+        "TELEGRAM_BOT_TOKEN",
+        |var| std::env::var(var).ok(),
+    );
 
     if telegram_token.is_some() {
         info!("Telegram channel enabled");
     }
 
     // Get Discord config
-    let discord_bot_token = config
-        .channels
-        .discord
-        .as_ref()
-        .map(|d| d.bot_token.clone())
-        .or_else(|| std::env::var("DISCORD_BOT_TOKEN").ok());
+    let discord_bot_token = channel_token(
+        config
+            .channels
+            .discord
+            .as_ref()
+            .map(|d| d.bot_token.as_str()),
+        "DISCORD_BOT_TOKEN",
+        |var| std::env::var(var).ok(),
+    );
 
     let discord_app_id = config
         .channels
@@ -314,5 +338,27 @@ mod tests {
     #[test]
     fn the_default_port_is_unchanged() {
         assert_eq!(server_port(None, &Config::default()), 3000);
+    }
+
+    /// A channel section whose token is in neither the secure store nor the
+    /// environment loads with an empty one. That is no token — not a bot to
+    /// start with `""` — and the environment still gets its say.
+    #[test]
+    fn an_empty_channel_token_is_no_token() {
+        let var = "TELEGRAM_BOT_TOKEN";
+        let no_env = |_: &str| None;
+        let env = |name: &str| (name == var).then(|| "env-token".to_string());
+        assert_eq!(channel_token(Some(""), var, no_env), None);
+        assert_eq!(channel_token(Some("  "), var, no_env), None);
+        assert_eq!(channel_token(None, var, no_env), None);
+        assert_eq!(
+            channel_token(Some(""), var, env).as_deref(),
+            Some("env-token")
+        );
+        assert_eq!(channel_token(None, var, env).as_deref(), Some("env-token"));
+        assert_eq!(
+            channel_token(Some("config-token"), var, env).as_deref(),
+            Some("config-token")
+        );
     }
 }
