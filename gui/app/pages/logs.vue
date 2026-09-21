@@ -47,7 +47,7 @@
     </div>
 
     <div class="relative z-10 px-4 sm:px-6 py-2 border-b border-white/[0.04] flex flex-wrap gap-2">
-      <input v-model="searchQuery" aria-label="Search logs" placeholder="Search logs" class="glass-well rounded px-2 py-1 text-xs" />
+      <input v-model="searchQuery" aria-label="Search logs" placeholder="Search logs or a session id" class="glass-well rounded px-2 py-1 text-xs" />
       <select v-model="levelFilter" aria-label="Filter by level" class="glass-well rounded px-2 py-1 text-xs">
         <option value="all">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warn">Warn</option><option value="error">Error</option>
       </select>
@@ -110,7 +110,7 @@
                is on the title attribute. -->
           <div
             class="py-1 px-2 rounded transition-colors group cursor-default h-full flex items-center whitespace-nowrap overflow-hidden"
-            :title="log.message"
+            :title="log.scope ? `${log.message}\n${log.scope}` : log.message"
             :class="[
             'hover:bg-white/[0.03]',
             log.level === 'error' ? 'text-red-400/80' :
@@ -140,6 +140,7 @@
           </span>
           <span class="text-white/20 text-xs select-none shrink-0">[{{ log.target }}]</span>
           <span class="ml-2 truncate">{{ log.message }}</span>
+          <span v-if="log.scope" class="ml-2 truncate text-white/25 text-xs">{{ log.scope }}</span>
           </div>
         </template>
       </VirtualList>
@@ -182,6 +183,7 @@
           </span>
           <span class="text-white/20 text-xs select-none">[{{ log.target }}]</span>
           <span class="ml-2 break-words">{{ log.message }}</span>
+          <span v-if="log.scope" class="ml-2 break-all text-white/25 text-xs">{{ log.scope }}</span>
         </div>
       </div>
     </div>
@@ -205,6 +207,9 @@ interface LogEntry {
   message: string
   // Absent only if an older daemon omitted it; rendered as 'daemon' in that case.
   source?: LogSource
+  // The span chain the line was logged in (turn → step → call). Absent for a
+  // line outside any span, and from older daemons.
+  scope?: string
 }
 
 /** How often the view re-reads the buffers while Live. */

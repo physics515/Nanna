@@ -1728,11 +1728,23 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             / #3616 still open, `tracing-subscriber` latest is 0.3.23). Today the setting is fixed
             at boot, so this is safe — if a "verbose spans" runtime toggle is ever added, gate it on
             a released fix or rebuild the subscriber rather than reloading the layer.
-      - [ ] **The GUI Logs page still sees none of it.** `nanna-core::LogBufferLayer` implements
+      - [x] **The GUI Logs page still sees none of it.** `nanna-core::LogBufferLayer` implements
             only `on_event` and keeps the message text, so the span context and every close
             line reach stdout and the file log but not `system logs`. Carrying it needs a
             `LookupSpan` bound, per-span field storage in extensions, and a `LogEntry` field the
             Logs page actually renders — ship both halves together, or it is a dead field.
+            *(2026-09-21, same run — both halves)* `LogEntry.scope` (omitted from the wire when
+            empty; `#[serde(default)]` for older daemons) holds the line's Nanna span chain,
+            outermost first, with each span's fields including ones recorded after it opened;
+            dependency spans are left out (same rule as the fmt layers) and the scope is capped at
+            512 bytes with the cut marked. The Logs page renders it dimmed after the message (full
+            text on hover) and **search matches it — pasting a session id narrows the log to that
+            conversation.** Real daemon over IPC `system logs`: 71 of 348 lines carried a chain,
+            including the scripting engine's own lines inside a tool call. Unit test (own-only,
+            outermost-first, recorded fields, empty scope off the wire), 2 new vitest cases,
+            `vue-tsc` clean, `pnpm build` green, `cargo check -p nanna-gui --tests` green.
+            **GUI rendering not verified on device** — the Linux WebDriver route needs the
+            `e2e-webdriver` feature that is still only in PR #344.
 - [~] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by
       session/day/month/model/tool, surface in GUI.
       *(2026-07-12)* Core shipped in `nanna-agent::cost`: `ModelPricing` (input/output/cache-read/cache-write
