@@ -496,11 +496,29 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [x] No SECURITY.md or vulnerability disclosure process.
       *(2026-07-24)* **`SECURITY.md` shipped** — supported versions, private disclosure via
       security@nanna.bot / GitHub private advisory, response targets, and scope.
-- [~] No Dependabot / cargo-audit / npm audit automation.
+- [x] No Dependabot / cargo-audit / npm audit automation.
       *(2026-07-24)* **Dependabot on.** `.github/dependabot.yml` covers cargo (workspace root,
       weekly, holds the intentional `turso`/`aegis` pins) and npm (`/gui`, weekly, ignores the
       documented deferred majors: tiptap/vue-router/vue-sonner/marked/typescript). cargo-audit /
       npm-audit CI steps remain open under P0.3.
+      *(2026-09-21)* **Audit gate landed: `.github/workflows/audit.yml`** — `cargo audit` over
+      `Cargo.lock` (fails on a RustSec vulnerability) and `pnpm audit --prod --audit-level=high`
+      over the GUI lockfile, on lockfile changes and weekly (an advisory can land against an
+      untouched lockfile). Both read only the lockfile — no toolchain, no install; verified
+      locally. **State today: 0 Rust vulnerabilities**, 16 warnings (14 unmaintained, 2 unsound),
+      none fixable from this tree; npm: 4 low/moderate. The gate was checked to have eyes: the
+      same pnpm audit at `moderate` exits 1. Thresholds are deliberate: failing on warnings would
+      leave the job permanently red, i.e. ignored.
+      - [ ] **`lru 0.16.4` is unsound (RUSTSEC-2026-0253, use-after-free when a key's `Drop` panics
+            inside `pop()`), patched in ≥ 0.18.2** — reached only via `tantivy 0.26` under turso's
+            exact `=0.7.2` pin, so it moves when turso does. Not reachable in shipped builds: it
+            needs unwinding plus `catch_unwind`, and the release profile is `panic = "abort"`.
+      - [ ] **Monaco vendors DOMPurify 3.4.8** (`monaco-editor/esm/vs/base/browser/dompurify/`) —
+            four advisories up to one moderate XSS (GHSA-vxr8-fq34-vvx9; fixed ≥ 3.4.13, latest
+            3.4.15). `monaco-editor 0.56.0` is the latest release. **A pnpm override would not help**:
+            the package-level `dompurify` it would bump is not the code monaco runs. Re-check on the
+            next monaco release; exposure is monaco's own hover/markdown rendering of local content.
+
 - [ ] No GitHub secret scanning enabled.
       *(2026-07-24)* Dependabot shipped (see above). Secret scanning itself is still a repo-admin
       toggle on GitHub and is not something a PR can flip — left open.
