@@ -2036,6 +2036,11 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             - [ ] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
                   for the same per-chunk decode once #344 merges (it is not on master, so it could
                   not be fixed here).
+      - [x] *(2026-09-21)* **Overlapping turns in two sessions pinned.** e2e
+            `overlapping_turns_in_two_sessions_stay_apart`: both turns in flight at once, each reply
+            answers its own question and lands only in its own history (the shape behind the
+            shared-workdir incident). The stub's step scripts take `{goal}`, filled from the step
+            prompt, so concurrent replies can be told apart.
       - [x] *(2026-09-21)* **Planner prose fallback pinned end to end.** e2e
             `a_planner_that_answers_in_prose_still_gets_the_question_answered`: the scripted planner
             replies in prose instead of JSON (routine for small models); the request becomes the one

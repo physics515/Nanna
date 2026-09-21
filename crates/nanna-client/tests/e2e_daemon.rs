@@ -837,10 +837,10 @@ impl ScriptedOllama {
                         let (ms, script) = rest.split_once(' ').unwrap_or((rest, ""));
                         (
                             ms.parse().expect("WAIT takes milliseconds"),
-                            scripted_reply(script),
+                            script.to_string(),
                         )
                     }
-                    None => (0, scripted_reply(text)),
+                    None => (0, text.clone()),
                 })
                 .collect(),
         );
@@ -877,8 +877,13 @@ impl ScriptedOllama {
                         )
                     } else {
                         let index = step_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let (delay_ms, line) = &steps[index.min(steps.len() - 1)];
-                        (*delay_ms, line.clone())
+                        let (delay_ms, script) = &steps[index.min(steps.len() - 1)];
+                        // `{goal}` names the request the step is working on,
+                        // so concurrent sessions' replies can be told apart.
+                        (
+                            *delay_ms,
+                            scripted_reply(&script.replace("{goal}", &step_goal(&body))),
+                        )
                     };
                     seen.lock().await.push(body);
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -940,6 +945,28 @@ fn planned_request(body: &str) -> String {
         .unwrap_or_default()
         .trim();
     let quoted = serde_json::to_string(request).unwrap_or_default();
+    quoted.trim_matches('"').to_string()
+}
+
+/// The goal a step prompt is working on (the line after `== GOAL`),
+/// JSON-escaped for splicing into a scripted reply.
+fn step_goal(body: &str) -> String {
+    let prompt = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|request| {
+            request["messages"].as_array()?.last()?["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let goal = prompt
+        .split("== GOAL")
+        .nth(1)
+        .and_then(|rest| rest.lines().nth(1))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let quoted = serde_json::to_string(&goal).unwrap_or_default();
     quoted.trim_matches('"').to_string()
 }
 
@@ -2337,6 +2364,68 @@ async fn a_message_sent_mid_turn_joins_the_running_turn() {
         reply.starts_with("First answer.\n\nAnswer to the interjection."),
         "both answered, in order, in the one reply: {reply:?}"
     );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// Two sessions' turns in flight at once stay apart: each reply answers its
+/// own question and lands in its own history. Overlapping turns are the
+/// shape behind the shared-workdir incident (one process-wide tool cwd let a
+/// second chat re-root a live turn into another project), and the reason the
+/// daemon's log lines now carry the session they came from.
+#[tokio::test]
+async fn overlapping_turns_in_two_sessions_stay_apart() {
+    // Each reply names the goal of the step that produced it; the delay
+    // keeps both turns in flight together.
+    let ollama = ScriptedOllama::start(vec![
+        "WAIT 400 Answer to: {goal}\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let mut sessions = Vec::new();
+    for name in ["alpha", "beta"] {
+        sessions.push(session_id_of(
+            &client
+                .sessions()
+                .create(Some(name.to_string()))
+                .await
+                .expect("sessions.create succeeds"),
+        ));
+    }
+    let (alpha, beta) = tokio::join!(
+        converse(&client, &sessions[0], "alpha question"),
+        converse(&client, &sessions[1], "beta question"),
+    );
+    assert_eq!(alpha.trim(), "Answer to: alpha question");
+    assert_eq!(beta.trim(), "Answer to: beta question");
+
+    for (session, own, other) in [
+        (&sessions[0], "alpha", "beta"),
+        (&sessions[1], "beta", "alpha"),
+    ] {
+        let history = client
+            .sessions()
+            .history(session, None)
+            .await
+            .expect("sessions.history answers")
+            .to_string();
+        assert!(
+            history.contains(&format!("Answer to: {own} question")),
+            "{history}"
+        );
+        assert!(
+            !history.contains(other),
+            "nothing of the other session leaked in: {history}"
+        );
+    }
 
     client.disconnect().await;
     daemon.stop();
