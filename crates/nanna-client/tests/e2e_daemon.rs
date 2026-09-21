@@ -1646,3 +1646,70 @@ async fn a_planner_that_answers_in_prose_still_gets_the_question_answered() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// Reminders, end to end, including the promise the `remind` skill makes to
+/// the model: the reminder "survives a restart of Nanna". The model sets one
+/// through the real skill and service, the daemon is stopped and started on
+/// the same data dir, and the reminder is posted into the conversation.
+///
+/// Slow by necessity: due reminders are swept every 30 s, so delivery lands
+/// up to that long after the restart.
+#[tokio::test]
+async fn a_reminder_set_in_chat_survives_a_restart_and_is_delivered() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"CALL remind {"message":"stretch your legs","delay_secs":2}"#.to_string(),
+        "Reminder set.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let configure = move |b: DaemonBuilder| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host.clone())
+            // The scheduler must run (it delivers reminders); only the
+            // heartbeat turn is kept out of the scripted conversation.
+            .with_heartbeat(false)
+    };
+    let daemon =
+        TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), configure.clone()).await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("reminder".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let reply = converse(&client, &session, "Remind me to stretch in two seconds.").await;
+    assert_eq!(reply.trim(), "Reminder set.");
+    client.disconnect().await;
+
+    let daemon = TestDaemon::start_with(daemon.stop(), configure).await;
+    let client = daemon.connect_client().await;
+    let mut events = client.subscribe_session(session.clone());
+    let delivered = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::SessionMessageAdded { content, .. }) => return content,
+                Ok(_) => {}
+                Err(e) => panic!("the event stream ended before the reminder: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the reminder is delivered after the restart");
+    assert!(delivered.contains("stretch your legs"), "{delivered:?}");
+
+    let history = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("sessions.history answers")
+        .to_string();
+    assert!(
+        history.contains("Reminder: stretch your legs"),
+        "the delivery is persisted in the conversation: {history}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

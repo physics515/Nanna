@@ -2042,6 +2042,13 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             task and the reply is exactly the answer. The stub's planner reply is now scriptable
             (`start_with_plan`). Also probed, no defect: a two-task plan streams as two paragraphs
             (the step-separator fix above) with the multi-item summary line.
+      - [x] *(2026-09-21)* **Reminders pinned end to end, restart included.** e2e
+            `a_reminder_set_in_chat_survives_a_restart_and_is_delivered`: the scripted model calls
+            the real `remind` skill, the daemon is stopped and restarted on the same data dir, and
+            `⏰ Reminder: …` is posted into the conversation (and persisted) — the promise the
+            skill's description makes to the model. ~30 s by necessity (the due sweep's cadence).
+            New builder option `with_heartbeat(false)`: the first probe ran with the scheduler on
+            and the heartbeat turn consumed the scripted `remind` call.
       - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
             behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
             comment says "the next message decides what happens to them" — but the harness simply

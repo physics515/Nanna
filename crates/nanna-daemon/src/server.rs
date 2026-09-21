@@ -6006,6 +6006,15 @@ impl DaemonBuilder {
         self
     }
 
+    /// The periodic heartbeat turn (`[scheduler] heartbeat_enabled`), under a
+    /// running scheduler. Off, reminders and cron still fire but no heartbeat
+    /// turn competes with the conversation a test is scripting.
+    #[must_use]
+    pub const fn with_heartbeat(mut self, enabled: bool) -> Self {
+        self.config.scheduler.heartbeat_enabled = enabled;
+        self
+    }
+
     #[must_use]
     pub const fn with_memory(mut self, enable: bool) -> Self {
         self.config.enable_memory = enable;
