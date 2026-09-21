@@ -49,6 +49,14 @@ pub mod keys {
     /// server sent it the previous server's token. A token with no record was
     /// saved by an older build and counts as the current server's.
     pub const OLLAMA_API_KEY_HOST: &str = "ollama_api_key_host";
+    /// Set once the store's `[llm]` keys have been sorted out under a
+    /// non-Anthropic `[llm].provider` (not a secret).
+    ///
+    /// Until 2026-09-18 `nanna init` filed that provider's key under
+    /// [`ANTHROPIC_API_KEY`]; the first load under such a provider moves it
+    /// to the provider's own entry. From then on only Anthropic's key is
+    /// saved there, so it is never looked at again.
+    pub const LLM_KEYS_FILED_BY_PROVIDER: &str = "llm_keys_filed_by_provider";
     pub const TELEGRAM_BOT_TOKEN: &str = "telegram_bot_token";
     pub const DISCORD_BOT_TOKEN: &str = "discord_bot_token";
     pub const SLACK_BOT_TOKEN: &str = "slack_bot_token";
@@ -481,7 +489,7 @@ impl SecureStore {
     /// # Errors
     /// Returns the keyring's error when it could not answer and the file
     /// store holds no copy, and the file store's own errors.
-    fn lookup(&self, key: &str) -> Result<Option<String>, CredentialError> {
+    pub(crate) fn lookup(&self, key: &str) -> Result<Option<String>, CredentialError> {
         let from_file = || match self.get_from_file(key) {
             Ok(value) => Ok(Some(value)),
             Err(CredentialError::NotFound) => Ok(None),

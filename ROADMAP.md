@@ -5414,7 +5414,7 @@ asks permission or restricts her.)*:
             expects each model on Ollama by its own router's rule. Still unbounded but for the
             transport: the Tier 2/3 chunk walk, where one conversation can legitimately need
             many calls.)*
-      - [ ] *(found 2026-09-18, reviewing the CLI's summarizer router)* **`[llm].api_key` means
+      - [~] *(found 2026-09-18, reviewing the CLI's summarizer router)* **`[llm].api_key` means
             two things.** The CLI (`nanna init`, the missing-key prompt, `init_components`) reads
             it as the key of `[llm].provider` and files it in the keyring under the *Anthropic*
             entry; the daemon's `LlmConfig::from_nanna` reads it as the Anthropic key whatever
@@ -5431,6 +5431,27 @@ asks permission or restricts her.)*:
             go to Anthropic and OpenAI directly — before, all three went to Anthropic unstripped
             and failed. `nanna init` should write `openrouter/<id>`, and the migration should
             prefix existing ones when `[llm].provider` is `openrouter`.
+            *(2026-09-21 — the key half done; the model-prefix half is still open.)*
+            `[llm].api_key` is Anthropic's alone, everywhere.
+            `LlmConfig::provider_api_key`/`_mut` name `[llm].provider`'s own field (`api_key`
+            only for Anthropic and for a name the CLI does not know); `nanna init`, the
+            missing-key prompt, `has_api_key` and `init_components` all go through it, and
+            `OPENAI_API_KEY` overrides `openai_api_key` instead of `api_key`. The move lives in
+            `nanna_config::provider_key`, run by every file load (CLI, daemon, reload, GUI)
+            before secrets are hydrated, only under `provider = "openai"`/`"openrouter"`: a key
+            config.toml itself carries in `api_key` is read as the provider's (nothing writes
+            keys to the file any more, so it is old-layout by construction), and the keyring's
+            Anthropic entry moves to the provider's entry **once per store** — marked by
+            `llm_keys_filed_by_provider`, so a key saved as Anthropic's afterwards is never
+            moved. Never moved: a key with Anthropic's `sk-ant-` prefix, and a key that differs
+            from one already in the provider's own place (a conflict — both stay, a warning
+            names it, and it is not marked, so it is looked at again). An Anthropic config
+            neither moves nor marks anything: the keyring is shared by every config on the
+            machine, a scratch `NANNA_CONFIG_PATH` one included. The provider's entry is written
+            before the Anthropic one is removed and the mark is set last, so a store that fails
+            part-way loses nothing and is retried at the next load. With one meaning left, the
+            CLI's `summarizer_credentials` reads each key as its own provider's, like the daemon
+            (the chat-provider-only rule above is retired). The daemon needed no change.
       - [~] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet

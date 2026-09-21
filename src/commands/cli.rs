@@ -3,7 +3,7 @@
 use crate::setup::init_components;
 use nanna_agent::{Agent, AgentConfig, AgentContext, RunOptions, Workspace};
 use nanna_config::Config;
-use nanna_daemon::llm_router::{AnthropicCredential, LlmRouter, ProviderCredentials, ProviderId};
+use nanna_daemon::llm_router::{AnthropicCredential, LlmRouter, ProviderCredentials};
 use nanna_storage::{Storage, StorageConfig};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
@@ -48,25 +48,20 @@ Be helpful. Be competent. Don't waste words.",
     base
 }
 
-/// The credentials the CLI's summarizers may use, read the way the CLI reads
-/// its own config — not the way the daemon reads it.
+/// The credentials the CLI's summarizers may use: each key serves the
+/// provider it is stored under, as in the daemon — `[llm].api_key` is
+/// Anthropic's, `OpenAI`, `OpenRouter` and GitHub have their own, and Ollama
+/// gets the token bound to `[memory].ollama_host`.
 ///
-/// The daemon's `LlmConfig::from_nanna` takes `[llm].api_key` for the
-/// Anthropic key, because that is what the GUI saves there. In the CLI the same
-/// field is the key of `[llm].provider` ([`crate::setup::chat_provider`]):
-/// `nanna init` stores an `OpenRouter` or `OpenAI` key there, and files it in
-/// the keyring under the Anthropic entry. Resolving the daemon's way therefore
-/// registered an Anthropic client holding that secret, and the first
-/// `anthropic/` summary — or any bare name the router sends to Anthropic —
-/// posted it to api.anthropic.com.
+/// Until 2026-09-18 `nanna init` stored an `OpenRouter` or `OpenAI` key in
+/// `[llm].api_key`, so this handed that field to the chat provider alone.
+/// It now stores it under the provider's own name, and loading a config
+/// moves a key the old layout left behind (`nanna_config`'s
+/// `provider_key`), so the field holds Anthropic's key only.
 ///
-/// So the chat key serves the chat provider and no other, and every other
-/// provider gets only a credential stored under its own name: `OpenAI`,
-/// `OpenRouter` and GitHub their own keys, Ollama the token bound to
-/// `[memory].ollama_host`. The daemon's Anthropic chain (keyring entry, OAuth
-/// refresh, the Claude CLI login) is not walked: the CLI's chat never used it,
-/// and walking it would read — and may refresh and rewrite — a login on every
-/// start.
+/// The daemon's Anthropic chain (keyring entry, OAuth refresh, the Claude CLI
+/// login) is not walked: the CLI's chat never used it, and walking it would
+/// read — and may refresh and rewrite — a login on every start.
 fn summarizer_credentials(config: &Config) -> ProviderCredentials {
     let non_blank = |value: Option<&String>| {
         value
@@ -74,37 +69,17 @@ fn summarizer_credentials(config: &Config) -> ProviderCredentials {
             .filter(|v| !v.is_empty())
             .map(str::to_string)
     };
-    let chat = crate::setup::chat_provider(&config.llm.provider);
-    let chat_key = non_blank(config.llm.api_key.as_ref());
-    let slot = |provider: ProviderId, own: Option<&String>| {
-        if provider == chat {
-            chat_key.clone().or_else(|| non_blank(own))
-        } else {
-            non_blank(own)
-        }
-    };
-    let anthropic = if chat == ProviderId::Anthropic {
-        chat_key.clone()
-    } else {
-        None
-    };
+    let anthropic = non_blank(config.llm.api_key.as_ref());
     // Carried into the error a skipped `anthropic/` entry logs, so the log
     // says why rather than only that Anthropic is missing.
-    let anthropic_absent_reason = match (&anthropic, chat) {
-        (Some(_), _) => None,
-        (None, ProviderId::Anthropic) => Some("no `[llm].api_key` is set".to_string()),
-        (None, provider) => Some(format!(
-            "in the CLI `[llm].api_key` is the {} key (`[llm].provider = \"{}\"`), and the CLI \
-             holds no other Anthropic credential",
-            provider.name(),
-            config.llm.provider
-        )),
-    };
+    let anthropic_absent_reason = anthropic.is_none().then(|| {
+        "no Anthropic API key is set (`nanna init`, or `ANTHROPIC_API_KEY`)".to_string()
+    });
     ProviderCredentials {
         anthropic: anthropic.map(AnthropicCredential::ApiKey),
         anthropic_absent_reason,
-        openai_api_key: slot(ProviderId::OpenAI, config.llm.openai_api_key.as_ref()),
-        openrouter_api_key: slot(ProviderId::OpenRouter, config.llm.openrouter_api_key.as_ref()),
+        openai_api_key: non_blank(config.llm.openai_api_key.as_ref()),
+        openrouter_api_key: non_blank(config.llm.openrouter_api_key.as_ref()),
         github_token: non_blank(config.llm.github_token.as_ref()),
         ollama_host: config.memory.ollama_host.clone(),
         ollama_api_key: non_blank(config.llm.ollama_api_key.as_ref()),
@@ -453,18 +428,19 @@ mod tests {
 
     const CHAT_KEY: &str = "sk-chat-provider-key";
 
-    /// What `nanna init` leaves behind: `provider`'s key in `[llm].api_key`,
-    /// the only key the CLI has, and a summarization list naming Anthropic
-    /// both ways a hand-edit might (the Settings picker's prefix, and the
-    /// `OpenRouter` spelling of the same model).
+    /// What `nanna init` leaves behind: `provider`'s key in that provider's
+    /// own field, the only key the CLI has, and a summarization list naming
+    /// Anthropic both ways a hand-edit might (the Settings picker's prefix,
+    /// and the `OpenRouter` spelling of the same model).
     fn cli_config(provider: &str) -> Config {
         let mut config = Config::default();
         config.llm.provider = provider.to_string();
-        config.llm.api_key = Some(CHAT_KEY.to_string());
+        config.llm.api_key = None;
         config.llm.openai_api_key = None;
         config.llm.openrouter_api_key = None;
         config.llm.github_token = None;
         config.llm.ollama_api_key = None;
+        *config.llm.provider_api_key_mut() = Some(CHAT_KEY.to_string());
         config.llm.summarization_priority = vec![
             "anthropic/claude-3.5-haiku".to_string(),
             "openrouter/anthropic/claude-3.5-haiku".to_string(),
@@ -501,7 +477,7 @@ mod tests {
             for spec in ["anthropic/claude-3.5-haiku", "llama3"] {
                 let why = resolved_model(&clients, spec).expect_err(spec);
                 assert!(
-                    why.contains(&format!("is the {provider} key")),
+                    why.contains("no Anthropic API key is set"),
                     "{provider}: `{spec}` is skipped and the log says why: {why}"
                 );
             }
@@ -529,6 +505,28 @@ mod tests {
             Ok("claude-3.5-haiku")
         );
         assert!(resolved_model(&clients, "openrouter/anthropic/claude-3.5-haiku").is_err());
+    }
+
+    /// `[llm].api_key` is Anthropic's alone, so an Anthropic key kept beside
+    /// an `OpenRouter` chat summarizes on Anthropic, as it does in the daemon.
+    #[test]
+    fn an_anthropic_key_beside_another_chat_summarizes_on_anthropic() {
+        let mut config = cli_config("openrouter");
+        config.llm.api_key = Some("sk-ant-api03-own".to_string());
+
+        let credentials = summarizer_credentials(&config);
+        assert_eq!(
+            credentials.anthropic,
+            Some(AnthropicCredential::ApiKey("sk-ant-api03-own".to_string()))
+        );
+        assert_eq!(credentials.anthropic_absent_reason, None);
+        assert_eq!(credentials.openrouter_api_key.as_deref(), Some(CHAT_KEY));
+
+        let clients = summarizer_clients(&config).expect("the list names models");
+        assert_eq!(
+            resolved_model(&clients, "anthropic/claude-3.5-haiku").as_deref(),
+            Ok("claude-3.5-haiku")
+        );
     }
 
     /// A key stored under its own provider's name is that provider's whatever

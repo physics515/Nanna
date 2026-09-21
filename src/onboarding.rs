@@ -2,7 +2,7 @@
 
 use console::{Emoji, style};
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
-use nanna_config::{Config, DiscordConfig, SlackConfig, TelegramConfig};
+use nanna_config::{Config, DiscordConfig, LlmConfig, SlackConfig, TelegramConfig};
 use std::path::PathBuf;
 
 static MOON: Emoji<'_, '_> = Emoji("🌙 ", "");
@@ -68,9 +68,8 @@ pub fn has_api_key(config: &Config) -> bool {
     // Prefer an already-hydrated in-memory key or the process environment;
     // fall back to the OS keyring / encrypted store so a key saved at
     // onboarding (and never written to config.toml) still counts.
-    has_api_key_with(
-        &config.llm.provider,
-        config.llm.api_key.as_deref(),
+    has_api_key_in(
+        config,
         |variable| {
             if let Ok(v) = std::env::var(variable)
                 && !v.trim().is_empty() {
@@ -90,6 +89,17 @@ pub fn has_api_key(config: &Config) -> bool {
                 .filter(|v| !v.trim().is_empty())
         },
     )
+}
+
+/// [`has_api_key`] for a given way to read a credential by variable name.
+fn has_api_key_in(config: &Config, read_env: impl Fn(&str) -> Option<String>) -> bool {
+    has_api_key_with(&config.llm.provider, config.llm.provider_api_key(), read_env)
+}
+
+/// Store the key entered for `[llm].provider` in that provider's own field,
+/// which `persist_config` files under that provider's own keyring entry.
+fn store_entered_key(llm: &mut LlmConfig, key: String) {
+    *llm.provider_api_key_mut() = Some(key);
 }
 
 /// Persist config: secrets → keyring, non-secrets → config.toml.
@@ -140,7 +150,7 @@ fn configure_llm(config: &mut Config, theme: &ColorfulTheme) -> anyhow::Result<(
         .interact()?;
 
     if !api_key.is_empty() {
-        config.llm.api_key = Some(api_key);
+        store_entered_key(&mut config.llm, api_key);
     }
 
     // Model selection
@@ -370,7 +380,7 @@ pub fn quick_setup(config: &mut Config) -> anyhow::Result<()> {
         anyhow::bail!("API key is required. Set {env_var} or run 'nanna init'");
     }
 
-    config.llm.api_key = Some(api_key);
+    store_entered_key(&mut config.llm, api_key);
     persist_config(config)?;
 
     println!("{CHECK}API key saved to the OS keychain.");
@@ -456,7 +466,8 @@ pub fn show_status(config: &Config) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_api_key_with, provider_api_key_env};
+    use super::{has_api_key_in, has_api_key_with, provider_api_key_env, store_entered_key};
+    use nanna_config::{Config, LlmConfig};
     use std::collections::HashMap;
 
     /// Build an environment reader over a fixed map — never touches the real process env, which
@@ -547,5 +558,42 @@ mod tests {
     #[test]
     fn a_missing_variable_reads_as_unconfigured() {
         assert!(!has_api_key_with("anthropic", None, env_of(&[])));
+    }
+
+    /// `nanna init` and the missing-key prompt store the key in the chosen
+    /// provider's own field — never in `api_key`, which every other reader
+    /// (the daemon, the GUI) hands to Anthropic.
+    #[test]
+    fn an_entered_key_is_stored_as_the_chosen_providers() {
+        for provider in ["openai", "openrouter", "anthropic"] {
+            let mut llm = LlmConfig {
+                provider: provider.to_string(),
+                ..LlmConfig::default()
+            };
+            store_entered_key(&mut llm, "entered".to_string());
+            let fields = [
+                ("anthropic", &llm.api_key),
+                ("openai", &llm.openai_api_key),
+                ("openrouter", &llm.openrouter_api_key),
+            ];
+            for (field, value) in fields {
+                let expected = (field == provider).then_some("entered");
+                assert_eq!(value.as_deref(), expected, "{provider}: the {field} field");
+            }
+        }
+    }
+
+    /// An Anthropic key does not make an `OpenRouter` setup configured: the
+    /// check reads the provider's own key, as the chat client does.
+    #[test]
+    fn only_the_chosen_providers_own_key_counts() {
+        let mut config = Config::default();
+        config.llm.provider = "openrouter".to_string();
+        config.llm.api_key = Some("sk-ant-api03-anthropic".to_string());
+        config.llm.openrouter_api_key = None;
+        assert!(!has_api_key_in(&config, env_of(&[])));
+
+        config.llm.openrouter_api_key = Some("sk-or-v1-own".to_string());
+        assert!(has_api_key_in(&config, env_of(&[])));
     }
 }
