@@ -606,25 +606,28 @@ impl ControlPlane {
 
     /// Load user tools and register them with the tool registry
     ///
+    /// Every tool on disk joins the store, so `ToolAction::ListUser` lists it
+    /// and `ToolAction::Enable` can find it; only the enabled ones are
+    /// registered, so a disabled tool stays uncallable across a restart.
+    ///
     /// # Errors
     ///
     /// Returns an error when no user tool manager is wired, or when the user
     /// tools directory cannot be read. Individual unreadable or unparseable
     /// tool files are logged and skipped, not reported here.
-    pub async fn load_user_tools(&self) -> Result<usize, String> {
+    pub async fn load_user_tools(&self) -> Result<crate::user_tools::UserToolLoad, String> {
         let Some(ref user_tools) = self.user_tools else {
             return Err("User tools manager not initialized".to_string());
         };
 
-        // Load from disk
-        let count = user_tools.load_all().await.map_err(|e| e.to_string())?;
+        let loaded = user_tools.load_all().await.map_err(|e| e.to_string())?;
+        let registered = match self.tools {
+            Some(ref tools) => user_tools.register_with_registry(tools).await,
+            None => 0,
+        };
+        debug_assert!(registered <= loaded, "only loaded tools can be registered");
 
-        // Register with tool registry
-        if let Some(ref tools) = self.tools {
-            user_tools.register_with_registry(tools).await;
-        }
-
-        Ok(count)
+        Ok(crate::user_tools::UserToolLoad { loaded, registered })
     }
 
     /// Reconcile the live tool registry with a user tool's current state.

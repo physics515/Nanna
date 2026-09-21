@@ -4087,6 +4087,23 @@ impl DaemonServer {
 
         self.restore_workspaces(&control).await;
 
+        // Read back the user tools the Tools page created (`ToolAction::Create`,
+        // `{data_dir}/user_tools/{name}.json`). Nothing did before, so a tool
+        // was registered live and then, at the next restart, gone from the
+        // registry, from `ListUser` and from the model — with its file still
+        // on disk. Disabled ones join the store but stay unregistered. After
+        // the skills, as a live `Create` is, so a name clash settles the same
+        // way across a restart; before IPC, so no request sees a partial
+        // store. Not the `{data_dir}/tools` skill dirs that `create_tool` and
+        // `edit_tool` author: those load with the skills in `init_services`.
+        match control.load_user_tools().await {
+            Ok(load) => info!(
+                "Loaded {} user tools, registered {} (disabled ones stay unregistered)",
+                load.loaded, load.registered
+            ),
+            Err(e) => warn!("User tools not loaded: {e}"),
+        }
+
         // Wire model stats tracker into the router for health-aware routing.
         // The control plane owns the canonical tracker; the router reads it.
         if let Some(router) = control.router() {

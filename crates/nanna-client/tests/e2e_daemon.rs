@@ -401,6 +401,99 @@ async fn state_survives_a_client_reconnect() {
     daemon.stop();
 }
 
+/// A user tool outlives the daemon that created it. `ToolAction::Create`
+/// writes `{data_dir}/user_tools/{name}.json` and registers the tool live, but
+/// nothing read that directory back at boot, so after a restart the tool was
+/// missing from `ListUser`, from `List` and from the registry the model calls
+/// through, with its file still on disk. A disabled tool must come back too,
+/// listed and re-enableable, but not callable.
+#[tokio::test]
+async fn a_user_tool_survives_a_daemon_restart() {
+    const KEPT: &str = "e2e_restart_kept";
+    const OFF: &str = "e2e_restart_off";
+    let tool = |action| nanna_client::Action::Tool(action);
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+
+    for name in [KEPT, OFF] {
+        let created = client
+            .request(tool(nanna_client::ToolAction::Create {
+                name: name.to_string(),
+                description: "restart probe".to_string(),
+                code: format!(
+                    "export default {{ name: \"{name}\", description: \"restart probe\", \
+                     execute() {{ return \"{name} ran\"; }} }}"
+                ),
+                needs_shell: None,
+            }))
+            .await
+            .expect("tool.create answers");
+        assert_eq!(created["status"], "created", "{created}");
+    }
+    let disabled = client
+        .request(tool(nanna_client::ToolAction::Disable {
+            name: OFF.to_string(),
+        }))
+        .await
+        .expect("tool.disable answers");
+    assert_eq!(disabled["status"], "disabled", "{disabled}");
+
+    client.disconnect().await;
+    // Keep the data dir alive across the restart; dropping it would delete the store.
+    let data_dir = daemon.stop();
+
+    let restarted = TestDaemon::start(data_dir).await;
+    let client = restarted.connect_client().await;
+
+    let listed = client
+        .request(tool(nanna_client::ToolAction::ListUser))
+        .await
+        .expect("tool.list_user answers");
+    let enabled_of = |name: &str| {
+        listed["tools"]
+            .as_array()
+            .and_then(|tools| tools.iter().find(|t| t["name"] == name))
+            .map(|t| t["enabled"].clone())
+    };
+    assert_eq!(
+        enabled_of(KEPT),
+        Some(serde_json::json!(true)),
+        "listed after the restart: {listed}"
+    );
+    assert_eq!(
+        enabled_of(OFF),
+        Some(serde_json::json!(false)),
+        "listed, still disabled: {listed}"
+    );
+
+    // Registered: the direct-execute path resolves through the same registry
+    // the model's calls do.
+    let ran = client
+        .request(tool(nanna_client::ToolAction::Execute {
+            name: KEPT.to_string(),
+            input: serde_json::json!({}),
+            session_id: None,
+        }))
+        .await
+        .expect("tool.execute answers");
+    assert_eq!(ran["success"], true, "the restored tool runs: {ran}");
+    assert_eq!(ran["output"], format!("{KEPT} ran"), "{ran}");
+
+    let off = client
+        .request(tool(nanna_client::ToolAction::Get {
+            name: OFF.to_string(),
+        }))
+        .await
+        .expect("tool.get answers");
+    assert_eq!(
+        off["error"], "not_found",
+        "a restart must not re-register a disabled tool: {off}"
+    );
+
+    client.disconnect().await;
+    restarted.stop();
+}
+
 /// The persistence half: state must outlive the daemon *process*, not just a client.
 /// Restarting on the same data dir has to bring the session back — this is what makes
 /// the daemon a durable control plane rather than a cache.
