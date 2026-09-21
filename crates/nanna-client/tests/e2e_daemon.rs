@@ -2608,3 +2608,82 @@ async fn deleting_a_session_stops_its_running_turn() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// Clearing a conversation while a turn is running in it is refused, as the
+/// chat apps' `/new` already was — otherwise the running turn's reply would
+/// land in the freshly cleared conversation. Once the turn ends, clearing
+/// works.
+#[tokio::test]
+async fn clearing_a_session_mid_turn_is_refused_until_the_turn_ends() {
+    let ollama =
+        ScriptedOllama::start(vec!["WAIT 800 An answer.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("clear".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+    let ack = client
+        .chat()
+        .send(&session, "question")
+        .await
+        .expect("chat.send is accepted");
+    let turn = ack["message_id"].as_str().unwrap_or_default().to_string();
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        while ollama.chat_bodies.lock().await.len() < 2 {
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the step is in flight");
+
+    let refused = client
+        .sessions()
+        .clear(&session)
+        .await
+        .expect("sessions.clear answers");
+    assert_eq!(refused["error"], "busy", "{refused}");
+
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            if let Ok(nanna_client::Event::MessageEnd { message_id, .. }) = events.recv().await
+                && message_id == turn
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the turn ends");
+    // `message_end` goes out before the turn releases its run claim, so the
+    // first clear after it may still be told "busy": poll, bounded.
+    let cleared = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            let answer = client
+                .sessions()
+                .clear(&session)
+                .await
+                .expect("sessions.clear answers");
+            if answer["error"] != "busy" {
+                return answer;
+            }
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the claim is released after the turn");
+    assert_eq!(cleared["status"], "cleared", "{cleared}");
+
+    client.disconnect().await;
+    daemon.stop();
+}

@@ -276,13 +276,7 @@ impl ControlPlane {
             SessionAction::Rename { id, name } => self.session_rename(id, name).await,
             SessionAction::Delete { id } => self.session_delete(id).await,
             SessionAction::DeleteAll => self.delete_all_sessions().await,
-            SessionAction::Clear { id } => {
-                if self.clear_session(&id).await {
-                    json!({ "status": "cleared", "id": id })
-                } else {
-                    json!({ "error": "not_found", "message": format!("Session {} not found", id) })
-                }
-            }
+            SessionAction::Clear { id } => self.session_clear(id).await,
             SessionAction::History { id, limit, before: _ } => self.session_history(id, limit).await,
             SessionAction::Export { id, format } => self.session_export(id, format).await,
             SessionAction::Switch { id } => self.session_switch(client_id, id).await,
@@ -707,6 +701,24 @@ Your task: {task}")
             forked.messages = original.messages.clone();
             self.sessions.update(forked.clone()).await;
             json!({ "session": forked })
+        } else {
+            json!({ "error": "not_found", "message": format!("Session {} not found", id) })
+        }
+    }
+
+    /// `SessionAction::Clear`: wipe a session's messages — refused while a
+    /// turn is running in it, as the chat apps' `/new` already is, because
+    /// the running turn's reply would land in the freshly cleared
+    /// conversation.
+    async fn session_clear(&self, id: String) -> Value {
+        if self.chat_runs.is_active(&id).await {
+            return json!({
+                "error": "busy",
+                "message": "Nanna is still working in this conversation. Stop it first, then clear.",
+            });
+        }
+        if self.clear_session(&id).await {
+            json!({ "status": "cleared", "id": id })
         } else {
             json!({ "error": "not_found", "message": format!("Session {} not found", id) })
         }

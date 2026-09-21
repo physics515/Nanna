@@ -2008,7 +2008,9 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             completes). Also probed: a model calling a tool it never discovered still gets it run
             (the registry resolves every registered tool) — not a defect, noted so it is not
             re-investigated.
-      - [ ] **IPC `session.clear` has no running-turn guard.** The chat apps' `/new` refuses while a
+      - [x] **IPC `session.clear` has no running-turn guard.** *(2026-09-21, fixed the same run:
+            refused with `"error": "busy"` and a way out while a turn runs, exactly as `/new`; e2e
+            `clearing_a_session_mid_turn_is_refused_until_the_turn_ends`.)* The chat apps' `/new` refuses while a
             turn is running ("Send /stop first, then /new"); the IPC `Clear` the GUI uses clears anyway,
             so the running turn's reply lands in the freshly-cleared conversation. Mirror `/new`'s
             guard (or stop the turn, as delete now does) — check what the GUI shows for either answer.
