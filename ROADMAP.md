@@ -2044,6 +2044,13 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             empty HOME (34/34). It reads its toolchain from `rust-toolchain.toml`
             (`rustup toolchain install`, no argument) instead of duplicating the pin, so a pin move
             cannot strand it. Not yet run on GitHub — first run is this PR.
+      - [x] *(2026-09-21)* **A mission-shaped turn pinned end to end.** e2e
+            `a_checked_task_is_verified_by_the_environment_and_reported_as_passing`: the plan's task
+            carries `file_exists`, the scripted model writes the file with the real `write_file` inside
+            a workspace (bookkeeping stays in the workspace — no `~/.nanna`), the check verifies it,
+            nothing is left open, and the follow-up turn's planner is told the check *already PASSES,
+            verified by running it* — the verified counterpart of the unverified-label fix above, and
+            the mission-shaped test the turn-admission change was owed.
       - [x] *(2026-09-21)* **Overlapping turns in two sessions pinned.** e2e
             `overlapping_turns_in_two_sessions_stay_apart`: both turns in flight at once, each reply
             answers its own question and lands only in its own history (the shape behind the

@@ -2434,3 +2434,93 @@ async fn overlapping_turns_in_two_sessions_stay_apart() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A mission-shaped turn end to end: the plan's task carries a machine check
+/// (`file_exists`), the scripted model writes the file with the real
+/// `write_file` tool inside a workspace, the check verifies it, and nothing is
+/// left open. A follow-up turn's planner is then told this item closed with
+/// its done-condition passing — the verified counterpart of
+/// `a_follow_up_turn_is_not_told_an_unchecked_answer_passed_a_check`.
+#[tokio::test]
+async fn a_checked_task_is_verified_by_the_environment_and_reported_as_passing() {
+    let project = tempfile::tempdir().expect("temp project dir");
+    let notes = project.path().join("notes.txt");
+    let notes_path = notes.to_str().expect("a UTF-8 temp path").to_string();
+    let plan = serde_json::json!([{
+        "title": "Write the notes file",
+        "description": "Create notes.txt",
+        "acceptance": { "kind": "file_exists", "path": notes_path },
+    }])
+    .to_string();
+    let write = format!(
+        "CALL write_file {}",
+        serde_json::json!({ "path": notes_path, "content": "hello notes\n" })
+    );
+    let ollama =
+        ScriptedOllama::start_with_plan(&plan, vec![write, "Wrote the notes file.".to_string()])
+            .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    // A workspace roots the file tools (and their bookkeeping) in the temp
+    // project, never in the test's cwd or HOME.
+    let opened = client
+        .workspaces()
+        .open(project.path().to_str().expect("a UTF-8 temp path"))
+        .await
+        .expect("workspace.open answers");
+    let workspace_id = opened["id"].as_str().expect("a workspace id").to_string();
+    let session = session_id_of(
+        &client
+            .request(nanna_client::Action::Session(
+                nanna_client::SessionAction::CreateInWorkspace {
+                    name: Some("mission".to_string()),
+                    workspace_id: Some(workspace_id),
+                },
+            ))
+            .await
+            .expect("sessions.create_in_workspace answers"),
+    );
+
+    let reply = converse(&client, &session, "Write a notes file.").await;
+    assert_eq!(reply.trim(), "Wrote the notes file.");
+    assert_eq!(
+        std::fs::read_to_string(&notes).ok().as_deref(),
+        Some("hello notes\n"),
+        "the tool really wrote the file"
+    );
+    assert!(
+        open_tasks(&client, &session).await.is_empty(),
+        "the check verified the task and closed it"
+    );
+
+    converse(&client, &session, "Is it done?").await;
+    let follow_up_plan = ollama
+        .chat_bodies
+        .lock()
+        .await
+        .iter()
+        .filter(|body| body.contains(PLANNER_PROMPT_OPENING))
+        .nth(1)
+        .cloned()
+        .expect("the follow-up was planned");
+    // The turn start re-runs the check and says so: the strongest form of
+    // "this passed", and the opposite of the unverified block.
+    assert!(
+        follow_up_plan.contains("already PASS, verified by running them")
+            && follow_up_plan.contains("Write the notes file"),
+        "a verified item is reported as a passing done-condition"
+    );
+    assert!(
+        !follow_up_plan.contains("no check ran"),
+        "and not as the model's word"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
