@@ -1869,6 +1869,21 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       failing confusingly. It now sets the state itself (the handler still does too; idempotent) and
       `debug_assert`s the postcondition. Remaining for this item: a real conversation turn (needs a live LLM)
       and the **embedded-fallback** path (needs a GUI build).
+      *(2026-09-21)* **A real conversation turn — without a live LLM.** The "needs a live LLM" premise
+      was wrong: every hop between the client and the model's socket is ours, so a scripted Ollama on
+      a loopback port is enough to exercise the whole shipping path. New
+      `a_conversation_turn_round_trips_and_persists_its_reply`: real daemon, real IPC, real client;
+      asserts the user's text reaches the model, `message_end` for that turn's `message_id` is
+      **exactly** the reply, and `sessions.history` holds both sides. Two builder options made it
+      reachable: `with_ollama_host` (the router's provider URL had no builder path) and
+      `with_scheduler(false)` (so a heartbeat turn cannot add requests). **The stub has to play a
+      well-behaved model, and that is a finding:** the first version answered every prompt with the
+      same prose, and the "real turn" came back as the answer **seven times glued together** plus
+      `_could not finish: every planned task was abandoned_` — the planner starved (no JSON), no step
+      ever said `TASK COMPLETE`, and the harness retried then abandoned. Scripted to answer the planner
+      with one null-acceptance task and each step with the reply + `TASK COMPLETE`, the turn is one
+      step and the reply is exact. The glued copies exposed a real defect, taken next (below).
+      Remaining: the **embedded-fallback** path (needs a GUI build).
 - [x] **Channel conversations were answered with an error — every message, since P22.** *(2026-09-17)*
       `ChannelManager::process_message` (Telegram/Discord/Slack listeners AND the webhook processor)
       read the reply from `chat.send`'s response `content`. Two things had made that impossible:

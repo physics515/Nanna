@@ -122,11 +122,21 @@ impl TestDaemon {
     /// Reusing a `data_dir` across calls is how the restart test proves persistence
     /// survives a full process lifecycle.
     async fn start(data_dir: tempfile::TempDir) -> Self {
+        Self::start_with(data_dir, |builder| builder).await
+    }
+
+    /// [`Self::start`], with `configure` applied to the builder after the
+    /// hermetic defaults — how a test adds a model without giving up any of
+    /// the isolation below.
+    async fn start_with(
+        data_dir: tempfile::TempDir,
+        configure: impl FnOnce(DaemonBuilder) -> DaemonBuilder + Send + 'static,
+    ) -> Self {
         let dir_path = data_dir.path().to_path_buf();
         let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<BoundAddr>();
 
         let mut handle = tokio::spawn(async move {
-            let mut server = DaemonBuilder::new()
+            let builder = DaemonBuilder::new()
                 .with_host("127.0.0.1")
                 // Port 0: the OS picks a free port at bind time and the daemon
                 // reports it, so parallel tests cannot collide.
@@ -138,8 +148,8 @@ impl TestDaemon {
                 .with_health_server(false)
                 .with_webhook_server(false)
                 .with_pid_file(false)
-                .with_log_level("warn")
-                .build();
+                .with_log_level("warn");
+            let mut server = configure(builder).build();
             // The receiver outlives this send; if it were gone the test has
             // already failed, so there is nothing to report here.
             let _ = bound_tx.send(server.ipc_bound_addr());
@@ -758,6 +768,224 @@ async fn a_chat_with_no_model_configured_says_which_setting_is_missing() {
     assert!(
         explained.contains("No model is configured") && explained.contains("[llm] model"),
         "the reply names the missing setting: {explained}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// How `nanna_agent::planner::build_plan_prompt` opens — the stub's cue that a
+/// request is the planner's rather than a step's.
+const PLANNER_PROMPT_OPENING: &str = "You are planning how to satisfy one request";
+
+/// The model a conversation-turn test configures; the `:tag` routes it to the
+/// Ollama provider, which [`ScriptedOllama`] stands in for.
+const STUB_MODEL: &str = "e2e-stub:1b";
+
+/// A scripted Ollama server playing a well-behaved model, and keeping each
+/// chat request body so a test can see what reached the model.
+///
+/// It answers the two prompts a chat turn sends the way the daemon asks them
+/// to be answered: the planner gets ONE JSON task with no machine check (what
+/// the planner's rules prescribe for a question), and a step gets the reply
+/// followed by `TASK COMPLETE` on its own line (what the step prompt asks for
+/// when no machine check exists). Anything else gets `{}`. A stub that
+/// answered every prompt with the same prose would test the harness's
+/// fallback ladder instead — the planner starves, no step ever completes, and
+/// the turn is abandoned — which is a different test.
+struct ScriptedOllama {
+    base_url: String,
+    chat_bodies: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+impl ScriptedOllama {
+    async fn start(reply: &'static str) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the scripted Ollama");
+        let base_url = format!("http://{}", listener.local_addr().expect("stub address"));
+        let chat_bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&chat_bodies);
+        let answer = |content: &str| {
+            serde_json::json!({
+                "model": STUB_MODEL,
+                "message": { "role": "assistant", "content": content },
+                "done": true,
+                "done_reason": "stop",
+                "prompt_eval_count": 20,
+                "eval_count": 8,
+            })
+            .to_string()
+        };
+        let plan = answer(
+            r#"[{"title":"Answer the question","description":"Reply directly.","acceptance":null}]"#,
+        );
+        let step = answer(&format!("{reply}\nTASK COMPLETE"));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let Some((request_line, body)) = read_http_request(&mut socket).await else {
+                    continue;
+                };
+                if request_line.contains("/api/chat") {
+                    let line = if body.contains(PLANNER_PROMPT_OPENING) {
+                        &plan
+                    } else {
+                        &step
+                    };
+                    seen.lock().await.push(body);
+                    // One NDJSON line serves both shapes: a streamed request
+                    // reads it as its only (final) chunk.
+                    respond(&mut socket, &format!("{line}\n")).await;
+                } else {
+                    respond(&mut socket, "{}").await;
+                }
+            }
+        });
+        Self {
+            base_url,
+            chat_bodies,
+        }
+    }
+}
+
+/// Read one HTTP/1.1 request; returns (request line, body).
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String, String)> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let request_line = headers.lines().next().unwrap_or("").to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let body_start = header_end + 4;
+    while buf.len() < body_start + content_length {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body_end = (body_start + content_length).min(buf.len());
+    Some((
+        request_line,
+        String::from_utf8_lossy(&buf[body_start..body_end]).to_string(),
+    ))
+}
+
+async fn respond(stream: &mut tokio::net::TcpStream, body: &str) {
+    use tokio::io::AsyncWriteExt;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+/// The rest of P8's end-to-end item: **a real conversation turn**, through
+/// the real daemon, the real IPC and the real client — the message reaches the
+/// model, the answer comes back as `message_end`, and it is persisted to the
+/// session so a client that asks later reads the same reply. The model is the
+/// one part that is scripted; everything between the client and the model's
+/// socket is the shipping path.
+#[tokio::test]
+async fn a_conversation_turn_round_trips_and_persists_its_reply() {
+    const USER_TEXT: &str = "What is the capital of France?";
+    const REPLY: &str = "Paris is the capital of France.";
+
+    let ollama = ScriptedOllama::start(REPLY).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            // No heartbeat turn: every chat request the stub sees is ours.
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("conversation".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+
+    let ack = client
+        .chat()
+        .send(&session, USER_TEXT)
+        .await
+        .expect("chat.send is accepted");
+    let message_id = ack["message_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the ack names the turn's message: {ack}"))
+        .to_string();
+
+    let answered = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::MessageEnd {
+                    message_id: id,
+                    content,
+                    ..
+                }) if id == message_id => {
+                    return content;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("the session's event stream ended before the turn did: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the turn ends before the hang ceiling");
+    // Exactly the answer: not the marker the harness consumes, not a
+    // "could not finish" footer, not the reply repeated once per retried step.
+    assert_eq!(
+        answered.trim(),
+        REPLY,
+        "message_end carries the model's answer and nothing else"
+    );
+
+    // The message reached the model — not a canned daemon-side reply.
+    let bodies = ollama.chat_bodies.lock().await.clone();
+    assert!(
+        bodies.iter().any(|body| body.contains(USER_TEXT)),
+        "no chat request carried the user's message ({} requests)",
+        bodies.len()
+    );
+
+    // And the turn is durable: a fresh read of the session holds both sides.
+    let history = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("sessions.history answers");
+    let text = history.to_string();
+    assert!(
+        text.contains(USER_TEXT),
+        "the user's message is persisted: {history}"
+    );
+    assert!(
+        text.contains(REPLY),
+        "the assistant's reply is persisted: {history}"
     );
 
     client.disconnect().await;

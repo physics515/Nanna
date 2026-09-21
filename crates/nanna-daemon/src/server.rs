@@ -5977,6 +5977,35 @@ impl DaemonBuilder {
         self
     }
 
+    /// Point the chat router's Ollama provider at `host` — the only provider
+    /// a hermetic test can stand up locally, so it is what lets an end-to-end
+    /// test run a real conversation turn against a scripted server.
+    ///
+    /// # Panics
+    ///
+    /// If `host` is not an `http(s)://` URL — a caller passing a bare
+    /// `host:port` is a programmer error the router would otherwise turn into
+    /// a connection failure on the first turn.
+    #[must_use]
+    pub fn with_ollama_host(mut self, host: impl Into<String>) -> Self {
+        let host = host.into();
+        assert!(
+            host.starts_with("http://") || host.starts_with("https://"),
+            "an Ollama host is an http(s) base URL, got {host:?}"
+        );
+        self.config.llm.ollama_host = host;
+        self
+    }
+
+    /// Master switch for the scheduler (`[scheduler] enabled`). Off, no
+    /// heartbeat or cron turn fires — so a test that counts a model's
+    /// requests counts only the ones it caused.
+    #[must_use]
+    pub const fn with_scheduler(mut self, enabled: bool) -> Self {
+        self.config.scheduler.enabled = enabled;
+        self
+    }
+
     #[must_use]
     pub const fn with_memory(mut self, enable: bool) -> Self {
         self.config.enable_memory = enable;
