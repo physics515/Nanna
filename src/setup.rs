@@ -139,22 +139,33 @@ pub fn create_scheduler(
         .with_executor(executor)
 }
 
-/// The provider the CLI's chat client belongs to, and so the provider whose
-/// key `[llm].api_key` holds.
-///
-/// In the CLI `[llm].api_key` is the key of whichever `[llm].provider` was
-/// picked — `nanna init` and the missing-key prompt store it there — and an
-/// unrecognised provider name is served by Anthropic. One definition because
-/// two consumers must agree on it: the chat client [`init_components`] builds,
-/// and the summarizers' credentials (`commands::cli`), which may hand that key
-/// to this provider and to no other.
+/// The provider the CLI's chat client belongs to: `[llm].provider`, with an
+/// unrecognised name served by Anthropic — the same fallback
+/// [`nanna_config::LlmConfig::provider_api_key`] reads the key by.
 #[must_use]
-pub fn chat_provider(provider: &str) -> ProviderId {
+fn chat_provider(provider: &str) -> ProviderId {
     match provider {
         "openai" => ProviderId::OpenAI,
         "openrouter" => ProviderId::OpenRouter,
         _ => ProviderId::Anthropic,
     }
+}
+
+/// The chat provider's key: `[llm].provider`'s own field, else `env_var`
+/// read through `read_env`.
+fn chat_api_key(
+    config: &Config,
+    env_var: &str,
+    read_env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<String> {
+    config
+        .llm
+        .provider_api_key()
+        .map(str::to_string)
+        .or_else(|| read_env(env_var).filter(|key| !key.trim().is_empty()))
+        .ok_or_else(|| anyhow::anyhow!(
+            "API key required. Run 'nanna init' or set {env_var} environment variable"
+        ))
 }
 
 /// Initialize common components
@@ -169,14 +180,7 @@ pub async fn init_components(
         _ => "ANTHROPIC_API_KEY", // anthropic or unknown
     };
     
-    let api_key = config
-        .llm
-        .api_key
-        .clone()
-        .or_else(|| std::env::var(env_var).ok())
-        .ok_or_else(|| anyhow::anyhow!(
-            "API key required. Run 'nanna init' or set {env_var} environment variable"
-        ))?;
+    let api_key = chat_api_key(config, env_var, |name| std::env::var(name).ok())?;
 
     // Create LLM client - default to Anthropic
     let llm = Arc::new(match chat_provider {
@@ -295,4 +299,53 @@ async fn register_discover_tools(tools: &Arc<ToolRegistry>, config: &Config) {
                 .with_registry(Arc::downgrade(tools));
             tools.register(wrapper).await;
         }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat_api_key;
+    use nanna_config::Config;
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    /// Every key field set, each to its own provider's name.
+    fn config_with_every_key(provider: &str) -> Config {
+        let mut config = Config::default();
+        config.llm.provider = provider.to_string();
+        config.llm.api_key = Some("anthropic".to_string());
+        config.llm.openai_api_key = Some("openai".to_string());
+        config.llm.openrouter_api_key = Some("openrouter".to_string());
+        config
+    }
+
+    /// An `OpenRouter` or `OpenAI` chat never runs on the Anthropic key.
+    #[test]
+    fn the_chat_client_gets_its_providers_own_key() {
+        for (provider, env_var) in [
+            ("openai", "OPENAI_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+            ("anthropic", "ANTHROPIC_API_KEY"),
+        ] {
+            let key = chat_api_key(&config_with_every_key(provider), env_var, no_env)
+                .expect("the provider has a key");
+            assert_eq!(key, provider);
+        }
+    }
+
+    #[test]
+    fn a_missing_own_key_falls_back_to_the_providers_variable_only() {
+        let mut config = config_with_every_key("openrouter");
+        config.llm.openrouter_api_key = None;
+        let env = |name: &str| (name == "OPENROUTER_API_KEY").then(|| "from-env".to_string());
+        assert_eq!(
+            chat_api_key(&config, "OPENROUTER_API_KEY", env).expect("the variable is set"),
+            "from-env"
+        );
+
+        let error = chat_api_key(&config, "OPENROUTER_API_KEY", no_env)
+            .expect_err("the Anthropic key is not OpenRouter's");
+        assert!(error.to_string().contains("OPENROUTER_API_KEY"), "{error}");
+    }
 }

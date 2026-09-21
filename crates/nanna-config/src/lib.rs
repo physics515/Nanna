@@ -18,6 +18,9 @@ pub use mcp::{MCP_SERVERS_MAX, McpConfig, McpServerEntry, mcp_secret_key};
 /// Which Ollama server an address names — what the bearer token is bound to.
 pub mod ollama;
 pub use ollama::{normalize_ollama_host, ollama_server_changed, same_ollama_server};
+/// Each provider's API key in its own `[llm]` field and keyring entry, and
+/// the move of keys the old layout filed as Anthropic's.
+mod provider_key;
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
@@ -258,6 +261,30 @@ impl LlmConfig {
             return self.model_priority.clone();
         }
         vec![self.model.clone()]
+    }
+}
+
+impl LlmConfig {
+    /// The key of `[llm].provider`, from that provider's own field; `None`
+    /// when it is unset or blank.
+    ///
+    /// `openai` and `openrouter` keep theirs in `openai_api_key` and
+    /// `openrouter_api_key`. `api_key` is Anthropic's alone, and serves any
+    /// other provider name too: the CLI's chat falls back to Anthropic for a
+    /// name it does not know.
+    #[must_use]
+    pub fn provider_api_key(&self) -> Option<&str> {
+        provider_key::NonAnthropicProvider::of(&self.provider)
+            .map_or(self.api_key.as_deref(), |provider| provider.key(self))
+            .filter(|key| !key.trim().is_empty())
+    }
+
+    /// The field [`Self::provider_api_key`] reads, to store an entered key in.
+    pub fn provider_api_key_mut(&mut self) -> &mut Option<String> {
+        match provider_key::NonAnthropicProvider::of(&self.provider) {
+            Some(provider) => provider.slot_mut(self),
+            None => &mut self.api_key,
+        }
     }
 }
 
@@ -775,14 +802,37 @@ impl Config {
     /// Returns `ConfigError::Io` if the file cannot be read.
     /// Returns `ConfigError::Parse` if the TOML is invalid.
     pub fn load_from(path: &PathBuf) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)?;
-        let mut config: Self = toml::from_str(&content)?;
-        info!("Loaded config from {path:?}");
+        Self::load_from_with(path, &crate::credentials::SecureStore::new(), process_env)
+    }
+
+    /// [`Self::load_from`] against a given store and environment.
+    fn load_from_with(
+        path: impl AsRef<Path>,
+        store: &crate::credentials::SecureStore,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let (mut config, content) = Self::parse_file(path.as_ref(), store)?;
         if let Some(notice) = retired_ollama_url_notice(&content, &config) {
             warn!("{notice}");
         }
-        config.load_secrets_from_store();
+        config.load_secrets_from(store, env);
         Ok(config)
+    }
+
+    /// Read and parse the config file at `path`, with a non-Anthropic
+    /// `[llm].provider`'s key filed under its own name
+    /// ([`provider_key::refile_provider_key`]) — before any secret is
+    /// hydrated, so only a key the old layout left behind is moved. The
+    /// file's text comes back too, for what only the raw text can show.
+    fn parse_file(
+        path: &Path,
+        store: &crate::credentials::SecureStore,
+    ) -> Result<(Self, String), ConfigError> {
+        let content = std::fs::read_to_string(path)?;
+        let mut config: Self = toml::from_str(&content)?;
+        info!("Loaded config from {path:?}");
+        provider_key::refile_provider_key(&mut config.llm, store);
+        Ok((config, content))
     }
 
     /// Save config to default location.
@@ -1083,9 +1133,7 @@ impl Config {
         store: &crate::credentials::SecureStore,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)?;
-        let mut config: Self = toml::from_str(&content)?;
-        info!("Loaded config from {path:?}");
+        let (mut config, _) = Self::parse_file(path, store)?;
         config.load_secrets_with(
             store,
             &env,
@@ -1350,14 +1398,7 @@ impl Config {
     /// Override config with environment variables
     #[must_use] 
     pub fn with_env_overrides(mut self) -> Self {
-        // LLM API keys
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            self.llm.api_key = Some(key);
-        }
-        if let Ok(key) = std::env::var("OPENAI_API_KEY")
-            && self.llm.provider == "openai" {
-                self.llm.api_key = Some(key);
-            }
+        self.override_llm_keys(process_env);
 
         // Server config
         if let Ok(port) = std::env::var("PORT")
@@ -1389,6 +1430,19 @@ impl Config {
             }
 
         self
+    }
+
+    /// The LLM keys [`Self::with_env_overrides`] takes from `env`.
+    fn override_llm_keys(&mut self, env: impl Fn(&str) -> Option<String>) {
+        if let Some(key) = env("ANTHROPIC_API_KEY") {
+            self.llm.api_key = Some(key);
+        }
+        // Until 2026-09-18 this went to `api_key` when `[llm].provider` was
+        // `openai` — the CLI's chat key then — which the daemon registers as
+        // the Anthropic credential.
+        if let Some(key) = env("OPENAI_API_KEY") {
+            self.llm.openai_api_key = Some(key);
+        }
     }
 }
 
@@ -1461,6 +1515,90 @@ mod tests {
             !llm.has_configured_api_key(),
             "an empty key is not a credential"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The chat provider's key, in its own field
+    // -----------------------------------------------------------------
+
+    /// Every key field set, each to its own provider's name.
+    fn llm_with_every_key(provider: &str) -> LlmConfig {
+        LlmConfig {
+            provider: provider.to_string(),
+            api_key: Some("anthropic".into()),
+            openai_api_key: Some("openai".into()),
+            openrouter_api_key: Some("openrouter".into()),
+            ..LlmConfig::default()
+        }
+    }
+
+    #[test]
+    fn each_provider_reads_its_own_key() {
+        for (provider, key) in [
+            ("openai", "openai"),
+            ("openrouter", "openrouter"),
+            ("anthropic", "anthropic"),
+            // The CLI's chat falls back to Anthropic for a name it does not know.
+            ("something-else", "anthropic"),
+        ] {
+            assert_eq!(
+                llm_with_every_key(provider).provider_api_key(),
+                Some(key),
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entered_key_is_stored_in_the_providers_own_field() {
+        for provider in ["openai", "openrouter", "anthropic"] {
+            let mut llm = LlmConfig {
+                provider: provider.to_string(),
+                ..LlmConfig::default()
+            };
+            *llm.provider_api_key_mut() = Some("entered".into());
+            let stored_in = [
+                ("anthropic", &llm.api_key),
+                ("openai", &llm.openai_api_key),
+                ("openrouter", &llm.openrouter_api_key),
+            ];
+            for (field, value) in stored_in {
+                let expected = (field == provider).then_some("entered");
+                assert_eq!(value.as_deref(), expected, "{provider}: the {field} field");
+            }
+        }
+    }
+
+    #[test]
+    fn a_blank_own_key_is_no_key() {
+        let mut llm = llm_with_every_key("openrouter");
+        llm.openrouter_api_key = Some("  ".into());
+        assert_eq!(llm.provider_api_key(), None);
+    }
+
+    /// `OPENAI_API_KEY` is `OpenAI`'s key: it overrides `openai_api_key`, and
+    /// never lands in `api_key`, which the daemon hands to Anthropic.
+    #[test]
+    fn each_environment_key_overrides_its_own_field() {
+        let env = |name: &str| match name {
+            "ANTHROPIC_API_KEY" => Some("env-anthropic".to_string()),
+            "OPENAI_API_KEY" => Some("env-openai".to_string()),
+            _ => None,
+        };
+        for provider in ["openai", "anthropic", "openrouter"] {
+            let mut config = Config::default();
+            config.llm.provider = provider.to_string();
+            config.override_llm_keys(env);
+            assert_eq!(config.llm.api_key.as_deref(), Some("env-anthropic"), "{provider}");
+            assert_eq!(config.llm.openai_api_key.as_deref(), Some("env-openai"), "{provider}");
+        }
+
+        let mut config = Config::default();
+        config.llm.provider = "openai".to_string();
+        config.override_llm_keys(|name| {
+            (name == "OPENAI_API_KEY").then(|| "env-openai".to_string())
+        });
+        assert_eq!(config.llm.api_key, None);
     }
 
     // -----------------------------------------------------------------
