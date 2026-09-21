@@ -3,6 +3,8 @@
 use crate::setup::{create_scheduler, init_components, provider_chat_key};
 use nanna_config::Config;
 use nanna_core::{LlmClient, Nanna, NannaConfig};
+use nanna_daemon::log_buffer::LogBuffer;
+use nanna_daemon::server::DaemonBuilder;
 use nanna_server::{AppStateBuilder, ServerConfig, start_server};
 use tracing::{debug, info, warn};
 
@@ -214,106 +216,36 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
 /// A full daemon under the `nanna` executable's name, on the same PID file,
 /// store and port as `nanna-daemon`. The single-instance probe recognizes it
 /// by `nanna_daemon::health::DAEMON_MODE_FLAG` on its command line.
-pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
-    use nanna_daemon::agent_service::AgentServiceConfig;
-    use nanna_daemon::server::{EmbeddingConfig, LlmConfig};
-    use nanna_daemon::{
-        DaemonConfig, DaemonServer, IpcServerConfig, SchedulerSwitches, ServerSwitches,
-        ToolAuditSwitches, WebhookConfig,
-    };
+///
+/// It is built and stopped the way `nanna-daemon run` (the GUI's sidecar) is:
+/// configured by [`DaemonBuilder::from_nanna_config`] and stopped by the
+/// signal handlers in [`nanna_daemon::shutdown`]. Until 2026-09-21 this path
+/// hand-built its `DaemonConfig`, and the copy had drifted. It ignored
+/// `[general] data_dir`, the model chain and routing
+/// (`AgentServiceConfig::default()`), the channels, the Brave key and the
+/// legacy `memories.json`. It had no signal handler, so `nanna daemon stop`
+/// killed it without a drain and left its exit record reading `running`.
+///
+/// Its config file is the default one, as for `nanna-daemon`:
+/// `NANNA_CONFIG_PATH`, else the platform config directory. `nanna --config
+/// <file> daemon start` sets that variable for it. `log_buffer` holds the
+/// lines `system.logs` serves (the GUI's Logs page).
+///
+/// # Errors
+///
+/// When a signal handler cannot be installed, or when
+/// [`nanna_daemon::DaemonServer::run`] fails (another daemon holds the
+/// instance, the port is taken).
+pub async fn run_daemon(host: String, port: u16, log_buffer: LogBuffer) -> anyhow::Result<()> {
+    let mut daemon = DaemonBuilder::from_nanna_config()?
+        .with_host(host)
+        .with_port(port)
+        .with_log_buffer(log_buffer)
+        .build();
 
-    // Configure daemon
-    let data_dir = Config::default_data_dir()?;
+    nanna_daemon::shutdown::install_signal_handlers(&daemon)?;
 
-    let daemon_config = DaemonConfig {
-        ipc: IpcServerConfig {
-            host: host.clone(),
-            port,
-            ..Default::default()
-        },
-        data_dir,
-        log_level: "info".to_string(),
-        auto_save_interval_secs: 60,
-        llm: LlmConfig {
-            provider: config.llm.provider.clone(),
-            anthropic_api_key: config.llm.api_key.clone(),
-            // `config` was hydrated from the SecureStore at load; keep OAuth
-            // state in sync with the daemon path (DaemonBuilder::from_nanna_config).
-            anthropic_oauth_token: config.llm.anthropic_oauth_token.clone(),
-            anthropic_use_oauth: config.llm.anthropic_use_oauth,
-            openai_api_key: config.llm.openai_api_key.clone(),
-            openrouter_api_key: config.llm.openrouter_api_key.clone(),
-            github_token: config.llm.github_token.clone(),
-            // The configured Ollama server and its token, as the daemon binary
-            // reads them (DaemonBuilder::from_nanna_config) — this entry point
-            // hardcoded localhost and no token, so a remote server set in
-            // Settings was never reached from here.
-            ollama_host: config.memory.ollama_host.clone(),
-            ollama_api_key: config.llm.ollama_api_key.clone(),
-            api_key: config.llm.api_key.clone(),
-        },
-        agent: AgentServiceConfig::default(),
-        enable_memory: true,
-        servers: ServerSwitches {
-            health_server: true,
-            webhook_server: false,
-            pid_file: true,
-        },
-        health_port: 5148,
-        webhook_port: 3000,
-        webhook: WebhookConfig::default(),
-        use_script_tools: config.tools.use_script_tools,
-        tools_dir: config.tools.tools_dir.clone(),
-        // `ocr_model_priority` already means "vision-capable models, in order".
-        vision_model_priority: config.memory.ocr_model_priority.clone(),
-        tool_allowlist: Some(config.tools.enabled.clone()),
-        tool_denylist: config.tools.disabled.clone(),
-        tool_audit: ToolAuditSwitches {
-            log: config.tools.audit_log,
-            log_values: config.tools.audit_log_values,
-        },
-        // Legacy single-binary path: channels are not started here (matches the
-        // field's Default). The daemon path wires channel config separately.
-        channels: None,
-        memory_max_compression_ratio: config.memory.max_compression_ratio,
-        memory_min_remaining_memories: config.memory.min_remaining_memories,
-        dream_idle_threshold_secs: config.memory.dream_idle_threshold_secs,
-        dream_memory_pressure_count: config.memory.dream_memory_pressure_count,
-        mcp: config.mcp.clone(),
-        scheduler: SchedulerSwitches {
-            enabled: config.scheduler.enabled,
-            heartbeat_enabled: config.scheduler.heartbeat_enabled,
-        },
-        heartbeat_interval_secs: config.scheduler.heartbeat_interval_secs,
-    };
-
-    info!("Initializing daemon server...");
-    // From the user's config, not `EmbeddingConfig::default()` — the default
-    // ignores the configured provider, model, AND priority list, so this
-    // entry point ran a different embedder than the daemon path did from the
-    // same config file.
-    let embedding = EmbeddingConfig {
-        provider: config.memory.embedding_provider.clone(),
-        model: config.memory.embedding_model.clone(),
-        ollama_host: config.memory.ollama_host.clone(),
-        ollama_api_key: config
-            .llm
-            .ollama_api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .map(str::to_string),
-        priority: config.memory.embedding_priority.clone(),
-    };
-    let mut server = DaemonServer::new(daemon_config, embedding, None, None);
-
-    info!("Daemon listening on {}:{}", host, port);
-    info!("WebSocket endpoint: ws://{}:{}/ws", host, port);
-
-    // Run until interrupted
-    server.run().await?;
-
-    info!("Daemon shutting down");
+    daemon.run().await?;
     Ok(())
 }
 
