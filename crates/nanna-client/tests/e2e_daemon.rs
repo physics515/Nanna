@@ -1253,10 +1253,12 @@ async fn a_model_that_never_claims_completion_still_finishes_the_turn() {
         !answered.contains("could not finish"),
         "a converged answer is a finished turn: {answered:?}"
     );
+    // The stream shows the answer and its converging repeat; the reply the
+    // user keeps (and the GUI's bubble is replaced by) holds it once.
     assert_eq!(
         answered.matches(REPLY).count(),
-        2,
-        "the answer, then its converging repeat — never the fruitless budget's worth: {answered:?}"
+        1,
+        "one copy kept — never the fruitless budget's worth: {answered:?}"
     );
     let step_requests = ollama
         .chat_bodies

@@ -1745,12 +1745,23 @@ pub struct ChatSink {
 /// `…read the file.The file says…`, in the stream AND in the persisted reply.
 #[derive(Debug, Default)]
 pub struct StepTextJoin {
-    /// Some text has been emitted into this reply.
-    emitted_any: bool,
     /// The last emitted character was whitespace (or nothing was emitted).
     ends_with_whitespace: bool,
     /// A step began and has not emitted text yet.
     step_break_pending: bool,
+    /// The text of the last step that emitted any, and of the current one —
+    /// what [`Self::repeated_last_step`] compares. Bounded by two steps'
+    /// output, which the reply already holds.
+    previous_step_text: String,
+    current_step_text: String,
+    /// The harness has finished its steps: later text (the run summary, stop
+    /// notices) is not step text and must not extend the last step's.
+    steps_ended: bool,
+    /// Bytes emitted into the reply so far, separators included.
+    emitted_bytes: usize,
+    /// Where the current step's text sits in the reply: from the start of
+    /// the separator before it to the end of its last delta.
+    current_step_span: Option<(usize, usize)>,
 }
 
 /// What goes between two steps' text: a paragraph break, since each step is
@@ -1761,7 +1772,37 @@ impl StepTextJoin {
     /// A step is starting: its first text, if any, opens a new paragraph.
     fn begin_step(&mut self) {
         self.step_break_pending = true;
+        // A step that said nothing does not displace the last one that did.
+        if !self.current_step_text.trim().is_empty() {
+            self.previous_step_text = std::mem::take(&mut self.current_step_text);
+        }
+        self.current_step_text.clear();
+        self.current_step_span = None;
         debug_assert!(self.step_break_pending, "a started step must arm the break");
+    }
+
+    /// No more steps: later text is the harness's summary, not a step's.
+    pub fn end_steps(&mut self) {
+        self.steps_ended = true;
+        debug_assert!(self.steps_ended);
+    }
+
+    /// The last step's text when it repeats the step before it verbatim
+    /// (whitespace-collapsed) — the converging answer of a model that never
+    /// said `TASK COMPLETE` (see `answer_converged` in the harness). The live
+    /// stream has already shown it; the persisted reply keeps one copy.
+    ///
+    /// Returns the repeat's text and its byte span in the reply (separator
+    /// included), so the caller can cut exactly it even when harness text
+    /// (the run summary) follows.
+    #[must_use]
+    pub fn repeated_last_step(&self) -> Option<(String, std::ops::Range<usize>)> {
+        let current: Vec<&str> = self.current_step_text.split_whitespace().collect();
+        let previous: Vec<&str> = self.previous_step_text.split_whitespace().collect();
+        let (start, end) = self.current_step_span?;
+        debug_assert!(start <= end, "a span runs forward");
+        (!current.is_empty() && current == previous)
+            .then(|| (self.current_step_text.clone(), start..end))
     }
 
     /// Account for `text` about to be emitted and return the separator that
@@ -1773,17 +1814,24 @@ impl StepTextJoin {
     fn separator_before(&mut self, text: &str) -> &'static str {
         debug_assert!(!text.is_empty(), "empty deltas are dropped before joining");
         let needs_break = self.step_break_pending
-            && self.emitted_any
+            && self.emitted_bytes > 0
             && !self.ends_with_whitespace
             && !text.starts_with(char::is_whitespace);
         self.step_break_pending = false;
-        self.emitted_any = true;
         self.ends_with_whitespace = text.ends_with(char::is_whitespace);
+        let separator = if needs_break { STEP_TEXT_SEPARATOR } else { "" };
+        let start = self.emitted_bytes;
+        self.emitted_bytes += separator.len() + text.len();
+        if !self.steps_ended {
+            self.current_step_text.push_str(text);
+            let span_start = self.current_step_span.map_or(start, |(from, _)| from);
+            self.current_step_span = Some((span_start, self.emitted_bytes));
+        }
         debug_assert!(
             !self.step_break_pending,
             "the break is spent by the first text"
         );
-        if needs_break { STEP_TEXT_SEPARATOR } else { "" }
+        separator
     }
 }
 
@@ -6643,6 +6691,48 @@ mod tests {
             run.accumulated_text.read().await.as_str(),
             "Let me check the file.\n\nIt says hello.",
             "one break at the step seam, none inside a step, none before the first text"
+        );
+    }
+
+    /// Two steps that say the same thing are the converging repeat: the join
+    /// reports the second copy and exactly where it sits in the reply — even
+    /// with the run summary after it, which is not step text.
+    #[tokio::test]
+    async fn a_repeated_step_is_reported_with_its_span() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+        sink.step_header(&execute_request(1, 0));
+        sink.delta("Paris.");
+        sink.step_header(&execute_request(1, 1));
+        sink.delta("Paris.");
+        sink.text_join.lock().unwrap().end_steps();
+        sink.delta("\n\n_2 steps_");
+
+        let reply = run.accumulated_text.read().await.clone();
+        let (repeat, span) = sink
+            .text_join
+            .lock()
+            .unwrap()
+            .repeated_last_step()
+            .expect("the second step repeats the first");
+        assert_eq!(repeat, "Paris.");
+        assert_eq!(
+            &reply[span], "\n\nParis.",
+            "the separator and the copy, nothing else"
+        );
+
+        let other = chat_sink(external_run_handle());
+        other.step_header(&execute_request(1, 0));
+        other.delta("Paris.");
+        other.step_header(&execute_request(1, 1));
+        other.delta("Lyon.");
+        assert!(
+            other
+                .text_join
+                .lock()
+                .unwrap()
+                .repeated_last_step()
+                .is_none()
         );
     }
 

@@ -2012,6 +2012,11 @@ impl ChatTurn {
             last_probe,
             ..
         } = b;
+        // The steps are over: the summary and notices that follow are the
+        // harness's, not step text (see `StepTextJoin::end_steps`).
+        if let Ok(mut join) = self.final_sink.text_join.lock() {
+            join.end_steps();
+        }
         // ONE cumulative terminal line per user turn, at the
         // single site every exit path crosses. Non-mission
         // turns cross it too (continuations = 0, cause =
@@ -2301,7 +2306,16 @@ impl ChatTurn {
         // and the timeline journal carries the interleaved record.
         // Harness plumbing (the TASK COMPLETE claim marker) is stripped
         // from both — it is a verdict signal, not conversation.
-        let full_text = self.run_handle.accumulated_text.read().await.clone();
+        let mut full_text = self.run_handle.accumulated_text.read().await.clone();
+        let repeated = self
+            .final_sink
+            .text_join
+            .lock()
+            .ok()
+            .and_then(|join| join.repeated_last_step());
+        if let Some((ref repeat, ref span)) = repeated {
+            drop_repeated_span(&mut full_text, repeat, span);
+        }
         let mut content = strip_harness_markers(&full_text);
         let mut timeline = sanitize_timeline(
             self.run_handle
@@ -2310,6 +2324,9 @@ impl ChatTurn {
                 .map(|journal| journal.clone())
                 .unwrap_or_default(),
         );
+        if let Some((ref repeat, _)) = repeated {
+            drop_repeat_from_timeline(&mut timeline, repeat);
+        }
         if self.run_handle.cancel.is_cancelled() {
             mark_stopped(&mut content, &mut timeline);
         }
@@ -2341,6 +2358,45 @@ impl ChatTurn {
             content,
         });
     }
+}
+
+/// Cut the converging repeat — the last step's verbatim copy of the step
+/// before it — out of the reply, at the span `StepTextJoin` recorded.
+///
+/// A model that answers without saying `TASK COMPLETE` closes its item by
+/// repeating the answer (`answer_converged`). The live stream has shown both
+/// copies; the reply the user keeps, and the `message_end` the GUI promotes
+/// the live bubble to, needs one. A no-op unless the span really holds the
+/// repeat (a dropped delta would shift it), and never the reply's only copy.
+fn drop_repeated_span(text: &mut String, repeat: &str, span: &std::ops::Range<usize>) {
+    let Some(slice) = text.get(span.clone()) else {
+        return;
+    };
+    if slice.trim() != repeat.trim() || span.start == 0 {
+        return;
+    }
+    debug_assert!(span.end <= text.len());
+    text.replace_range(span.clone(), "");
+}
+
+/// The timeline twin of [`drop_repeated_span`]: a conversation-shaped turn
+/// merges its steps' text into one entry, so the repeat is that entry's
+/// trailing copy (the run summary is not in the timeline).
+fn drop_repeat_from_timeline(timeline: &mut [TimelineItem], repeat: &str) {
+    let Some(TimelineItem::Text { content, .. }) = timeline
+        .iter_mut()
+        .rev()
+        .find(|item| matches!(item, TimelineItem::Text { .. }))
+    else {
+        return;
+    };
+    let tail = repeat.trim();
+    let body = content.trim_end();
+    if tail.is_empty() || !body.ends_with(tail) || body.len() == tail.len() {
+        return;
+    }
+    let kept = content[..body.len() - tail.len()].trim_end().len();
+    content.truncate(kept);
 }
 
 /// The marker the GUI shows on a bubble the user stopped (`stopSession` in

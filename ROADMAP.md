@@ -2012,6 +2012,8 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             turn is running ("Send /stop first, then /new"); the IPC `Clear` the GUI uses clears anyway,
             so the running turn's reply lands in the freshly-cleared conversation. Mirror `/new`'s
             guard (or stop the turn, as delete now does) — check what the GUI shows for either answer.
+            *Latent today:* no GUI command invokes `session.clear`; its only production caller is `/new`,
+            which is guarded. It becomes live the moment a "clear chat" button is wired.
       - [x] *(2026-09-21)* **Deleting a session left its turn running.** Probed: the model kept
             generating for the deleted conversation (a mission would have kept calling tools, for
             hours), and its reply was persisted into nothing. `session.delete` and `delete_all` now stop
@@ -2186,12 +2188,19 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
                   directive's intent — but nothing ever closes one the user has moved on from.
                   Decide whether a leftover not re-adopted within N turns should be closed as
                   superseded, and by what evidence N is chosen.
-            - [ ] **The converging repeat is still streamed.** The user sees the answer twice
-                  (paragraph-separated) — down from seven, but the second copy is the signal and
-                  cannot be recognized until it has finished streaming. Options: hold back a
-                  quiet item's step-2+ text until the step ends (costs live streaming exactly where
-                  it is rarest), or drop the duplicate from the *persisted* reply only. Needs a
-                  call on whether live streaming of later steps is worth the duplicate.
+            - [x] **The converging repeat is no longer kept.** *(2026-09-21, same run — the
+                  persisted-only option.)* The live stream still shows the answer twice (the second
+                  copy is the signal and cannot be recognized until it has streamed), but
+                  `StepTextJoin` now records each step's text and its byte span in the reply, and
+                  `persist_reply` cuts a last step that repeats the one before it — from the
+                  persisted content, the timeline, and the `message_end` the GUI replaces its live
+                  bubble with, so the duplicate collapses the moment the turn ends. Step text is
+                  sealed before the run summary (`end_steps`), so a footer after the repeat does not
+                  hide it. The span is validated against the text before the cut (a dropped delta
+                  would shift it), and the reply's only copy is never removed.
+                  - [ ] Holding back step-2+ text of a conversation-shaped item until the step ends
+                        would remove the brief live duplicate too, at the cost of live streaming for
+                        later steps — still an owner call.
 - [x] **Channel conversations were answered with an error — every message, since P22.** *(2026-09-17)*
       `ChannelManager::process_message` (Telegram/Discord/Slack listeners AND the webhook processor)
       read the reply from `chat.send`'s response `content`. Two things had made that impossible:
