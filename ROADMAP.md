@@ -2112,16 +2112,22 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             `only_a_run_that_acted_is_told_its_repeat_changed_nothing` covers both sides — a
             repeated question gets no warning; a repeated run that called tools and changed nothing
             still does.
-      - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
-            behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
-            comment says "the next message decides what happens to them" — but the harness simply
-            runs every open item in the scope, so the user's **next, unrelated** message also answers
-            the question they stopped: `first` → Stop → `second` came back as
-            `Second answer.\n\nSecond answer.\n\n_2 steps · 2 items completed_`, the stopped item
-            worked unasked. Resuming makes sense for a mission ("stop, wait — use X") and is wrong
-            for a stopped question. Options: close conversation-shaped (single, unchecked) items on
-            Stop and keep missions pending; or keep everything pending but let only the planner
-            re-admit it. Not changed unattended — this decides what Stop means.
+      - [ ] **A stopped request is worked anyway on the user's next message — against the
+            owner directive already written into `run_mission`.** Found by the probe behind the Stop
+            test: `first` → Stop → `second` came back as
+            `Second answer.\n\nSecond answer.\n\n_2 steps · 2 items completed_`. The directive
+            (2026-07-25, quoted in `chat_harness.rs::run_mission`): *"the model should decide to
+            resume or answer another question by the user … i don't think we should assume that the
+            user wants to resume."* It is implemented on the **input** side — the planner is shown
+            outstanding work via `open_work_context` — but not on the **execution** side: the turn's
+            `TursoTaskSource` serves every open item in the scope, so a leftover runs whether or not
+            the planner chose it (`finish_turn`'s "the next message decides" comment describes the
+            intent, not the behaviour). The fix belongs in the task source: admit items created
+            during this turn (seeded, interjected, replan subtasks, continuation rounds) plus any the
+            planner explicitly re-adopts, and keep the park-resume path (a turn started by the park
+            waiter IS a resume) admitting its own leftovers. Not taken in the run that found it: it
+            touches the P22/P23 continuation semantics, which deserve their own increment with a
+            mission-shaped e2e beside the conversational one.
             - [ ] **The converging repeat is still streamed.** The user sees the answer twice
                   (paragraph-separated) — down from seven, but the second copy is the signal and
                   cannot be recognized until it has finished streaming. Options: hold back a
