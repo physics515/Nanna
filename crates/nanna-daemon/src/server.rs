@@ -4042,13 +4042,16 @@ impl DaemonServer {
             dreaming,
         } = deps;
 
-        // Create control plane with all services (including router for consolidation)
+        // Create control plane with all services (including router for consolidation).
+        // The data dir is the one this daemon resolved (`[general] data_dir`,
+        // then `--data-dir`), so user tools live beside the store it opened.
         let mut control = ControlPlane::with_all_services(
             self.sessions.clone(),
             agent,
             memory.clone(),
             Some(tools),
             Some(router),
+            self.config.data_dir.clone(),
         )
         .with_tools_dir(tools_dir)
         .with_audit_log_path(
@@ -7177,6 +7180,25 @@ mod tests {
         assert!(!core.enabled);
         assert!(!core.heartbeat_enabled);
         assert_eq!(core.heartbeat_interval, std::time::Duration::from_secs(600));
+    }
+
+    /// `[general] data_dir` becomes `DaemonConfig::data_dir`, the one data dir
+    /// the daemon hands to everything it builds — the store, and the control
+    /// plane's user tools, which `e2e_daemon`'s
+    /// `a_user_tool_is_kept_in_the_daemons_own_data_dir` follows from there.
+    /// The control plane used to derive its own from the platform default, so
+    /// a relocated install kept its user tools apart from its store.
+    #[test]
+    fn a_configured_data_dir_is_the_daemons_data_dir() {
+        let relocated = PathBuf::from("relocated-nanna-data");
+        let mut config = nanna_config::Config::default();
+        config.general.data_dir = Some(relocated.clone());
+
+        let mut builder = DaemonBuilder::new();
+        builder.apply_data_dir(&config);
+
+        assert_eq!(builder.config.data_dir, relocated);
+        assert_eq!(builder.memory_path, Some(relocated.join("memories.json")));
     }
 
     /// A fake Ollama that answers everything EXCEPT a generation instantly,

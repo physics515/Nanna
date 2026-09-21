@@ -56,6 +56,15 @@ pub struct ControlPlane {
     workspaces: Arc<RwLock<WorkspaceRegistry>>,
     config: Arc<RwLock<Config>>,
     config_path: Option<PathBuf>,
+    /// The daemon's data directory: home of the user tools and of the legacy
+    /// `tool-stats.json` that [`Self::with_storage`] migrates.
+    ///
+    /// Handed over by the server rather than re-derived, for the same reason
+    /// as `audit_log_path`: `[general] data_dir` and `--data-dir` both move
+    /// `DaemonConfig::data_dir`, and `Config::default_data_dir` knows neither,
+    /// so deriving it here kept user tools in the platform default while the
+    /// store the daemon opened lived somewhere else. `None` in the minimal
+    /// constructions, which keep no user tools.
     data_dir: Option<PathBuf>,
     /// System prompt template
     system_prompt: Arc<RwLock<String>>,
@@ -257,7 +266,10 @@ impl ControlPlane {
         }
     }
 
-    /// Create a control plane with all services including LLM router
+    /// Create a control plane with all services including LLM router.
+    ///
+    /// `data_dir` is the daemon's resolved data directory
+    /// (`DaemonConfig::data_dir`), where the user tools live.
     #[must_use]
     pub fn with_all_services(
         sessions: Arc<SessionManager>,
@@ -265,26 +277,22 @@ impl ControlPlane {
         memory: Option<Arc<MemoryService>>,
         tools: Option<Arc<ToolRegistry>>,
         router: Option<Arc<LlmRouter>>,
+        data_dir: PathBuf,
     ) -> Self {
         // Load config from disk
-        let (config, config_path, data_dir) = Config::load().map_or_else(
-            |_| (Config::default().with_env_overrides(), None, None),
+        let (config, config_path) = Config::load().map_or_else(
+            |_| (Config::default().with_env_overrides(), None),
             |cfg| {
                 // Save must target the same file `Config::load()` reads. This
                 // used to point at {data_dir}/config.toml while load reads
                 // {config_dir}/config.toml — every control-plane config write
                 // landed in a file nothing ever read back.
                 let path = Config::default_config_path().ok();
-                let data = nanna_config::Config::default_data_dir().ok();
-                (cfg.with_env_overrides(), path, data)
+                (cfg.with_env_overrides(), path)
             },
         );
 
-        // Initialize user tools manager
-        let user_tools = data_dir.as_ref().map(|d| {
-            let tools_dir = d.join("user_tools");
-            Arc::new(UserToolManager::new(tools_dir))
-        });
+        let user_tools = Some(Arc::new(UserToolManager::new(data_dir.join("user_tools"))));
 
         Self {
             sessions,
@@ -297,7 +305,7 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(config)),
             config_path,
-            data_dir,
+            data_dir: Some(data_dir),
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
