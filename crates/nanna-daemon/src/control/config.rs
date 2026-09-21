@@ -129,46 +129,11 @@ impl ControlPlane {
                 }
             }
             ConfigAction::Set { path, value } => self.config_set(path, value).await,
-            ConfigAction::Reset { path } => {
-                let mut config = self.config.write().await;
-
-                if let Some(_path) = path {
-                    // Reset specific path - would need more complex logic
-                    json!({ "error": "partial_reset_not_supported", "hint": "Use Reset without path to reset all" })
-                } else {
-                    let previous_ollama_host = config.memory.ollama_host.clone();
-                    let reset = Config::default().with_env_overrides();
-                    if let Err(message) = self.file_brought_in_secrets(&config, &reset).await {
-                        warn!("config.reset refused: {message}");
-                        return json!({ "error": "secret_store_failed", "message": message });
-                    }
-                    *config = reset;
-
-                    // Save to disk
-                    if let Some(ref config_path) = self.config_path
-                        && let Err(e) = config.save_to(config_path)
-                    {
-                        warn!("Failed to save config: {}", e);
-                    }
-
-                    // Propagate to agent service
-                    if let Some(ref agent) = self.agent {
-                        agent.apply_llm_config(&config.llm).await;
-                    }
-
-                    let snapshot = config.clone();
-                    drop(config);
-                    // The reset moves the Ollama address like a `config.set`
-                    // of it: a token saved with no server recorded was the
-                    // old address's.
-                    let snapshot = self
-                        .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
-                        .await;
-                    self.propagate_committed(&snapshot).await;
-
-                    json!({ "status": "reset" })
-                }
+            ConfigAction::Reset { path: Some(_) } => {
+                // Reset specific path - would need more complex logic
+                json!({ "error": "partial_reset_not_supported", "hint": "Use Reset without path to reset all" })
             }
+            ConfigAction::Reset { path: None } => self.config_reset().await,
             ConfigAction::Reload => self.config_reload().await,
             ConfigAction::Export => {
                 let config = self.config.read().await;
@@ -180,50 +145,106 @@ impl ControlPlane {
             }
             ConfigAction::Import { config: config_value } => {
                 // Parse as JSON object (TOML parsing removed for simplicity)
-                let new_config: Result<Config, String> = 
-                    serde_json::from_value(config_value).map_err(|e| e.to_string());
-                
-                match new_config {
-                    Ok(cfg) => {
-                        let mut config = self.config.write().await;
-                        let previous_ollama_host = config.memory.ollama_host.clone();
-                        let imported = cfg.with_env_overrides();
-                        if let Err(message) = self.file_brought_in_secrets(&config, &imported).await
-                        {
-                            warn!("config.import refused: {message}");
-                            return json!({ "error": "secret_store_failed", "message": message });
-                        }
-                        *config = imported;
-                        
-                        // Save to disk
-                        if let Some(ref config_path) = self.config_path
-                            && let Err(e) = config.save_to(config_path)
-                        {
-                            warn!("Failed to save config: {}", e);
-                        }
-                        
-                        info!("Config imported");
-
-                        // Import replaces the whole config, `[llm]` included —
-                        // it propagates for the same reason set/reset/reload do.
-                        if let Some(ref agent) = self.agent {
-                            agent.apply_llm_config(&config.llm).await;
-                        }
-
-                        let snapshot = config.clone();
-                        drop(config);
-                        // As for a reset: the address may have moved.
-                        let snapshot = self
-                            .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
-                            .await;
-                        self.propagate_committed(&snapshot).await;
-
-                        json!({ "status": "imported" })
-                    }
-                    Err(e) => json!({ "error": "import_failed", "message": e })
+                match serde_json::from_value::<Config>(config_value) {
+                    Ok(cfg) => self.config_import(cfg).await,
+                    Err(e) => json!({ "error": "import_failed", "message": e.to_string() }),
                 }
             }
         }
+    }
+
+    /// `ConfigAction::Reset` of the whole config: the defaults, with the
+    /// environment's overrides and every stored credential, persisted and
+    /// propagated live.
+    async fn config_reset(&self) -> Value {
+        let mut config = self.config.write().await;
+        let previous_ollama_host = config.memory.ollama_host.clone();
+        let mut reset = Config::default().with_env_overrides();
+        if let Err(message) = self.file_brought_in_secrets(&config, &reset).await {
+            warn!("config.reset refused: {message}");
+            return json!({ "error": "secret_store_failed", "message": message });
+        }
+        // A reset is of the settings, not the credentials: the store keeps
+        // every secret, and the reset config holds them as a restart would
+        // load them.
+        if let Err(message) = self
+            .settle_left_out_secrets(&config, &mut reset, None)
+            .await
+        {
+            warn!("config.reset refused: {message}");
+            return json!({ "error": "secret_store_failed", "message": message });
+        }
+        *config = reset;
+
+        // Save to disk
+        if let Some(ref config_path) = self.config_path
+            && let Err(e) = config.save_to(config_path)
+        {
+            warn!("Failed to save config: {}", e);
+        }
+
+        // Propagate to agent service
+        if let Some(ref agent) = self.agent {
+            agent.apply_llm_config(&config.llm).await;
+        }
+
+        let snapshot = config.clone();
+        drop(config);
+        // The reset moves the Ollama address like a `config.set` of it: a
+        // token saved with no server recorded was the old address's.
+        let snapshot = self
+            .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
+            .await;
+        self.propagate_committed(&snapshot).await;
+
+        json!({ "status": "reset" })
+    }
+
+    /// `ConfigAction::Import`: replace the whole config with `cfg`, persist,
+    /// and propagate it live.
+    async fn config_import(&self, cfg: Config) -> Value {
+        let mut config = self.config.write().await;
+        let previous_ollama_host = config.memory.ollama_host.clone();
+        let mut imported = cfg.with_env_overrides();
+        if let Err(message) = self.file_brought_in_secrets(&config, &imported).await {
+            warn!("config.import refused: {message}");
+            return json!({ "error": "secret_store_failed", "message": message });
+        }
+        // An export may carry no secrets: one the import lacks is kept, not
+        // cleared.
+        if let Err(message) = self
+            .settle_left_out_secrets(&config, &mut imported, None)
+            .await
+        {
+            warn!("config.import refused: {message}");
+            return json!({ "error": "secret_store_failed", "message": message });
+        }
+        *config = imported;
+
+        // Save to disk
+        if let Some(ref config_path) = self.config_path
+            && let Err(e) = config.save_to(config_path)
+        {
+            warn!("Failed to save config: {}", e);
+        }
+
+        info!("Config imported");
+
+        // Import replaces the whole config, `[llm]` included — it propagates
+        // for the same reason set/reset/reload do.
+        if let Some(ref agent) = self.agent {
+            agent.apply_llm_config(&config.llm).await;
+        }
+
+        let snapshot = config.clone();
+        drop(config);
+        // As for a reset: the address may have moved.
+        let snapshot = self
+            .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
+            .await;
+        self.propagate_committed(&snapshot).await;
+
+        json!({ "status": "imported" })
     }
 
     /// `ConfigAction::Reload`: load `config.toml` again and apply it live.
@@ -269,6 +290,10 @@ impl ControlPlane {
         if let Err(e) = set_nested(&mut config_value, &parts, value.clone()) {
             return json!({ "error": "set_failed", "message": e, "path": path });
         }
+        // Null or blank at a secret's own path is someone clearing it. A
+        // blank inside a larger value (a whole section, an import) is not:
+        // that only lacks the secret.
+        let clears = (is_blank(&value) && Config::names_a_secret(&path)).then_some(path.as_str());
 
         // Deserialize back to config
         match serde_json::from_value::<Config>(config_value) {
@@ -278,7 +303,7 @@ impl ControlPlane {
                 // token to a new `memory.ollama_host`. Dropped here, under the
                 // lock, so nothing ever reads it paired with the new address;
                 // which token the new address gets is read from the secure
-                // store below, once the lock is released.
+                // store below.
                 let previous_ollama_host = config.memory.ollama_host.clone();
                 let ollama_moved = nanna_config::ollama_server_changed(
                     &previous_ollama_host,
@@ -291,6 +316,16 @@ impl ControlPlane {
                     warn!("config.set {path} refused: {message}");
                     return json!({ "error": "secret_store_failed", "message": message, "path": path });
                 }
+                if let Err(message) = self
+                    .settle_left_out_secrets(&config, &mut new_config, clears)
+                    .await
+                {
+                    warn!("config.set {path} refused: {message}");
+                    return json!({ "error": "secret_store_failed", "message": message, "path": path });
+                }
+                // Cleared from the store, and still held: the environment
+                // supplies it, and every load takes it from there.
+                let still_supplied = clears.is_some() && new_config.holds_secret(&path);
                 *config = new_config;
 
                 // Save to disk if we have a path
@@ -323,6 +358,14 @@ impl ControlPlane {
                     .await;
                 self.propagate_committed(&snapshot).await;
 
+                if still_supplied {
+                    let note = format!(
+                        "{path} is deleted from the secure store, but the environment still \
+                         supplies it; unset it there to clear it"
+                    );
+                    warn!("config.set {path}: {note}");
+                    return json!({ "status": "updated", "path": path, "note": note });
+                }
                 json!({ "status": "updated", "path": path })
             }
             Err(e) => json!({ "error": "invalid_config", "message": e.to_string() })
@@ -414,6 +457,62 @@ impl ControlPlane {
             Err(e) => Err(format!("filing secrets in the secure store failed: {e}")),
         }
     }
+
+    /// Settle the secrets `changed` leaves out, before it is committed and
+    /// saved: forget the one a `config.set` clears (`cleared`, a path
+    /// `Config::names_a_secret`), and give `changed` back every one it
+    /// merely drops (`Config::drops_secrets`), from where the next load
+    /// fills them. Settled, `changed` holds what that load gives it.
+    ///
+    /// The save strips every secret, and the next load — a restart, or the
+    /// config watcher reading the save back seconds later — fills each unset
+    /// one from the environment, else the store. A clear made in the running
+    /// config alone was back with that load. A change that merely lacked a
+    /// secret — a reset, an import of an export carrying none, a set of a
+    /// whole section — ran without it until then, chat included, while the
+    /// store still held it.
+    ///
+    /// As [`Self::file_brought_in_secrets`]: only for a control plane that
+    /// saves, called with the config write lock held so that the store and
+    /// the commit agree, off the async runtime, and only for a change that
+    /// clears or drops a secret. A change of anything else never touches the
+    /// store.
+    ///
+    /// An `Err` says the store could not forget the cleared secret, and the
+    /// change must be refused with it: applied, the secret would be back at
+    /// the next load. `changed` is then left as it was.
+    async fn settle_left_out_secrets(
+        &self,
+        previous: &Config,
+        changed: &mut Config,
+        cleared: Option<&str>,
+    ) -> Result<(), String> {
+        if self.config_path.is_none() || (cleared.is_none() && !changed.drops_secrets(previous)) {
+            return Ok(());
+        }
+        let cleared = cleared.map(str::to_owned);
+        let running_ollama_host = previous.memory.ollama_host.clone();
+        let store = self.credential_store.clone();
+        let mut settling = changed.clone();
+        let settled = tokio::task::spawn_blocking(move || -> Result<Config, String> {
+            if let Some(path) = cleared {
+                settling
+                    .forget_secret(&path, &store)
+                    .map_err(|e| format!("the secure store could not delete {path}: {e}"))?;
+            }
+            settling.refill_secrets_replacing(&running_ollama_host, &store);
+            Ok(settling)
+        })
+        .await;
+        *changed = settled
+            .map_err(|e| format!("settling secrets with the secure store failed: {e}"))??;
+        Ok(())
+    }
+}
+
+/// Whether a `config.set` value is null or a blank string.
+fn is_blank(value: &Value) -> bool {
+    value.is_null() || value.as_str().is_some_and(|text| text.trim().is_empty())
 }
 
 /// Keys the daemon once read and no longer does, each with the sentence

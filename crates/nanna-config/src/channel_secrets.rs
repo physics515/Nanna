@@ -164,6 +164,22 @@ pub fn strip(channels: &mut ChannelsConfig) {
     }
 }
 
+/// The dotted path of every channel secret.
+pub fn fields() -> impl Iterator<Item = &'static str> {
+    SECRETS.iter().map(|secret| secret.field)
+}
+
+/// Unset the channel secret at dotted `path` in `channels`, as [`strip`]
+/// leaves it, and return its key in the store; `None` when `path` names no
+/// channel secret.
+pub fn unset(channels: &mut ChannelsConfig, path: &str) -> Option<&'static str> {
+    let secret = SECRETS.iter().find(|secret| secret.field == path)?;
+    if let Some(mut slot) = (secret.slot)(channels) {
+        slot.take();
+    }
+    Some(secret.key)
+}
+
 /// File every channel secret held in `channels` in `store`, trimmed, and take
 /// it out of `channels`.
 ///
