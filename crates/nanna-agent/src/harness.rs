@@ -1729,6 +1729,25 @@ pub fn tool_free_answer_fingerprint(outcome: &StepOutcome) -> Option<u64> {
     (words > 0).then(|| hasher.finish())
 }
 
+/// The first clause of an abandonment reason: how many steps ran on the item
+/// (replans included, counted where the run counts its steps), and what the
+/// no-progress budget charged.
+///
+/// The budget is a charge counter, not a step counter: a step that repeats
+/// the previous one is charged twice, a step with fresh evidence resets it,
+/// and replans are not charged at all. Reporting the charge as "N fruitless
+/// steps" told the user a turn that ran 6 steps had run 8.
+#[must_use]
+pub fn abandonment_headline(steps_run: usize, fruitless_charges: usize, replans: usize) -> String {
+    debug_assert!(replans <= steps_run, "a replan is a step");
+    debug_assert!(fruitless_charges > 0, "abandonment spends the budget");
+    format!(
+        "abandoned after {steps_run} steps ({replans} of them replans) made no verifiable \
+         progress; {fruitless_charges} no-progress charges spent (a step repeating the last \
+         one is charged twice)"
+    )
+}
+
 /// Did an unchecked item's answer converge — this step, like the one before
 /// it on the same item, answered with no tool calls, and said the same thing?
 ///
@@ -1824,6 +1843,12 @@ struct ItemProgress {
     /// [`tool_free_answer_fingerprint`] of this item's previous step — what
     /// [`answer_converged`] compares against.
     last_answer_fingerprint: Option<u64>,
+    /// Steps actually run on this item. Reporting only: the abandonment
+    /// reason used to present `steps_without_progress` — a CHARGE counter,
+    /// where a step repeating the last one is charged twice — as a count of
+    /// steps, so a turn that ran 6 steps said "abandoned after 8 fruitless
+    /// steps".
+    steps_run: usize,
     runner_errors: usize,
     /// Consecutive acceptance runs that timed out (reset by any DECIDED
     /// verdict, pass or fail). Reporting and framing only — it sizes the
@@ -2387,18 +2412,16 @@ impl<'a> HarnessRun<'a> {
         hang_timeouts: usize,
     ) -> Phase {
         // Grinding AND replanning failed — close the item and move on.
-        let (dry_replans, escalated_asks, last_result) = self.progress
-            .get(&step.id)
-            .map_or((0, 0, None), |item| {
+        let (dry_replans, escalated_asks, last_result, steps_run) =
+            self.progress.get(&step.id).map_or((0, 0, None, 0), |item| {
                 (
                     item.dry_replans,
                     item.escalated_asks,
                     item.last_result.clone(),
+                    item.steps_run,
                 )
             });
-        let mut reason = format!(
-            "abandoned after {fruitless_steps} fruitless steps and {item_replans} replans"
-        );
+        let mut reason = abandonment_headline(steps_run, fruitless_steps, item_replans);
         // Say what the replan rungs actually returned. The old
         // sentence described the outcome as though decomposition had
         // happened: 84 instrumented firings produced ZERO subtasks,
@@ -2806,6 +2829,9 @@ impl<'a> HarnessRun<'a> {
         subtasks_before: Option<usize>,
     ) -> Phase {
         self.steps_taken += 1;
+        // Counted where the run counts, so the item's number and the turn's
+        // `N steps` line can never disagree.
+        self.progress.entry(step.id).or_default().steps_run += 1;
         self.input_tokens += outcome.input_tokens;
         self.output_tokens += outcome.output_tokens;
         // Attribution material for the evidence guard: which paths this
@@ -6145,6 +6171,16 @@ mod tests {
             "{log:?}"
         );
         drop(log);
+    }
+
+    #[test]
+    fn the_abandonment_headline_counts_steps_not_charges() {
+        let headline = abandonment_headline(6, 8, 2);
+        assert!(
+            headline.starts_with("abandoned after 6 steps (2 of them replans)"),
+            "{headline}"
+        );
+        assert!(headline.contains("8 no-progress charges"), "{headline}");
     }
 
     #[tokio::test]

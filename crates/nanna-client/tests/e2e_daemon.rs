@@ -1946,3 +1946,60 @@ async fn a_huge_tool_argument_does_not_evict_the_call_that_made_it() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A model stuck repeating the same failing call — a classic small-model
+/// loop — ends the turn by itself, and the report it leaves tells the truth
+/// about how much ran: the abandoned item's step count and the turn's own
+/// `N steps` line agree. The item's count used to be the no-progress CHARGE
+/// counter (a repeated step is charged twice): "abandoned after 8 fruitless
+/// steps" in a turn that ran 6.
+#[tokio::test]
+async fn a_repeated_failing_call_ends_bounded_and_reports_the_steps_it_ran() {
+    let ollama = ScriptedOllama::start(vec![r#"CALL frobnicate {"x":1}"#.to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("loop".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let reply = converse(&client, &session, "Frobnicate it.").await;
+    assert!(
+        reply.contains("could not finish"),
+        "the failure is stated: {reply}"
+    );
+
+    let number_before = |marker: &str| -> Option<usize> {
+        let end = reply.find(marker)?;
+        // The line is italic markdown (`_6 steps · …_`): keep the digits.
+        reply[..end]
+            .split_whitespace()
+            .last()?
+            .trim_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .ok()
+    };
+    let turn_steps = number_before(" steps · ").expect("the turn's step line");
+    let item_steps = reply
+        .split("abandoned after ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .expect("the abandoned item's step count");
+    assert_eq!(item_steps, turn_steps, "one item, one count: {reply}");
+    assert!(
+        ollama.chat_bodies.lock().await.len() < 100,
+        "the loop is bounded by the harness, not by the model"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

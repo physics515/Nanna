@@ -2089,6 +2089,17 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             `a_huge_tool_argument_does_not_evict_the_call_that_made_it` fails when either half is
             removed; 2 unit tests. The e2e stub now answers `/api/show` like a 32K tool-calling
             model, so every scripted test sizes context as a real model would.
+      - [x] *(2026-09-21)* **An abandoned item reported its charge counter as a step count.** A
+            model repeating one failing call is stopped by the harness (probed: 36 requests,
+            0.24 s, bounded) — but the report read "abandoned after **8** fruitless steps" in a turn
+            whose own footer said "**6** steps": `steps_without_progress` is a no-progress *charge*
+            (a step repeating the last one is charged twice; replans are not charged), not a step
+            count. Items now count the steps actually run on them, at the same place the run counts
+            its steps, and the reason says both: `abandoned after 6 steps (2 of them replans) made
+            no verifiable progress; 8 no-progress charges spent (…charged twice)`. e2e
+            `a_repeated_failing_call_ends_bounded_and_reports_the_steps_it_ran` asserts the two
+            counts agree (fails on the old counter). Not changed: the "last said" excerpt in that
+            report can quote model-facing harness notes (`[HARNESS NOTE — …]`) verbatim.
       - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
             behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
             comment says "the next message decides what happens to them" — but the harness simply
