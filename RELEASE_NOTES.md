@@ -1,43 +1,61 @@
-# Nanna v0.3.25-beta.34 — Sent When You Say Send
+# Nanna v0.3.26-beta.35 — Chats That Carry On, Keys That Stay Put
 
-A small release: the chat fix that just missed 0.3.24, and a config fix that landed after it.
-Pressing Ctrl+Enter the moment you finished typing could leave your message sitting in the box,
-unsent, with nothing to say why. And a Telegram or Discord bot token set in the environment quietly
-threw away the rest of that channel's settings, including, for Telegram, the list of people allowed
-to talk to the bot.
+When the first model in your list fails, chat now moves on to the next one instead of giving up.
+Every API key, bot token and webhook secret now lives only in your system's secure store, never in
+config.toml, and a key you change, clear or reset stays that way.
 
-Two fixes that are in 0.3.24 were left out of its release notes. They are described at the end.
+## What's New
+
+**Chat falls back to your next model when the first one fails.** Chat used to run every step on
+the first model in your priority list. When that model's provider failed, chat kept retrying it
+until the reply ended in an error such as `error decoding response body`, even with working models
+listed after it. Now a step that fails on one model runs again on the next model in the list, and
+the rest of that reply stays on it. The next message starts from the top of the list again. Each
+switch is shown in the chat and on the model badge. A chat pinned to one model is never moved off
+it.
+
+**Tools you create survive a restart.** A tool made on the Tools page was saved to disk but never
+loaded again, so after the daemon restarted it disappeared from the list, the model could no
+longer call it, and it could not be enabled or disabled. Saved tools now load at startup.
 
 ## What's Fixed
 
-**Ctrl+Enter right after typing always sends.** The composer judged whether it was empty from a
-copy of your text that lagged a frame or two behind, so a message sent the instant it was typed
-could stay in the box, unsent and unexplained. It now reads the text itself, so the shortcut and the
-Send button agree with what you see.
+**Secrets are no longer written to config.toml.** Channel secrets (the Telegram, Discord, Slack,
+Signal and WhatsApp tokens and signing secrets), the `nanna server` webhook secret, and API keys
+typed into config.toml by hand were kept there in plain text. Each one is now filed in the secure
+store (the OS keyring, or its encrypted-file fallback) when config.toml is loaded. The next save of
+your settings removes it from the file, and until then a warning says the line can be deleted.
 
-**A channel token in the environment no longer wipes the channel's settings.** With
-`TELEGRAM_BOT_TOKEN` exported, a configured `[channels.telegram]` section lost its `allowed_users`
-list, so anyone could drive the bot, and its webhook URL and secret, so the webhook refused every
-request. The three Discord variables rebuilt `[channels.discord]` from scratch in the same way. Each
-variable now replaces only the field it names, and the rest of the section is kept. A variable left
-blank changes nothing, and `DISCORD_BOT_TOKEN` on its own now overrides a configured token (before,
-it was ignored unless the other two were set as well).
+**A key you change or clear stays changed.** A key or token changed through the daemon's settings
+(`config.set`, import or reset) reached the running app but not the secure store, and the daemon
+reloads its settings a couple of seconds after each save. So a new key vanished moments later, a
+key you cleared came back, and a reset or import briefly left chat without your saved keys. Each
+change is now recorded where the next load reads it.
 
-## Also in 0.3.24, Missing From Its Notes
+**A key set in the environment is respected, and never copied to disk.** When a key comes from an
+environment variable, such as `BRAVE_API_KEY`, the daemon now refuses to change it and names the
+variable to unset, instead of accepting a change that would be undone within seconds. Setting some
+other key no longer copies the environment's keys into the keyring either.
 
-**Each provider's API key stays with that provider.** A key that `nanna init` saved for OpenRouter
-or OpenAI was also read as the Anthropic key, so a `claude-*` chat or an Anthropic summary could
-send it to Anthropic. Every provider now has its own field and keyring entry. The first time Nanna
-loads a config saved the old way, it moves the key to its provider's entry, once. A key with
-Anthropic's `sk-ant-` prefix is never moved. Neither is a key that disagrees with one already in the
-provider's own place: both are kept, and a warning names the conflict.
+**Settings lists your OpenAI models with a stored key.** Listing OpenAI models failed with "No
+OpenAI API key configured" unless `OPENAI_API_KEY` was set, even with a key saved in Settings.
 
-**Sending no longer leaves an invisible line break behind.** After Ctrl+Enter the composer looked
-empty but still held a line break, so the Send button stayed lit.
+**Your data folder is used for everything.** With `[general] data_dir` set, the daemon kept user
+tools in the default location instead of your data folder.
+
+### For command-line users
+
+- A key entered at the first-run prompt now works for the chat it was entered for. Before, that
+  chat started without it.
+- `nanna serve` uses the chosen provider's key. It read the Anthropic key for every provider.
+  `OPENROUTER_API_KEY` now overrides the stored OpenRouter key, and a variable that is set but empty
+  no longer wipes a stored key.
+- `nanna daemon start` runs the same daemon as the desktop app and stops cleanly on a shutdown
+  signal, and starting a second daemon no longer takes over the first one's PID file.
 
 ---
 
-Updating from 0.3.22 or earlier? The
-[0.3.24 release notes](https://github.com/physics515/Nanna/releases/tag/v0.3.24-beta.33) cover the
-rest of what is new to you: plain chat that answers once, pictures that reach the model, streaming
-that survives any language, and the memory speedups from 0.3.23.
+Updating from 0.3.24 or earlier? The
+[0.3.25 release notes](https://github.com/physics515/Nanna/releases/tag/v0.3.25-beta.34) cover
+Ctrl+Enter sending reliably and channel settings kept with a token in the environment, and link to
+0.3.24's.
