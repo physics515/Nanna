@@ -1564,6 +1564,61 @@ pub struct ChatSink {
     /// so "working, wedged, or finished" is answerable without log greps.
     /// `None` on paths that have no beat (task-run manager, tests).
     pub liveness: Option<Arc<crate::liveness::SessionLiveness>>,
+    /// Where the reply's text stands, so each harness step's text starts a
+    /// new paragraph instead of running on from the last step's final word.
+    /// Shared (not per-clone) for the same reason as `quiet_item`.
+    pub text_join: Arc<std::sync::Mutex<StepTextJoin>>,
+}
+
+/// How consecutive harness steps' text joins into one reply.
+///
+/// Steps are separate agent runs streaming into the same message. The loop
+/// separates its own iterations (`loop_runner` emits a space between them),
+/// but nothing separated steps, and once the step banner moved out of the
+/// text (run mechanics are not message content) the steps simply abutted:
+/// `…read the file.The file says…`, in the stream AND in the persisted reply.
+#[derive(Debug, Default)]
+pub struct StepTextJoin {
+    /// Some text has been emitted into this reply.
+    emitted_any: bool,
+    /// The last emitted character was whitespace (or nothing was emitted).
+    ends_with_whitespace: bool,
+    /// A step began and has not emitted text yet.
+    step_break_pending: bool,
+}
+
+/// What goes between two steps' text: a paragraph break, since each step is
+/// a separate action, not a continuation of the previous sentence.
+const STEP_TEXT_SEPARATOR: &str = "\n\n";
+
+impl StepTextJoin {
+    /// A step is starting: its first text, if any, opens a new paragraph.
+    fn begin_step(&mut self) {
+        self.step_break_pending = true;
+        debug_assert!(self.step_break_pending, "a started step must arm the break");
+    }
+
+    /// Account for `text` about to be emitted and return the separator that
+    /// must precede it (empty when none is needed).
+    ///
+    /// No separator before the reply's first text, and none when either side
+    /// of the seam already carries whitespace — the model's own `\n` must not
+    /// grow into three.
+    fn separator_before(&mut self, text: &str) -> &'static str {
+        debug_assert!(!text.is_empty(), "empty deltas are dropped before joining");
+        let needs_break = self.step_break_pending
+            && self.emitted_any
+            && !self.ends_with_whitespace
+            && !text.starts_with(char::is_whitespace);
+        self.step_break_pending = false;
+        self.emitted_any = true;
+        self.ends_with_whitespace = text.ends_with(char::is_whitespace);
+        debug_assert!(
+            !self.step_break_pending,
+            "the break is spent by the first text"
+        );
+        if needs_break { STEP_TEXT_SEPARATOR } else { "" }
+    }
 }
 
 impl ChatSink {
@@ -1571,6 +1626,22 @@ impl ChatSink {
         if text.is_empty() {
             return;
         }
+        let separator = self
+            .text_join
+            .lock()
+            .map_or("", |mut join| join.separator_before(text));
+        if separator.is_empty() {
+            self.emit_delta(text);
+        } else {
+            let mut joined = String::with_capacity(separator.len() + text.len());
+            joined.push_str(separator);
+            joined.push_str(text);
+            self.emit_delta(&joined);
+        }
+    }
+
+    /// Stream `text` and record it in the run's buffers, exactly as given.
+    fn emit_delta(&self, text: &str) {
         if let Some(live) = &self.liveness {
             live.on_stream_delta(text.len());
         }
@@ -1824,6 +1895,11 @@ impl ChatSink {
     /// writes `Task #id: title`); if that line is ever absent the header
     /// degrades to the bare item id rather than failing.
     fn step_header(&self, request: &StepRequest) {
+        // Every step — quiet or announced — is a new action, so its text
+        // starts a new paragraph (see `StepTextJoin`).
+        if let Ok(mut join) = self.text_join.lock() {
+            join.begin_step();
+        }
         // The liveness ledger tracks EVERY step, including banner-free quiet
         // items — a wedge inside a conversation-shaped turn must still be
         // visible to the beat and the `session.liveness` verb.
@@ -6088,6 +6164,7 @@ mod tests {
             storage: None,
             liveness: None,
             quiet_item: Arc::new(std::sync::Mutex::new(None)),
+            text_join: Arc::default(),
         }
     }
 
@@ -6241,6 +6318,70 @@ mod tests {
             }
             other => panic!("expected one Step entry, got: {other:?}"),
         }
+    }
+
+    fn execute_request(item_id: i64, step_index: usize) -> StepRequest {
+        StepRequest {
+            item_title: format!("test item {item_id}"),
+            item_id,
+            step_index,
+            step_kind: nanna_agent::harness::StepKind::Execute,
+            prompt: format!("Task #{item_id}: reply to the user"),
+            tool_scope: Vec::new(),
+            token_budget: None,
+            max_iterations: None,
+            max_wall_clock: None,
+            cancel: None,
+        }
+    }
+
+    /// Consecutive steps are separate actions streaming into one reply, and
+    /// used to abut: `…the file.The file says…` in the stream and in the
+    /// persisted message. Each step's text now opens a new paragraph — for
+    /// quiet (conversation-shaped) items too, which are exactly the ones with
+    /// no banner or journal entry to mark the seam.
+    #[tokio::test]
+    async fn each_step_opens_a_new_paragraph_in_the_reply() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+        *sink.quiet_item.lock().unwrap() = Some(7);
+
+        sink.step_header(&execute_request(7, 0));
+        sink.delta("Let me check");
+        sink.delta(" the file.");
+        sink.step_header(&execute_request(7, 1));
+        sink.delta("It says hello.");
+
+        assert_eq!(
+            run.accumulated_text.read().await.as_str(),
+            "Let me check the file.\n\nIt says hello.",
+            "one break at the step seam, none inside a step, none before the first text"
+        );
+    }
+
+    /// The break is only added where the seam has no whitespace of its own:
+    /// a model that already ended on a newline, or starts with one, keeps its
+    /// own spacing, and a step that emits nothing leaves no stray break.
+    #[tokio::test]
+    async fn a_step_seam_that_already_has_whitespace_is_left_alone() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+
+        sink.step_header(&execute_request(1, 0));
+        sink.delta("First.\n");
+        sink.step_header(&execute_request(1, 1));
+        sink.delta("Second.");
+        sink.step_header(&execute_request(1, 2));
+        sink.delta("\nThird.");
+        // A step with no text, then one with text: exactly one break.
+        sink.step_header(&execute_request(1, 3));
+        sink.step_header(&execute_request(1, 4));
+        sink.delta("Fourth.");
+
+        assert_eq!(
+            run.accumulated_text.read().await.as_str(),
+            "First.\nSecond.\nThird.\n\nFourth."
+        );
     }
 
     /// Parity with the retired direct chat path: completed tool calls feed

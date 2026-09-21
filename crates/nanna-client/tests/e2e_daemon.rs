@@ -787,9 +787,10 @@ const STUB_MODEL: &str = "e2e-stub:1b";
 ///
 /// It answers the two prompts a chat turn sends the way the daemon asks them
 /// to be answered: the planner gets ONE JSON task with no machine check (what
-/// the planner's rules prescribe for a question), and a step gets the reply
-/// followed by `TASK COMPLETE` on its own line (what the step prompt asks for
-/// when no machine check exists). Anything else gets `{}`. A stub that
+/// the planner's rules prescribe for a question), and step `n` gets
+/// `steps[n]` verbatim (the last entry repeats) — a finishing step ends with
+/// `TASK COMPLETE` on its own line, which is what the step prompt asks for
+/// when no machine check exists. Anything else gets `{}`. A stub that
 /// answered every prompt with the same prose would test the harness's
 /// fallback ladder instead — the planner starves, no step ever completes, and
 /// the turn is abandoned — which is a different test.
@@ -799,7 +800,11 @@ struct ScriptedOllama {
 }
 
 impl ScriptedOllama {
-    async fn start(reply: &'static str) -> Self {
+    async fn start(steps: Vec<String>) -> Self {
+        assert!(
+            !steps.is_empty(),
+            "a scripted model needs at least one step reply"
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the scripted Ollama");
@@ -820,8 +825,9 @@ impl ScriptedOllama {
         let plan = answer(
             r#"[{"title":"Answer the question","description":"Reply directly.","acceptance":null}]"#,
         );
-        let step = answer(&format!("{reply}\nTASK COMPLETE"));
+        let steps: Vec<String> = steps.iter().map(|text| answer(text)).collect();
         tokio::spawn(async move {
+            let mut step_index = 0_usize;
             while let Ok((mut socket, _)) = listener.accept().await {
                 let Some((request_line, body)) = read_http_request(&mut socket).await else {
                     continue;
@@ -830,7 +836,8 @@ impl ScriptedOllama {
                     let line = if body.contains(PLANNER_PROMPT_OPENING) {
                         &plan
                     } else {
-                        &step
+                        step_index += 1;
+                        &steps[(step_index - 1).min(steps.len() - 1)]
                     };
                     seen.lock().await.push(body);
                     // One NDJSON line serves both shapes: a streamed request
@@ -910,7 +917,7 @@ async fn a_conversation_turn_round_trips_and_persists_its_reply() {
     const USER_TEXT: &str = "What is the capital of France?";
     const REPLY: &str = "Paris is the capital of France.";
 
-    let ollama = ScriptedOllama::start(REPLY).await;
+    let ollama = ScriptedOllama::start(vec![format!("{REPLY}\nTASK COMPLETE")]).await;
     let host = ollama.base_url.clone();
     let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
         b.with_model(STUB_MODEL)
@@ -986,6 +993,86 @@ async fn a_conversation_turn_round_trips_and_persists_its_reply() {
     assert!(
         text.contains(REPLY),
         "the assistant's reply is persisted: {history}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A turn that takes two steps reads as two paragraphs, not one run-on line.
+///
+/// Each harness step streams into the same reply. With the step banner out
+/// of the text (run mechanics are not content) nothing separated them, and
+/// the reply — live and persisted — read `…the question.Paris is…`.
+#[tokio::test]
+async fn a_two_step_turn_reads_as_two_paragraphs() {
+    const FIRST: &str = "Let me recall the answer.";
+    const SECOND: &str = "Paris is the capital of France.";
+
+    // Step one makes no claim to be finished, so the harness takes another
+    // step; step two finishes.
+    let ollama =
+        ScriptedOllama::start(vec![FIRST.to_string(), format!("{SECOND}\nTASK COMPLETE")]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("two steps".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+    let ack = client
+        .chat()
+        .send(&session, "What is the capital of France?")
+        .await
+        .expect("chat.send is accepted");
+    let message_id = ack["message_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the ack names the turn's message: {ack}"))
+        .to_string();
+
+    let answered = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::MessageEnd {
+                    message_id: id,
+                    content,
+                    ..
+                }) if id == message_id => {
+                    return content;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("the session's event stream ended before the turn did: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the turn ends before the hang ceiling");
+    // A multi-step turn ends with the harness's own `_N steps · …_` summary
+    // line; the seam under test is the one between the two steps' text.
+    assert!(
+        answered.starts_with(&format!("{FIRST}\n\n{SECOND}")),
+        "the two steps' text is separated by a paragraph break: {answered:?}"
+    );
+
+    let history = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("sessions.history answers");
+    assert!(
+        history
+            .to_string()
+            .contains(&format!("{FIRST}\\n\\n{SECOND}")),
+        "the persisted reply keeps the paragraph break: {history}"
     );
 
     client.disconnect().await;

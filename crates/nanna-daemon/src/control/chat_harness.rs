@@ -521,6 +521,7 @@ impl ControlPlane {
             storage: Some(storage.clone()),
             liveness: Some(live.clone()),
             quiet_item: Arc::new(std::sync::Mutex::new(None)),
+            text_join: Arc::default(),
         };
         // The finalizer needs the sink after the step runner takes ownership;
         // ChatSink is a bundle of shared handles, so a clone IS the same sink.

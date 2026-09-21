@@ -1884,6 +1884,17 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       with one null-acceptance task and each step with the reply + `TASK COMPLETE`, the turn is one
       step and the reply is exact. The glued copies exposed a real defect, taken next (below).
       Remaining: the **embedded-fallback** path (needs a GUI build).
+      - [x] *(2026-09-21)* **Consecutive harness steps glued their text together.** Every step
+            streams into the same reply; the loop separates its own iterations with a space, but
+            nothing separated *steps*, and once the step banner left the message body (run
+            mechanics are not content) a two-step answer read `Let me recall the answer.Paris is…`
+            — live, and in the persisted reply the model is shown on later turns. `ChatSink` now
+            keeps a `StepTextJoin`: every step (quiet conversation-shaped items included — they are
+            the ones with no banner or journal entry to mark the seam) arms a paragraph break, spent
+            by that step's first text, and only added when neither side of the seam already has
+            whitespace, so a model's own newline never grows into three. 2 unit tests + a new e2e
+            `a_two_step_turn_reads_as_two_paragraphs` through the real daemon; all three fail by name
+            with the separator emptied, and the e2e failure reproduces the defect verbatim.
 - [x] **Channel conversations were answered with an error — every message, since P22.** *(2026-09-17)*
       `ChannelManager::process_message` (Telegram/Discord/Slack listeners AND the webhook processor)
       read the reply from `chat.send`'s response `content`. Two things had made that impossible:
