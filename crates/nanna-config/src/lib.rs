@@ -31,6 +31,8 @@ mod server_secret;
 /// The `[llm]` keys and `[tools].brave_api_key` a `config.toml` holds, filed
 /// in the secure store as it loads.
 mod api_keys;
+/// Forgetting a secret someone clears, and keeping the ones a change lacks.
+mod secret_clearing;
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///

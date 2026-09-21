@@ -1134,3 +1134,443 @@ async fn a_retired_key_inside_a_parent_object_is_refused_too() {
     assert_eq!(resp["status"], "updated", "{resp}");
     assert_eq!(cp.config.read().await.llm.model, "nanna-test-other-model");
 }
+
+// -----------------------------------------------------------------------------
+// Clearing a secret, and a change that merely lacks one
+// -----------------------------------------------------------------------------
+
+/// Boot `cp` as the daemon boots: `config` is its saved `config.toml`, and
+/// the running config is what loading that file gives, with `store`'s
+/// secrets and the environment's.
+async fn boot_from(cp: &ControlPlane, dir: &std::path::Path, config: &Config) {
+    let file = dir.join("config.toml");
+    config.save_to(&file).expect("save");
+    let loaded =
+        Config::load_from_replacing(&file, &config.memory.ollama_host, &cp.credential_store)
+            .expect("loads")
+            .with_env_overrides();
+    *cp.config.write().await = loaded;
+}
+
+/// Assert that the running config is what the next load of the save gives:
+/// a restart, or the config watcher reading the daemon's own save back
+/// within one poll (loaded here as the watcher loads it). Where the two
+/// differ, the watcher applies the load, and what the change did is undone
+/// seconds later.
+async fn assert_running_is_the_next_load(cp: &ControlPlane, dir: &std::path::Path, label: &str) {
+    let running = cp.config.read().await.clone();
+    let loaded = Config::load_from_replacing(
+        &dir.join("config.toml"),
+        &running.memory.ollama_host,
+        &cp.credential_store,
+    )
+    .expect("the save loads")
+    .with_env_overrides();
+    assert_eq!(
+        serde_json::to_value(&running).expect("json"),
+        serde_json::to_value(&loaded).expect("json"),
+        "{label}: the running config is what the next load gives"
+    );
+}
+
+/// What the environment supplies for `var`: a blank variable supplies nothing.
+fn env_supplies(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// The string at dotted `path` in `config`, when there is one.
+fn string_at(config: &Config, path: &str) -> Option<String> {
+    let value = serde_json::to_value(config).expect("json");
+    path.split('.')
+        .try_fold(&value, |node, part| node.get(part))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// `config.set` of a secret's path to null or blank is someone clearing it.
+/// Cleared in the running config only, the store kept it, and the next load
+/// (a restart, or the watcher reading the save back) brought it back. It is
+/// deleted from the store, and the running config holds what the next load
+/// gives: only what the environment still supplies.
+#[tokio::test]
+async fn clearing_a_secret_deletes_it_from_the_store() {
+    use nanna_config::credentials::keys;
+    for (path, key, env_var, clear) in [
+        (
+            "llm.api_key",
+            keys::ANTHROPIC_API_KEY,
+            "ANTHROPIC_API_KEY",
+            json!(null),
+        ),
+        (
+            "llm.openrouter_api_key",
+            keys::OPENROUTER_API_KEY,
+            "OPENROUTER_API_KEY",
+            json!(""),
+        ),
+        (
+            "tools.brave_api_key",
+            keys::BRAVE_API_KEY,
+            "BRAVE_API_KEY",
+            json!(null),
+        ),
+        (
+            "server.webhook_secret",
+            keys::SERVER_WEBHOOK_SECRET,
+            "NANNA_WEBHOOK_SECRET",
+            json!("  "),
+        ),
+        (
+            "channels.telegram.bot_token",
+            keys::TELEGRAM_BOT_TOKEN,
+            "TELEGRAM_BOT_TOKEN",
+            json!(""),
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cp, store) = persisting_control_plane(dir.path());
+        store.set(key, "stored-secret").expect("set");
+        let mut config = Config::default();
+        config.channels.telegram = Some(nanna_config::TelegramConfig {
+            bot_token: String::new(),
+            webhook_url: None,
+            allowed_users: Some(vec![42]),
+            webhook_secret: None,
+        });
+        boot_from(&cp, dir.path(), &config).await;
+        let cp = Arc::new(cp);
+
+        let resp = cp
+            .handle(
+                "test",
+                Action::Config(ConfigAction::Set {
+                    path: path.into(),
+                    value: clear,
+                }),
+            )
+            .await;
+
+        assert_eq!(resp["status"], "updated", "{path}: {resp}");
+        assert!(!store.exists(key), "{path}: deleted from the store");
+        assert_eq!(
+            string_at(&*cp.config.read().await, path).filter(|held| !held.is_empty()),
+            env_supplies(env_var),
+            "{path}: the running config holds only what the environment supplies"
+        );
+        assert_running_is_the_next_load(&cp, dir.path(), path).await;
+    }
+}
+
+/// The store holds one Ollama token, bound to the server it was saved for.
+/// Clearing the token clears the running server's: the stored one goes when
+/// it is that server's, or recorded for none (an older build's, loaded for
+/// the running server). Another server's token is not this one's to clear.
+#[tokio::test]
+async fn clearing_the_ollama_token_deletes_only_the_running_servers() {
+    use nanna_config::credentials::keys;
+    const RUNNING: &str = "https://gpu.example/ollama";
+    let clear = || {
+        Action::Config(ConfigAction::Set {
+            path: "llm.ollama_api_key".into(),
+            value: Value::Null,
+        })
+    };
+    let mut running_config = Config::default();
+    running_config.memory.ollama_host = RUNNING.to_string();
+
+    // Filed for the running server.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    store.save_ollama_token("gpu-token", RUNNING).expect("save");
+    boot_from(&cp, dir.path(), &running_config).await;
+    let cp = Arc::new(cp);
+    let resp = cp.handle("test", clear()).await;
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(
+        store.ollama_token(),
+        None,
+        "the running server's token is deleted"
+    );
+    assert!(
+        !store.exists(keys::OLLAMA_API_KEY_HOST),
+        "and its server's record"
+    );
+    assert_eq!(
+        cp.config.read().await.llm.ollama_api_key,
+        env_supplies("OLLAMA_API_KEY")
+    );
+    assert_running_is_the_next_load(&cp, dir.path(), "the running server's").await;
+
+    // Filed for another server: kept, still bound to it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    store
+        .save_ollama_token("other-token", "https://other.example/ollama")
+        .expect("save");
+    boot_from(&cp, dir.path(), &running_config).await;
+    let cp = Arc::new(cp);
+    let resp = cp.handle("test", clear()).await;
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(store.ollama_token().as_deref(), Some("other-token"));
+    assert_eq!(
+        store
+            .ollama_token_host()
+            .expect("a file store answers")
+            .as_deref(),
+        Some("https://other.example/ollama"),
+        "another server's token is kept for it"
+    );
+    assert_running_is_the_next_load(&cp, dir.path(), "another server's").await;
+
+    // Filed by an older build, with no server recorded: the running server's.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    store
+        .set(keys::OLLAMA_API_KEY, "legacy-token")
+        .expect("set");
+    running_config
+        .save_to(&dir.path().join("config.toml"))
+        .expect("save");
+    {
+        let mut config = cp.config.write().await;
+        *config = running_config.clone();
+        config.llm.ollama_api_key = Some("legacy-token".to_string());
+    }
+    let cp = Arc::new(cp);
+    let resp = cp.handle("test", clear()).await;
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(
+        store.ollama_token(),
+        None,
+        "an unbound token was the running server's"
+    );
+    assert_running_is_the_next_load(&cp, dir.path(), "an unbound token").await;
+}
+
+/// The secrets a reset keeps: every one the store holds. Reset put the
+/// defaults in the running config, credentials included, so chat went
+/// without the stored key until the watcher read the save back and the
+/// store's secrets came back with it. The running config after a reset is
+/// what a restart loads, and the store loses nothing.
+#[tokio::test]
+async fn a_reset_keeps_the_stored_credentials() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    let stored = [
+        (
+            keys::OPENROUTER_API_KEY,
+            "OPENROUTER_API_KEY",
+            "llm.openrouter_api_key",
+            "sk-or-stored",
+        ),
+        (
+            keys::BRAVE_API_KEY,
+            "BRAVE_API_KEY",
+            "tools.brave_api_key",
+            "brave-stored",
+        ),
+        (
+            keys::SERVER_WEBHOOK_SECRET,
+            "NANNA_WEBHOOK_SECRET",
+            "server.webhook_secret",
+            "webhook-stored",
+        ),
+    ];
+    for (key, _, _, secret) in stored {
+        store.set(key, secret).expect("set");
+    }
+    let default_host = Config::default().memory.ollama_host;
+    store
+        .save_ollama_token("ollama-stored", &default_host)
+        .expect("save");
+    let mut config = Config::default();
+    config.llm.model = "nanna-test-configured-model".to_string();
+    boot_from(&cp, dir.path(), &config).await;
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle("test", Action::Config(ConfigAction::Reset { path: None }))
+        .await;
+
+    assert_eq!(resp["status"], "reset", "{resp}");
+    let running = cp.config.read().await.clone();
+    assert_eq!(running.llm.model, Config::default().llm.model, "reset");
+    for (key, env_var, path, secret) in stored {
+        assert_eq!(store.get(key).ok().as_deref(), Some(secret), "{path}: kept");
+        assert_eq!(
+            string_at(&running, path),
+            Some(env_supplies(env_var).unwrap_or_else(|| secret.to_string())),
+            "{path}: still held by the running config"
+        );
+    }
+    assert_eq!(store.ollama_token().as_deref(), Some("ollama-stored"));
+    assert_eq!(
+        running.llm.ollama_api_key,
+        Some(env_supplies("OLLAMA_API_KEY").unwrap_or_else(|| "ollama-stored".to_string()))
+    );
+    assert_running_is_the_next_load(&cp, dir.path(), "reset").await;
+}
+
+/// An import replaces the whole config, but an export may carry no secrets
+/// (a copy that never held them, one written before they left
+/// `config.toml`): a secret the import lacks is not one it clears. The store
+/// keeps it, and the running config holds it as the next load will.
+#[tokio::test]
+async fn an_import_that_lacks_a_secret_keeps_it() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    store
+        .set(keys::OPENROUTER_API_KEY, "sk-or-stored")
+        .expect("set");
+    store.set(keys::BRAVE_API_KEY, "brave-stored").expect("set");
+    boot_from(&cp, dir.path(), &Config::default()).await;
+    let cp = Arc::new(cp);
+
+    let mut imported = Config::default();
+    imported.llm.model = "nanna-test-imported-model".to_string();
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Import {
+                config: serde_json::to_value(&imported).expect("json"),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["status"], "imported", "{resp}");
+    let running = cp.config.read().await.clone();
+    assert_eq!(running.llm.model, "nanna-test-imported-model");
+    for (key, env_var, secret, held) in [
+        (
+            keys::OPENROUTER_API_KEY,
+            "OPENROUTER_API_KEY",
+            "sk-or-stored",
+            running.llm.openrouter_api_key.clone(),
+        ),
+        (
+            keys::BRAVE_API_KEY,
+            "BRAVE_API_KEY",
+            "brave-stored",
+            running.tools.brave_api_key.clone(),
+        ),
+    ] {
+        assert_eq!(store.get(key).ok().as_deref(), Some(secret), "{key}: kept");
+        assert_eq!(
+            held,
+            Some(env_supplies(env_var).unwrap_or_else(|| secret.to_string())),
+            "{key}: still held by the running config"
+        );
+    }
+    assert_running_is_the_next_load(&cp, dir.path(), "import").await;
+}
+
+/// A `config.set` of a whole section that lacks a secret is not a clear of
+/// it, any more than an import is: only a set of the secret's own path to
+/// null or blank clears it.
+#[tokio::test]
+async fn a_set_of_a_section_that_lacks_a_secret_keeps_it() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    store
+        .set(keys::OPENROUTER_API_KEY, "sk-or-stored")
+        .expect("set");
+    boot_from(&cp, dir.path(), &Config::default()).await;
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm".into(),
+                value: json!({ "model": "nanna-test-other-model", "openrouter_api_key": null }),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(
+        store.get(keys::OPENROUTER_API_KEY).ok().as_deref(),
+        Some("sk-or-stored"),
+        "kept in the store"
+    );
+    assert_eq!(
+        cp.config.read().await.llm.openrouter_api_key,
+        Some(env_supplies("OPENROUTER_API_KEY").unwrap_or_else(|| "sk-or-stored".to_string()))
+    );
+    assert_running_is_the_next_load(&cp, dir.path(), "section set").await;
+}
+
+/// A store that cannot delete the secret refuses the clear, with why:
+/// applied, it would last until the next load and the secret would be back.
+/// Nothing is applied or saved.
+#[tokio::test]
+async fn a_clear_the_store_cannot_make_is_refused() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    store.set(keys::BRAVE_API_KEY, "brave-stored").expect("set");
+    boot_from(&cp, dir.path(), &Config::default()).await;
+    let held = cp.config.read().await.tools.brave_api_key.clone();
+    let saved = saved_config(dir.path());
+    // The store's file no longer decrypts: every read and write of it fails.
+    std::fs::write(
+        dir.path().join("store").join("credentials.enc"),
+        b"not a store",
+    )
+    .expect("write");
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "tools.brave_api_key".into(),
+                value: Value::Null,
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["error"], "secret_store_failed", "{resp}");
+    assert_eq!(resp["path"], "tools.brave_api_key", "{resp}");
+    assert_eq!(
+        cp.config.read().await.tools.brave_api_key,
+        held,
+        "nothing is applied"
+    );
+    assert_eq!(saved_config(dir.path()), saved, "nothing is saved");
+}
+
+/// Negative space: a set of null on a path that is no secret is no clear —
+/// the GUI sends `llm.sub_agent_model: null` with every sub-agent list — and
+/// never touches the store (this one cannot be read at all).
+#[tokio::test]
+async fn a_null_set_of_no_secret_leaves_the_store_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, _store) = persisting_control_plane(dir.path());
+    std::fs::create_dir_all(dir.path().join("store")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("store").join("credentials.enc"),
+        b"not a store",
+    )
+    .expect("write");
+    cp.config.write().await.llm.sub_agent_model = Some("nanna-test-sub-agent".to_string());
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.sub_agent_model".into(),
+                value: Value::Null,
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(cp.config.read().await.llm.sub_agent_model, None);
+}
