@@ -2112,6 +2112,7 @@ impl ChatTurn {
             }
         }
 
+        self.state_a_silent_finish(turn_stop_kind).await;
         self.persist_reply().await;
 
         // The turn's workdir binding is turn-scoped and dies with the turn.
@@ -2134,6 +2135,33 @@ impl ChatTurn {
         self.registry.release(&self.session_id).await;
         if let Some(ref baselines) = self.turn_baselines {
             baselines.close_turn(&self.scope, self.scope_id.as_deref()).await;
+        }
+    }
+
+    /// A turn that finished with nothing to show says so.
+    ///
+    /// A model that replies to a message with the bare `TASK COMPLETE` marker
+    /// closes its item — the claim is honoured — and the marker is then
+    /// stripped from the reply, which leaves a successful turn with no text
+    /// and no tool calls: an empty message the GUI hides, i.e. silence. An
+    /// empty *completion* is already reported (`_could not run: empty
+    /// completion…_`); an empty *claimed* completion gets the same honesty.
+    /// Never on a cancel: an empty stopped turn is exactly what Stop asked
+    /// for.
+    async fn state_a_silent_finish(&self, turn_stop_kind: &str) {
+        if turn_stop_kind != "all_tasks_done" || self.run_handle.cancel.is_cancelled() {
+            return;
+        }
+        let said_nothing = strip_harness_markers(&self.run_handle.accumulated_text.read().await)
+            .trim()
+            .is_empty();
+        let did_nothing = self.run_handle.completed_tool_calls.read().await.is_empty();
+        if said_nothing && did_nothing {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "turn finished with no reply text and no tool calls — stating it"
+            );
+            self.final_sink.delta(SILENT_FINISH_NOTICE);
         }
     }
 
@@ -2183,6 +2211,10 @@ impl ChatTurn {
         });
     }
 }
+
+/// What a turn that finished with nothing to show says instead of nothing.
+const SILENT_FINISH_NOTICE: &str = "_finished without a reply: the model marked this done but said nothing and ran \
+     no tools. Ask again, or rephrase if the request was unclear._";
 
 /// The planner shares the step runner's provider handling but must not
 /// stream its JSON into the transcript — planning is not work to show.

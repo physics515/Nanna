@@ -1293,3 +1293,39 @@ async fn inline_reasoning_stays_out_of_the_reply() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A model that answers with the bare `TASK COMPLETE` marker closes its item,
+/// and the marker is stripped from the reply — which used to leave an empty
+/// message the GUI hides: the user saw nothing at all. The turn now says it
+/// finished without a reply.
+#[tokio::test]
+async fn a_claimed_completion_with_nothing_said_is_stated_not_silent() {
+    let ollama = ScriptedOllama::start(vec!["TASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("silent".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let reply = converse(&client, &session, "hi").await;
+    assert!(
+        reply.contains("finished without a reply"),
+        "an empty finished turn states itself: {reply:?}"
+    );
+    assert!(
+        !reply.contains("TASK COMPLETE"),
+        "the marker stays plumbing"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

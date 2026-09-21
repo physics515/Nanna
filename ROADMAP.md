@@ -1945,12 +1945,16 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             block's index. 5 unit tests + e2e `inline_reasoning_stays_out_of_the_reply` (reply is
             exactly the answer; the reasoning is persisted as a `thinking` timeline entry); with the
             splitter bypassed the e2e fails with the raw `<think>` text as the reply.
-      - [ ] *(found 2026-09-21)* **A reply of only `TASK COMPLETE` becomes an empty message.** The
-            claim marker is stripped at persistence, so a model that answers "hi" with the bare marker
-            closes the item and the user gets a turn with no text at all (the GUI then hides the
-            empty bubble — silence). An empty completion is already reported honestly
-            (`_could not run: empty completion…_`); a claimed completion with nothing said deserves
-            the same, or should not count as a claim for a conversation-shaped item.
+      - [x] *(2026-09-21)* **A reply of only `TASK COMPLETE` became an empty message.** The claim
+            marker is stripped at persistence, so a model that answered "hi" with the bare marker
+            closed the item and the user got a turn with no text at all (the GUI then hides the
+            empty bubble — silence). An empty *completion* was already reported honestly
+            (`_could not run: empty completion…_`); an empty *claimed* completion now gets the same:
+            `finish_turn` states `_finished without a reply: the model marked this done but said
+            nothing and ran no tools…_` — only for an `all_tasks_done` turn with no text and no
+            tool calls, never on a cancel (an empty stopped turn is what Stop asked for). E2e
+            `a_claimed_completion_with_nothing_said_is_stated_not_silent`; with the call removed
+            the reply is `""`.
             - [ ] **The converging repeat is still streamed.** The user sees the answer twice
                   (paragraph-separated) — down from seven, but the second copy is the signal and
                   cannot be recognized until it has finished streaming. Options: hold back a
