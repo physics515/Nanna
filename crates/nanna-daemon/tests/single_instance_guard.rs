@@ -75,7 +75,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     /// Scaffolding, not a speed claim: bounds a hang waiting on the kernel to
-    /// settle a killed child, sized far past any scheduling delay.
+    /// settle a child's exec or death, sized far past any scheduling delay.
     const SETTLE_CEILING: Duration = Duration::from_secs(30);
 
     fn find_on_path(program: &str) -> PathBuf {
@@ -90,6 +90,12 @@ mod linux {
     /// `sleep`. The kernel names a process (`comm`) after the executed file,
     /// while argv[0] stays `sleep` so multi-call coreutils builds still
     /// dispatch.
+    ///
+    /// The kernel renames the task late in `execve`, AFTER the point where
+    /// `spawn` returns: glibc's `posix_spawn` resumes the parent once the
+    /// child drops its old address space, so `/proc` can still show the
+    /// spawning thread's name (`linux::a_live_d`) — which the probe rightly
+    /// reads as another program. `spawn` waits for the rename.
     struct Staged {
         child: Child,
         _dir: tempfile::TempDir,
@@ -116,9 +122,15 @@ mod linux {
                     {
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    Err(e) => panic!("spawning {exe:?} failed: {e}"),
+                    Err(e) => panic!("spawning {} failed: {e}", exe.display()),
                 }
             };
+            // Renamed = `comm` is the file name, cut to the kernel's comm
+            // width. The pre-rename name is a libtest thread path (`linux::…`),
+            // never a prefix of a staged file name.
+            wait_for_proc(child.id(), "took its executable's name", |comm, _| {
+                !comm.is_empty() && name.starts_with(comm)
+            });
             Self { child, _dir: dir }
         }
 
@@ -135,20 +147,29 @@ mod linux {
         }
     }
 
-    fn wait_for_proc_state(pid: u32, state: char) {
+    /// `(comm, state)` from `/proc/<pid>/stat`. `comm` is parenthesized and
+    /// may itself contain `)`, so it ends at the LAST one.
+    fn proc_stat(pid: u32) -> Option<(String, char)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (head, rest) = stat.rsplit_once(')')?;
+        let (_, comm) = head.split_once('(')?;
+        Some((comm.to_owned(), rest.trim_start().chars().next()?))
+    }
+
+    /// Poll `/proc/<pid>/stat` until `settled(comm, state)` holds.
+    fn wait_for_proc(pid: u32, what: &str, settled: impl Fn(&str, char) -> bool) {
         let deadline = Instant::now() + SETTLE_CEILING;
         loop {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-            let current = stat
-                .rsplit(')')
-                .next()
-                .and_then(|rest| rest.trim_start().chars().next());
-            if current == Some(state) {
+            let stat = proc_stat(pid);
+            if stat
+                .as_ref()
+                .is_some_and(|(comm, state)| settled(comm, *state))
+            {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "process {pid} never reached state {state}: {stat:?}"
+                "process {pid} never {what}: {stat:?}"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -179,7 +200,7 @@ mod linux {
 
         // Not reaped yet: a zombie still answers kill(pid, 0), which is how a
         // liveness-only check would read a crashed sidecar as a live daemon.
-        wait_for_proc_state(pid, 'Z');
+        wait_for_proc(pid, "became a zombie", |_, state| state == 'Z');
         assert_eq!(probe_process(pid), ProcessProbe::Dead);
 
         daemon.child.wait().unwrap();
