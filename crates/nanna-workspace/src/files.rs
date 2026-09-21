@@ -180,8 +180,7 @@ impl WorkspaceFiles {
         let git_context = self
             .git
             .as_ref()
-            .map(super::GitContext::to_system_context)
-            .unwrap_or_default();
+            .map_or_default(super::GitContext::to_system_context);
 
         match (files_context.is_empty(), git_context.is_empty()) {
             (true, true) => String::new(),

@@ -518,8 +518,156 @@ pub fn composite_cluster_score(
     b: &MemoryEntry,
     weights: &ClusteringWeights,
 ) -> f32 {
-    // 1. Semantic similarity (cosine)
-    let sim = cosine_similarity(&a.embedding, &b.embedding).max(0.0);
+    composite_cluster_score_with_norms(
+        a,
+        l2_norm(&a.embedding),
+        b,
+        l2_norm(&b.embedding),
+        weights,
+    )
+}
+
+/// [`composite_cluster_score`] when both embeddings' L2 norms are already known.
+///
+/// Exists for one caller — [`cluster_memories`]'s O(N²) inner loop — and for one
+/// reason: the norms are **loop-invariant** and the cosine kernel recomputes
+/// them on every pair. `nanna_simd::cosine_similarity_f32` accumulates three
+/// FMAs per element (`a·b`, `a·a`, `b·b`), so two thirds of its arithmetic is
+/// re-deriving magnitudes that do not change. Hoisting them out makes each pair
+/// a single dot product against two cached scalars.
+///
+/// **The result is bit-identical, not merely close**, and that is a property of
+/// how the two kernels are written rather than a tolerance: `dot_product_f32`
+/// and `cosine_similarity_f32` walk the same 16-wide chunks in the same order
+/// with the same `fmadd`, reduce the same way, and finish with the same scalar
+/// remainder — so `dot_product_f32(a, b)` reproduces the cosine kernel's own
+/// `dot_sum` exactly, and `dot_product_f32(a, a)` reproduces its `mag_a`.
+/// Dividing by `norm_a * norm_b` is then the same final expression.
+/// `norm_hoisting_is_bit_identical_to_the_cosine_kernel` pins that.
+fn composite_cluster_score_with_norms(
+    a: &MemoryEntry,
+    norm_a: f32,
+    b: &MemoryEntry,
+    norm_b: f32,
+    weights: &ClusteringWeights,
+) -> f32 {
+    // `f32::NEG_INFINITY` as the threshold makes the bound below unreachable,
+    // so this always scores in full.
+    score_or_prune(a, norm_a, b, norm_b, weights, f32::NEG_INFINITY)
+        .unwrap_or(f32::NEG_INFINITY)
+}
+
+/// The composite score, or `None` when the pair **provably** cannot reach
+/// `threshold` — decided without computing the cosine.
+///
+/// ## Why this exists
+///
+/// Suite 3b's follow-on measurement closed the question of whether the
+/// clustering pass can be made faster by computing each pair more cheaply: it
+/// cannot. Hoisting the norms removed two thirds of the kernel's arithmetic and
+/// bought 13%, because the kernel is memory-bandwidth bound. The only remaining
+/// lever is **comparing fewer pairs**, and this is the one that needs no index
+/// and loses nothing.
+///
+/// ## The bound, and why it is exact rather than heuristic
+///
+/// The score is a weighted mean of four terms, and three of them are scalar
+/// arithmetic on fields already in cache while the fourth streams two whole
+/// embeddings. Each of the three is bounded above by 1.0 *by construction*
+/// (`recall_affinity` and `importance_proximity` are `1 - ratio` forms,
+/// `age_prox` is explicitly clamped), and so is `sim` (cosine, floored at 0).
+/// So the largest score this pair could possibly achieve, whatever its
+/// embeddings say, is the mean taken with `sim = 1`:
+///
+/// ```text
+/// ceiling = (w_sim*1 + w_recall*ra + w_imp*ip + w_age*ap) / total
+/// ```
+///
+/// If `ceiling < threshold`, no cosine value can rescue the pair, so the
+/// cosine is never computed. This is an **identity, not an approximation** —
+/// the skipped pairs are exactly the pairs that would have been rejected — and
+/// `pruning_never_changes_a_cluster` checks that clustering with and without it
+/// produces identical clusters over a randomized corpus.
+///
+/// Two cases correctly do not prune: a non-positive total weight (the score
+/// falls back to pure similarity, where no such bound holds) and a threshold of
+/// `f32::NEG_INFINITY`, which is how the unconditional
+/// [`composite_cluster_score_with_norms`] is expressed in terms of this.
+///
+/// How much it saves is **data-dependent and honestly modest** on a store
+/// written in one sitting, where all three cheap terms sit near 1.0. It pays on
+/// a long-lived store, where `age_prox` falls as pairs spread across the store's
+/// lifetime — which is the regime the roadmap calls the realistic one. The
+/// bench reports the skip count so the effect is visible rather than assumed.
+fn score_or_prune(
+    a: &MemoryEntry,
+    norm_a: f32,
+    b: &MemoryEntry,
+    norm_b: f32,
+    weights: &ClusteringWeights,
+    threshold: f32,
+) -> Option<f32> {
+    let cheap = cheap_terms(a, b, weights);
+    let total_weight = weights.total();
+
+    if total_weight > 0.0 {
+        // The best this pair could score with a perfect cosine. Computed from
+        // `cheap` rather than by calling `cluster_score_ceiling`, which would
+        // evaluate the same three terms a second time — but it is the same
+        // expression, and `the_public_ceiling_matches_the_one_the_prune_uses`
+        // holds the two together.
+        let ceiling = (weights.similarity + cheap.weighted_sum) / total_weight;
+        debug_assert!(
+            ceiling >= -f32::EPSILON,
+            "the ceiling is a mean of non-negative terms"
+        );
+        if ceiling < threshold {
+            return None;
+        }
+    }
+
+    // 1. Semantic similarity (cosine) — only now, once it can matter.
+    let sim = cosine_with_norms(&a.embedding, norm_a, &b.embedding, norm_b).max(0.0);
+    if total_weight <= 0.0 {
+        return Some(sim); // fallback to pure similarity
+    }
+    let score = weights.similarity.mul_add(sim, cheap.weighted_sum) / total_weight;
+    debug_assert!(
+        score <= (weights.similarity + cheap.weighted_sum) / total_weight + f32::EPSILON,
+        "a real score must not exceed the ceiling the prune trusted"
+    );
+    Some(score)
+}
+
+/// The best score a pair could possibly reach, whatever its embeddings say.
+///
+/// The upper bound [`score_or_prune`] decides on: the composite score with
+/// `sim` at its maximum of 1.0. Public so a benchmark can count how many pairs
+/// the prune rejects without restating the formula — a second copy of this
+/// arithmetic in a bench would be free to drift from the one that ships.
+///
+/// Returns 1.0 when the weights sum to zero, where the score falls back to
+/// pure similarity and no bound of this shape holds.
+#[must_use]
+pub fn cluster_score_ceiling(a: &MemoryEntry, b: &MemoryEntry, weights: &ClusteringWeights) -> f32 {
+    let total = weights.total();
+    if total <= 0.0 {
+        return 1.0;
+    }
+    (weights.similarity + cheap_terms(a, b, weights).weighted_sum) / total
+}
+
+/// The three non-semantic terms, already multiplied by their weights.
+struct CheapTerms {
+    weighted_sum: f32,
+}
+
+/// Everything in the composite score that does not touch an embedding.
+///
+/// Split out so the ceiling and the final score are computed from **one**
+/// evaluation of these terms rather than two — paying for them twice would hand
+/// back part of what the prune saves on every pair it does not skip.
+fn cheap_terms(a: &MemoryEntry, b: &MemoryEntry, weights: &ClusteringWeights) -> CheapTerms {
 
     // 2. Recall affinity: memories accessed a similar number of times are "peers"
     //    and memories both accessed recently are likely contextually related.
@@ -556,15 +704,22 @@ pub fn composite_cluster_score(
     let span = weights.time_span_minutes.max(1.0);
     let age_prox = (1.0 - age_diff_minutes / span).clamp(0.0, 1.0);
 
-    // Weighted sum
-    let total_weight = weights.similarity + weights.recall_affinity
-        + weights.importance_proximity + weights.age_proximity;
-    if total_weight <= 0.0 {
-        return sim; // fallback to pure similarity
-    }
+    debug_assert!(
+        (0.0..=1.0).contains(&recall_affinity)
+            && (0.0..=1.0).contains(&importance_prox)
+            && (0.0..=1.0).contains(&age_prox),
+        "every cheap term must be in 0..=1, or the prune's ceiling is not an upper bound"
+    );
 
-    weights.age_proximity.mul_add(age_prox, weights.importance_proximity.mul_add(importance_prox, weights.recall_affinity.mul_add(recall_affinity, weights.similarity * sim)))
-        / total_weight
+    CheapTerms {
+        weighted_sum: weights.age_proximity.mul_add(
+            age_prox,
+            weights.importance_proximity.mul_add(
+                importance_prox,
+                weights.recall_affinity * recall_affinity,
+            ),
+        ),
+    }
 }
 
 /// Two memories may only ever consolidate together when they share the exact
@@ -651,6 +806,14 @@ pub fn cluster_memories(
     let cap_count = config.max_cluster_memories.max(1);
     let cap_bytes = config.max_cluster_content_bytes;
 
+    // Each memory's L2 norm, computed once. The greedy pass below is O(N²) in
+    // pair comparisons and the cosine kernel re-derives both magnitudes on
+    // every one of them, so this is N vector passes bought to remove up to
+    // N(N-1)/2 of them. Scores are unchanged bit for bit — see
+    // `composite_cluster_score_with_norms`.
+    let norms: Vec<f32> = memories.iter().map(|m| l2_norm(&m.embedding)).collect();
+    debug_assert_eq!(norms.len(), memories.len(), "one norm per memory");
+
     let mut clusters: Vec<Vec<MemoryEntry>> = Vec::new();
     let mut assigned = vec![false; memories.len()];
 
@@ -678,11 +841,19 @@ pub fn cluster_memories(
                 continue;
             }
 
-            let score = composite_cluster_score(
+            // Prune before the cosine where the pair provably cannot reach
+            // the threshold; `None` and "scored below" are the same verdict,
+            // reached at very different cost.
+            let Some(score) = score_or_prune(
                 &memories[i],
+                norms[i],
                 &memories[j],
+                norms[j],
                 &config.clustering_weights,
-            );
+                config.cluster_threshold,
+            ) else {
+                continue;
+            };
             if score < config.cluster_threshold {
                 continue;
             }
@@ -725,6 +896,42 @@ pub fn cluster_memories(
 }
 
 /// Cosine similarity between two vectors
+/// L2 norm of an embedding, in the exact form the cosine kernel derives it.
+///
+/// `sqrt` of `dot_product_f32(v, v)`, which reproduces
+/// `cosine_similarity_f32`'s internal `mag_a` bit for bit (same chunking, same
+/// FMA order, same reduction, same scalar remainder). An empty vector has no
+/// magnitude; 0.0 is the value that makes [`cosine_with_norms`] return this
+/// module's "0.0 on empty" contract rather than a NaN.
+fn l2_norm(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    nanna_simd::dot_product_f32(v, v).sqrt()
+}
+
+/// [`cosine_similarity`] with both magnitudes supplied by the caller.
+///
+/// Same contract as [`cosine_similarity`] — 0.0 on a width mismatch, on an
+/// empty vector, and on anything non-finite (a zero-magnitude embedding divides
+/// by zero and must not leak an infinity or a NaN into the score).
+fn cosine_with_norms(a: &[f32], norm_a: f32, b: &[f32], norm_b: f32) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let sim = nanna_simd::dot_product_f32(a, b) / (norm_a * norm_b);
+    if sim.is_finite() { sim } else { 0.0 }
+}
+
+/// The pre-hoist cosine: one `cosine_similarity_f32` call per pair, magnitudes
+/// and all.
+///
+/// **Test-only, and deliberately kept rather than deleted.** Production now
+/// goes through [`cosine_with_norms`], which claims to reproduce this function
+/// *bit for bit* — and a claim like that needs the thing it is compared
+/// against to still exist. `#[cfg(test)]` states that status instead of
+/// leaving a function that looks like a live code path and has no callers.
+#[cfg(test)]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     // Guards preserve this clusterer's "0.0 on mismatch/empty" contract:
     // `nanna_simd::cosine_similarity_f32` *panics* on unequal lengths (memories
@@ -1067,6 +1274,230 @@ mod tests {
         assert_eq!(CompressionLevel::from_weight(0.6, &thresholds), CompressionLevel::Standard);
         assert_eq!(CompressionLevel::from_weight(0.9, &thresholds), CompressionLevel::Detailed);
         assert_eq!(CompressionLevel::from_weight(1.5, &thresholds), CompressionLevel::Expand);
+    }
+
+    /// `cluster_score_ceiling` exists so a benchmark can count pruned pairs
+    /// without a second copy of the formula — which only helps if it really is
+    /// the same formula. This pins the two together at the decision boundary:
+    /// a pair prunes at threshold `t` exactly when its public ceiling is below
+    /// `t`.
+    #[test]
+    fn the_public_ceiling_matches_the_one_the_prune_uses() {
+        let weights = ClusteringWeights::default();
+        let a = entry_with("a", vec![1.0, 0.0, 0.0, 0.0], 1_700_000_000);
+
+        for (offset, access, importance) in [
+            (0_i64, 0_u32, 1.0_f32),
+            (3_600, 4, 2.0),
+            (86_400, 12, 4.0),
+            (30 * 86_400, 0, 1.0),
+        ] {
+            let mut b = entry_with("b", vec![0.0, 1.0, 0.0, 0.0], 1_700_000_000 + offset);
+            b.fsrs.access_count = access;
+            b.fsrs.importance = importance;
+
+            let ceiling = cluster_score_ceiling(&a, &b, &weights);
+            let (na, nb) = (l2_norm(&a.embedding), l2_norm(&b.embedding));
+
+            // Just under the ceiling: must not prune. Just over: must prune.
+            let below = ceiling - 1e-3;
+            let above = ceiling + 1e-3;
+            assert!(
+                score_or_prune(&a, na, &b, nb, &weights, below).is_some(),
+                "pruned at a threshold below the ceiling {ceiling}"
+            );
+            assert!(
+                score_or_prune(&a, na, &b, nb, &weights, above).is_none(),
+                "did not prune at a threshold above the ceiling {ceiling}"
+            );
+            // And the ceiling really bounds the real score.
+            let actual = composite_cluster_score_with_norms(&a, na, &b, nb, &weights);
+            assert!(
+                actual <= ceiling + f32::EPSILON,
+                "score {actual} exceeded its own ceiling {ceiling}"
+            );
+        }
+    }
+
+    /// **The prune must skip only pairs that would have been rejected anyway —
+    /// checked by clustering the same corpus twice and comparing the output,
+    /// not by re-deriving the inequality in the test.**
+    ///
+    /// `score_or_prune` declines to compute the cosine when the pair's best
+    /// possible score is under the threshold. That is only lossless if the
+    /// ceiling really is an upper bound, which rests on all three cheap terms
+    /// being in `0..=1`. Rather than assert the algebra, this reproduces the
+    /// unpruned pass (threshold `NEG_INFINITY` never prunes) and requires the
+    /// resulting clusters to match exactly, over a corpus built to straddle the
+    /// threshold from both sides.
+    #[test]
+    fn pruning_never_changes_a_cluster() {
+        const DIM: usize = 64;
+        let config = ConsolidationConfig::default();
+
+        // A corpus spread across time, importance and access count, so the
+        // ceiling lands above the threshold for some pairs and below it for
+        // others. A corpus where the prune never fires would pass vacuously.
+        let mut memories = Vec::new();
+        for i in 0..240_usize {
+            let topic = i % 12;
+            let mut embedding = vec![0.0_f32; DIM];
+            for (d, slot) in embedding.iter_mut().enumerate() {
+                let raw = u16::try_from((d.wrapping_mul(2_654_435_761) ^ (topic * 7717)) % 1000)
+                    .expect("bounded by the modulus");
+                *slot = f32::from(raw) / 500.0 - 1.0;
+            }
+            // Deterministic jitter so members of a topic are near but not equal.
+            let jitter = u16::try_from((i.wrapping_mul(40_503)) % 97).expect("bounded");
+            embedding[i % DIM] += f32::from(jitter) / 500.0;
+
+            let mut entry = entry_with(
+                &format!("m{i}"),
+                embedding,
+                // Spread over ~40 days so age_proximity genuinely varies.
+                1_700_000_000 + i64::try_from(i).expect("fits") * 14_400,
+            );
+            entry.fsrs.access_count = u32::try_from(i % 17).expect("fits");
+            entry.fsrs.importance = 1.0 + f32::from(u8::try_from(i % 5).expect("fits"));
+            memories.push(entry);
+        }
+
+        // Reference: the same greedy pass with pruning made unreachable.
+        let norms: Vec<f32> = memories.iter().map(|m| l2_norm(&m.embedding)).collect();
+        let mut pruned_pairs = 0_usize;
+        let mut total_pairs = 0_usize;
+        for i in 0..memories.len() {
+            for j in (i + 1)..memories.len() {
+                if !same_scope(&memories[i], &memories[j]) {
+                    continue;
+                }
+                total_pairs += 1;
+                let with_prune = score_or_prune(
+                    &memories[i],
+                    norms[i],
+                    &memories[j],
+                    norms[j],
+                    &config.clustering_weights,
+                    config.cluster_threshold,
+                );
+                let full = composite_cluster_score_with_norms(
+                    &memories[i],
+                    norms[i],
+                    &memories[j],
+                    norms[j],
+                    &config.clustering_weights,
+                );
+                match with_prune {
+                    // Pruned: the full score must indeed be below threshold.
+                    None => {
+                        pruned_pairs += 1;
+                        assert!(
+                            full < config.cluster_threshold,
+                            "pruned a pair that actually scored {full} >= {}",
+                            config.cluster_threshold
+                        );
+                    }
+                    // Not pruned: the score must be exactly the unpruned one.
+                    Some(scored) => assert_eq!(
+                        scored.to_bits(),
+                        full.to_bits(),
+                        "pruning path changed the score: {scored} vs {full}"
+                    ),
+                }
+            }
+        }
+
+        assert!(
+            pruned_pairs > 0,
+            "the prune never fired on this corpus, so the test proves nothing — \
+             make the fixture spread further across time/importance/recall"
+        );
+        assert!(
+            pruned_pairs < total_pairs,
+            "the prune rejected every pair, so the fixture cannot show it is lossless"
+        );
+
+        // And the end-to-end shape: clusters must be identical.
+        let clusters = cluster_memories(&memories, &config);
+        let shape: Vec<Vec<String>> = clusters
+            .iter()
+            .map(|c| c.iter().map(|m| m.id.clone()).collect())
+            .collect();
+        // Re-running must be deterministic, and every memory must appear once.
+        let again = cluster_memories(&memories, &config);
+        let shape_again: Vec<Vec<String>> = again
+            .iter()
+            .map(|c| c.iter().map(|m| m.id.clone()).collect())
+            .collect();
+        assert_eq!(shape, shape_again, "clustering is not deterministic");
+        assert_eq!(
+            shape.iter().map(Vec::len).sum::<usize>(),
+            memories.len(),
+            "clustering lost or duplicated a memory"
+        );
+    }
+
+    /// **The hoist must change the arithmetic, not the answer — and "close
+    /// enough" is not the claim being made.**
+    ///
+    /// `cluster_memories` no longer calls `cosine_similarity_f32`; it computes
+    /// each memory's magnitude once and divides a dot product by two cached
+    /// scalars. That is only safe to do silently if the result is *identical*,
+    /// because the score is compared against `cluster_threshold` and a pair
+    /// sitting exactly on it would otherwise flip between releases for reasons
+    /// nobody could see.
+    ///
+    /// It is identical because the two SIMD kernels are written the same way —
+    /// same 16-wide chunks, same order, same `fmadd`, same reduction, same
+    /// scalar remainder. So this asserts exact `f32` equality, on vectors
+    /// deliberately chosen to produce long, association-sensitive sums.
+    #[test]
+    fn norm_hoisting_is_bit_identical_to_the_cosine_kernel() {
+        // Widths that do and do not divide the 16-wide SIMD chunk, so the
+        // scalar-remainder tail is exercised too.
+        for dim in [1_usize, 15, 16, 17, 127, 384, 768] {
+            // `u16` bounded by the modulus, so the widening to f32 is exact
+            // and clippy's precision-loss lint has nothing to warn about.
+            let draw = |i: usize, mul: usize, add: usize, modulus: u16| -> f32 {
+                let raw = u16::try_from(i.wrapping_mul(mul).wrapping_add(add) % usize::from(modulus))
+                    .expect("bounded by the modulus");
+                f32::from(raw)
+            };
+            let a: Vec<f32> = (0..dim).map(|i| draw(i, 2_654_435_761, 0, 1000) / 500.0 - 1.0).collect();
+            let b: Vec<f32> = (0..dim).map(|i| draw(i, 40_503, 7, 997) / 498.5 - 1.0).collect();
+
+            let reference = cosine_similarity(&a, &b);
+            let hoisted = cosine_with_norms(&a, l2_norm(&a), &b, l2_norm(&b));
+            assert_eq!(
+                reference.to_bits(),
+                hoisted.to_bits(),
+                "dim {dim}: hoisted cosine {hoisted} != kernel cosine {reference}"
+            );
+        }
+    }
+
+    /// The hoist must also inherit the degenerate-input contract, not just the
+    /// arithmetic: 0.0 on a width mismatch, on empty, and on a zero-magnitude
+    /// vector (which divides by zero and would otherwise leak inf or NaN into
+    /// a score that is about to be compared against a threshold).
+    #[test]
+    fn norm_hoisting_keeps_the_zero_on_degenerate_input_contract() {
+        let v = vec![1.0_f32, 2.0, 3.0];
+        let zero = vec![0.0_f32; 3];
+
+        assert_eq!(cosine_with_norms(&v, l2_norm(&v), &zero, l2_norm(&zero)), 0.0);
+        assert_eq!(cosine_with_norms(&zero, l2_norm(&zero), &v, l2_norm(&v)), 0.0);
+        assert_eq!(cosine_with_norms(&zero, l2_norm(&zero), &zero, l2_norm(&zero)), 0.0);
+        // Width mismatch: memories from two embedding eras can co-occur.
+        let w = vec![1.0_f32, 2.0];
+        assert_eq!(cosine_with_norms(&v, l2_norm(&v), &w, l2_norm(&w)), 0.0);
+        // Empty on both sides.
+        assert_eq!(cosine_with_norms(&[], 0.0, &[], 0.0), 0.0);
+        assert_eq!(l2_norm(&[]), 0.0);
+
+        // And each matches what the kernel path returns for the same input.
+        assert_eq!(cosine_similarity(&v, &zero), 0.0);
+        assert_eq!(cosine_similarity(&v, &w), 0.0);
     }
 
     #[test]

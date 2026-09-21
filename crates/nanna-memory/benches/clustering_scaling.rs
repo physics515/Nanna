@@ -28,7 +28,9 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use nanna_memory::{ConsolidationConfig, cluster_memories, composite_cluster_score};
+use nanna_memory::{
+    ConsolidationConfig, cluster_memories, cluster_score_ceiling, composite_cluster_score,
+};
 use nanna_memory::{FsrsState, MemoryEntry};
 
 /// Embedding width — MiniLM-class, matching the local embedder the memory path
@@ -192,6 +194,24 @@ fn main() {
         run_case(count, count, 0.25, false, &config);
     }
 
+    // AGED: the sparse regime again, but at the timescale and the FSRS spread
+    // production actually presents.
+    //
+    // The two arms above leave `time_span_minutes` at its 1440-minute default
+    // while spacing memories one second apart, so the age term never leaves the
+    // top of its range — a configuration `MemoryService` never uses. Its
+    // `with_store_timescale` sets the span to the store's own oldest-to-newest
+    // gap, which is what makes a mature store discriminate at week scale. FSRS
+    // state is varied too, since `FsrsState::default()` pins `access_count` at
+    // 0 and `importance` at 1.0 for every memory, which makes the recall and
+    // importance terms identically 1.0 by construction.
+    println!(
+        "\n-- aged: sparse vectors at the production timescale (spans 90 days, varied FSRS) --"
+    );
+    for &count in &[1_000usize, 2_000, 4_000, 8_000, 16_000] {
+        run_aged_case(count, &config);
+    }
+
     println!(
         "\nRead the `pairs` column, not just wall_ms: it is the quantity an ANN\n\
          candidate set replaces, and it is the same on every machine.\n\
@@ -201,6 +221,123 @@ fn main() {
          memories is the quadratic case, and it is the realistic one for a\n\
          long-lived personal store that has already been consolidated."
     );
+}
+
+/// A long-lived store: sparse vectors, spread over 90 days, with FSRS state
+/// that actually varies between memories.
+fn aged_corpus(count: usize) -> Vec<MemoryEntry> {
+    const SPAN_SECS: i64 = 90 * 24 * 3600;
+    (0..count)
+        .map(|i| {
+            let mut entry = MemoryEntry {
+                id: format!("m{i}"),
+                content: format!("memory {i}"),
+                embedding: unrelated_vector(i),
+                embedding_model: None,
+                embeddings: HashMap::new(),
+                metadata: HashMap::new(),
+                // Spread evenly across the whole span, so pair age gaps cover
+                // the full 0..1 range of `age_proximity`.
+                timestamp: 1_700_000_000 + (i as i64) * SPAN_SECS / (count.max(1) as i64),
+                fsrs: FsrsState::default(),
+                workspace_id: None,
+            };
+            entry.fsrs.access_count = (i % 17) as u32;
+            entry.fsrs.importance = 1.0 + (i % 5) as f32;
+            entry
+        })
+        .collect()
+}
+
+/// `config` with the clustering timescale taken from the corpus, exactly as
+/// `MemoryService::with_store_timescale` does it in production.
+fn with_store_timescale(memories: &[MemoryEntry], config: &ConsolidationConfig) -> ConsolidationConfig {
+    let mut config = config.clone();
+    let span_minutes = match (
+        memories.iter().map(|e| e.timestamp).min(),
+        memories.iter().map(|e| e.timestamp).max(),
+    ) {
+        (Some(first), Some(last)) => (last - first) as f32 / 60.0,
+        _ => 0.0,
+    };
+    config.clustering_weights.time_span_minutes = span_minutes.max(1.0);
+    config
+}
+
+/// Time the aged corpus and print its row, with the pruned-pair count.
+fn run_aged_case(count: usize, base: &ConsolidationConfig) {
+    let memories = aged_corpus(count);
+    let config = with_store_timescale(&memories, base);
+    let pairs = pairs_considered(&memories, &config);
+    let pruned = pairs_pruned(&memories, &config);
+
+    let start = Instant::now();
+    let clusters = cluster_memories(&memories, &config);
+    drop(memories);
+    let elapsed = start.elapsed();
+
+    let wall_ms = elapsed.as_secs_f64() * 1000.0;
+    let ns_per_pair = if pairs == 0 {
+        0.0
+    } else {
+        elapsed.as_secs_f64() * 1e9 / pairs as f64
+    };
+    let pct = if pairs == 0 {
+        0.0
+    } else {
+        pruned as f64 * 100.0 / pairs as f64
+    };
+    println!(
+        "{count:>8} {count:>8} {:>10} {pairs:>14} {wall_ms:>12.1} {ns_per_pair:>12.1}           pruned {pruned:>12} ({pct:.1}%)",
+        clusters.len()
+    );
+}
+
+/// How many of the considered pairs the ceiling rejects before any cosine.
+///
+/// Hardware-independent, like `pairs_considered`, and computed outside the
+/// timed region. Replays the same admission rules; `composite_cluster_score`
+/// (unpruned) decides membership so the replay matches the real pass.
+fn pairs_pruned(memories: &[MemoryEntry], config: &ConsolidationConfig) -> u64 {
+    let weights = &config.clustering_weights;
+    let total = weights.total();
+    let cap_count = config.max_cluster_memories.max(1);
+    let cap_bytes = config.max_cluster_content_bytes;
+    let mut assigned = vec![false; memories.len()];
+    let mut pruned: u64 = 0;
+
+    for i in 0..memories.len() {
+        if assigned[i] {
+            continue;
+        }
+        let mut len = 1usize;
+        let mut bytes = memories[i].content.len();
+        assigned[i] = true;
+        for j in (i + 1)..memories.len() {
+            if len >= cap_count {
+                break;
+            }
+            if assigned[j] {
+                continue;
+            }
+            if total > 0.0 && cluster_score_ceiling(&memories[i], &memories[j], weights) < config.cluster_threshold {
+                pruned += 1;
+                continue;
+            }
+            let score =
+                composite_cluster_score(&memories[i], &memories[j], &config.clustering_weights);
+            if score < config.cluster_threshold {
+                continue;
+            }
+            if bytes.saturating_add(memories[j].content.len()) > cap_bytes {
+                continue;
+            }
+            bytes += memories[j].content.len();
+            len += 1;
+            assigned[j] = true;
+        }
+    }
+    pruned
 }
 
 /// Time one corpus shape and print its row.

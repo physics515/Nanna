@@ -225,8 +225,7 @@ impl AgentCoordinator {
         let mut mailboxes = self.mailboxes.write().await;
         mailboxes
             .get_mut(agent_id)
-            .map(std::mem::take)
-            .unwrap_or_default()
+            .map_or_default(std::mem::take)
     }
 
     /// Poll for completed tasks (non-blocking).

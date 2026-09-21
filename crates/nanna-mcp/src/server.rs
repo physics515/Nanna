@@ -650,8 +650,7 @@ pub mod tools_bridge {
                         // Convert Value to HashMap
                         let params: StdHashMap<String, Value> = input
                             .as_object()
-                            .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                            .unwrap_or_default();
+                            .map_or_default(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
 
                         let call = ToolCall {
                             id: uuid::Uuid::new_v4().to_string(),

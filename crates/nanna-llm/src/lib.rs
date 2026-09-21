@@ -3960,8 +3960,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
                 .error
                 .code
                 .as_ref()
-                .map(|c| format!(" (code {c})"))
-                .unwrap_or_default();
+                .map_or_default(|c| format!(" (code {c})"));
             return Err(LlmError::from_api_response(
                 embedded_code.unwrap_or(status),
                 format!("{}{code_note}", err.error.message),
