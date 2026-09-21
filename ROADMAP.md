@@ -1703,6 +1703,13 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       (clippy: "overflow evaluating the requirement") — the span wraps the boxed future.
       Real binary: scratch-isolated daemon + fake Ollama, one IPC chat turn → 14 `llm_call`,
       4 `tool_call`, 5 `harness_step`, 1 `chat_turn` close lines, 0 foreign, 0 panics.
+      - [ ] *(research 2026-09-21)* **Never make span events reloadable.** `fmt::Layer` keeps
+            per-span busy/idle bookkeeping only while the current span-event config calls for it,
+            so toggling `with_span_events` through a `reload` handle while a turn's spans are live
+            trips a `debug_assert` (tokio-rs/tracing#3529; fixes [#3570](https://github.com/tokio-rs/tracing/pull/3570)
+            / #3616 still open, `tracing-subscriber` latest is 0.3.23). Today the setting is fixed
+            at boot, so this is safe — if a "verbose spans" runtime toggle is ever added, gate it on
+            a released fix or rebuild the subscriber rather than reloading the layer.
       - [ ] **The GUI Logs page still sees none of it.** `nanna-core::LogBufferLayer` implements
             only `on_event` and keeps the message text, so the span context and every close
             line reach stdout and the file log but not `system logs`. Carrying it needs a
@@ -1895,6 +1902,27 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             whitespace, so a model's own newline never grows into three. 2 unit tests + a new e2e
             `a_two_step_turn_reads_as_two_paragraphs` through the real daemon; all three fail by name
             with the separator emptied, and the e2e failure reproduces the defect verbatim.
+      - [x] *(2026-09-21)* **A model that answers but never says `TASK COMPLETE` got its answer
+            seven times, then "could not finish".** For an item with no machine check the model's
+            word is the verdict, and small local models routinely answer and simply do not say the
+            marker. The harness then charged each re-answer as fruitless, re-streaming it every step,
+            until the ladder abandoned the item — reproduced verbatim through the real daemon: seven
+            copies, `_could not finish: every planned task was abandoned_`, a "Dropped" list, and
+            `7 steps · 0 items completed · 1 abandoned`. New rule, `answer_converged`: two
+            **consecutive** steps on an unchecked item that call no tools, are not a narration loop,
+            and give the same answer (whitespace-collapsed, otherwise exact) close the item —
+            logged as its own `completed_converged` event, still counted unverified. Exact on purpose:
+            a false match ends a turn early, a missed one costs one step. A step that did work in
+            between breaks the chain (its world may have changed the answer). 3 harness tests incl.
+            both negatives, + e2e `a_model_that_never_claims_completion_still_finishes_the_turn`
+            (2 steps, no "could not finish"; fails with the full 7-copy transcript when the rule is
+            disabled).
+            - [ ] **The converging repeat is still streamed.** The user sees the answer twice
+                  (paragraph-separated) — down from seven, but the second copy is the signal and
+                  cannot be recognized until it has finished streaming. Options: hold back a
+                  quiet item's step-2+ text until the step ends (costs live streaming exactly where
+                  it is rarest), or drop the duplicate from the *persisted* reply only. Needs a
+                  call on whether live streaming of later steps is worth the duplicate.
 - [x] **Channel conversations were answered with an error — every message, since P22.** *(2026-09-17)*
       `ChannelManager::process_message` (Telegram/Discord/Slack listeners AND the webhook processor)
       read the reply from `chat.send`'s response `content`. Two things had made that impossible:

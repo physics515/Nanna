@@ -1078,3 +1078,80 @@ async fn a_two_step_turn_reads_as_two_paragraphs() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A model that answers but never says `TASK COMPLETE` — common for small
+/// local models — still gets a finished turn, not an abandoned one.
+///
+/// Before, the harness re-ran the step until the item's fruitless budget ran
+/// out, streaming the same answer each time: a plain question came back as
+/// its answer seven times, then `_could not finish: every planned task was
+/// abandoned_`. Now the second identical tool-free answer closes the item.
+#[tokio::test]
+async fn a_model_that_never_claims_completion_still_finishes_the_turn() {
+    const REPLY: &str = "Paris is the capital of France.";
+
+    let ollama = ScriptedOllama::start(vec![REPLY.to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("no claim".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+    let ack = client
+        .chat()
+        .send(&session, "What is the capital of France?")
+        .await
+        .expect("chat.send is accepted");
+    let message_id = ack["message_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the ack names the turn's message: {ack}"))
+        .to_string();
+
+    let answered = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::MessageEnd {
+                    message_id: id,
+                    content,
+                    ..
+                }) if id == message_id => {
+                    return content;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("the session's event stream ended before the turn did: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the turn ends before the hang ceiling");
+    assert!(
+        !answered.contains("could not finish"),
+        "a converged answer is a finished turn: {answered:?}"
+    );
+    assert_eq!(
+        answered.matches(REPLY).count(),
+        2,
+        "the answer, then its converging repeat — never the fruitless budget's worth: {answered:?}"
+    );
+    let step_requests = ollama
+        .chat_bodies
+        .lock()
+        .await
+        .iter()
+        .filter(|body| !body.contains(PLANNER_PROMPT_OPENING))
+        .count();
+    assert_eq!(step_requests, 2, "two steps, then done");
+
+    client.disconnect().await;
+    daemon.stop();
+}
