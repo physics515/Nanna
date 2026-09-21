@@ -1,6 +1,6 @@
 //! `server` command and the legacy daemon-mode entry point.
 
-use crate::setup::{create_scheduler, init_components};
+use crate::setup::{create_scheduler, init_components, provider_chat_key};
 use nanna_config::Config;
 use nanna_core::{LlmClient, Nanna, NannaConfig};
 use nanna_server::{AppStateBuilder, ServerConfig, start_server};
@@ -28,6 +28,20 @@ pub fn server_port(flag: Option<u16>, config: &Config) -> u16 {
     port
 }
 
+/// The key `nanna serve`'s bot is built with: the chat client's
+/// ([`provider_chat_key`]), so the two never run on different keys.
+///
+/// This read `[llm].api_key`, Anthropic's key, for every provider. Once
+/// `nanna init` filed each key under its own provider (2026-09-21), an
+/// `OpenAI` or `OpenRouter` bot found no key after the chat client beside it had
+/// started, or was built with the Anthropic key.
+fn bot_api_key(
+    config: &Config,
+    read_env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<String> {
+    provider_chat_key(config, read_env)
+}
+
 /// A channel's bot token: the one its config holds, else `var` from `env`;
 /// `None` when neither holds one that is not blank.
 ///
@@ -51,23 +65,10 @@ fn channel_token(
 ///
 /// # Errors
 ///
-/// `API key not found` when neither `[llm].api_key` nor that provider's key
-/// variable (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, else `ANTHROPIC_API_KEY`)
-/// is set, and whatever [`Nanna::new`] reports for the built client.
+/// When the provider has no key ([`bot_api_key`]), and whatever
+/// [`Nanna::new`] reports for the built client.
 async fn build_bot(config: &Config) -> anyhow::Result<Nanna> {
-    // Get API key for bot - default to Anthropic
-    let env_var = match config.llm.provider.as_str() {
-        "openai" => "OPENAI_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        _ => "ANTHROPIC_API_KEY", // anthropic or unknown
-    };
-
-    let api_key = config
-        .llm
-        .api_key
-        .clone()
-        .or_else(|| std::env::var(env_var).ok())
-        .ok_or_else(|| anyhow::anyhow!("API key not found"))?;
+    let api_key = bot_api_key(config, |name| std::env::var(name).ok())?;
 
     // Create Nanna bot instance for backwards compatibility
     let bot_config = NannaConfig {
@@ -315,6 +316,36 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    /// `nanna serve`'s bot runs on its provider's own key — where `nanna init`
+    /// stores it since 2026-09-21 — like the chat client beside it, and never
+    /// on the Anthropic key.
+    #[test]
+    fn the_bot_gets_its_providers_own_key() {
+        for (provider, env_var) in [
+            ("openai", "OPENAI_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+        ] {
+            let mut config = Config::default();
+            config.llm.provider = provider.to_string();
+            config.llm.api_key = Some("sk-ant-api03-anthropic".to_string());
+            *config.llm.provider_api_key_mut() = Some("own-key".to_string());
+            assert_eq!(
+                bot_api_key(&config, no_env).expect(provider),
+                "own-key",
+                "{provider}"
+            );
+
+            *config.llm.provider_api_key_mut() = None;
+            let error =
+                bot_api_key(&config, no_env).expect_err("the Anthropic key is not this provider's");
+            assert!(error.to_string().contains(env_var), "{provider}: {error}");
+        }
+    }
 
     /// The port a user chose during onboarding — written to `[server].port`,
     /// as is `PORT` — is the one `nanna server` listens on when no `--port`

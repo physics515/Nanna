@@ -5828,6 +5828,14 @@ asks permission or restricts her.)*:
             part-way loses nothing and is retried at the next load. With one meaning left, the
             CLI's `summarizer_credentials` reads each key as its own provider's, like the daemon
             (the chat-provider-only rule above is retired). The daemon needed no change.
+            *(2026-09-21, follow-up.)* `nanna serve` builds a second client, its bot, and that
+            one still read `api_key` for every provider. Once the key had moved, an OpenAI or
+            OpenRouter `nanna serve` started its chat client and then failed with `API key not
+            found`, or built the bot with the Anthropic key. It now uses the chat client's key
+            (`setup::provider_chat_key`). `OPENROUTER_API_KEY` now overrides
+            `openrouter_api_key` as the other two variables override theirs, and a blank
+            variable overrides nothing (an exported-empty `ANTHROPIC_API_KEY` used to blank the
+            stored key).
       - [~] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet

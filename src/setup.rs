@@ -151,6 +151,33 @@ fn chat_provider(provider: &str) -> ProviderId {
     }
 }
 
+/// The variable that supplies `provider`'s key when its own field is empty.
+const fn chat_key_env(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::OpenAI => "OPENAI_API_KEY",
+        ProviderId::OpenRouter => "OPENROUTER_API_KEY",
+        _ => "ANTHROPIC_API_KEY", // anthropic or unknown
+    }
+}
+
+/// The key the CLI's chat provider runs on: [`chat_api_key`] for
+/// [`chat_provider`] and its variable. One definition for the two clients
+/// built from it, [`init_components`]'s and `nanna serve`'s bot.
+///
+/// # Errors
+///
+/// When that provider has no key, naming the variable that would supply one.
+pub fn provider_chat_key(
+    config: &Config,
+    read_env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<String> {
+    chat_api_key(
+        config,
+        chat_key_env(chat_provider(&config.llm.provider)),
+        read_env,
+    )
+}
+
 /// The chat provider's key: `[llm].provider`'s own field, else `env_var`
 /// read through `read_env`.
 fn chat_api_key(
@@ -173,14 +200,8 @@ pub async fn init_components(
     config: &Config,
 ) -> anyhow::Result<(Arc<LlmClient>, Arc<ToolRegistry>, Arc<Storage>)> {
     let chat_provider = chat_provider(&config.llm.provider);
-    // Get API key - default to Anthropic
-    let env_var = match chat_provider {
-        ProviderId::OpenAI => "OPENAI_API_KEY",
-        ProviderId::OpenRouter => "OPENROUTER_API_KEY",
-        _ => "ANTHROPIC_API_KEY", // anthropic or unknown
-    };
-    
-    let api_key = chat_api_key(config, env_var, |name| std::env::var(name).ok())?;
+    let env_var = chat_key_env(chat_provider);
+    let api_key = provider_chat_key(config, |name| std::env::var(name).ok())?;
 
     // Create LLM client - default to Anthropic
     let llm = Arc::new(match chat_provider {
