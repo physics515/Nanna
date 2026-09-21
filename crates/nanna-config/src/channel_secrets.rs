@@ -199,11 +199,11 @@ pub fn file(channels: &mut ChannelsConfig, store: &SecureStore) -> Result<(), Cr
 }
 
 /// Fill each unset secret of every channel `channels` names from `env`, else
-/// from `store`. A secret already held is kept, and a channel `channels` does
-/// not name is neither created nor read for.
+/// from `store` (no store holds nothing). A secret already held is kept, and a
+/// channel `channels` does not name is neither created nor read for.
 pub fn fill(
     channels: &mut ChannelsConfig,
-    store: &SecureStore,
+    store: Option<&SecureStore>,
     env: &impl Fn(&str) -> Option<String>,
 ) {
     let set = |secret: &String| !secret.trim().is_empty();
@@ -218,6 +218,9 @@ pub fn fill(
             slot.put(from_env);
             continue;
         }
+        let Some(store) = store else {
+            continue;
+        };
         match store.get(secret.key) {
             Ok(stored) if set(&stored) => slot.put(stored),
             Ok(_) | Err(CredentialError::NotFound) => {}

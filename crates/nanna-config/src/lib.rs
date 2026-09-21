@@ -26,6 +26,7 @@ mod provider_key;
 mod channel_secrets;
 /// Filing the secrets a change brings in before a save strips them.
 mod secret_filing;
+pub use secret_filing::EnvSuppliedSecret;
 /// `[server].webhook_secret` in the secure store, and out of `config.toml`.
 mod server_secret;
 /// The `[llm]` keys and `[tools].brave_api_key` a `config.toml` holds, filed
@@ -1106,6 +1107,18 @@ impl Config {
         env: &impl Fn(&str) -> Option<String>,
         unbound: UnboundOllamaToken<'_>,
     ) {
+        self.fill_secrets(Some(store), env, unbound);
+    }
+
+    /// [`Self::load_secrets_with`], where no `store` is a store holding
+    /// nothing: every unset secret is filled from `env` alone, and nothing
+    /// is read or written anywhere else.
+    fn fill_secrets(
+        &mut self,
+        store: Option<&crate::credentials::SecureStore>,
+        env: &impl Fn(&str) -> Option<String>,
+        unbound: UnboundOllamaToken<'_>,
+    ) {
         use crate::credentials::keys;
         let fill = |slot: &mut Option<String>, key: &str, env_name: &str| {
             if slot.as_ref().is_some_and(|s| !s.trim().is_empty()) {
@@ -1116,10 +1129,12 @@ impl Config {
                     *slot = Some(v);
                     return;
                 }
-            if let Ok(v) = store.get(key)
-                && !v.trim().is_empty() {
-                    *slot = Some(v);
-                }
+            if let Some(store) = store
+                && let Ok(v) = store.get(key)
+                && !v.trim().is_empty()
+            {
+                *slot = Some(v);
+            }
         };
         fill(&mut self.llm.api_key, keys::ANTHROPIC_API_KEY, "ANTHROPIC_API_KEY");
         fill(&mut self.llm.openai_api_key, keys::OPENAI_API_KEY, "OPENAI_API_KEY");
@@ -1152,7 +1167,7 @@ impl Config {
     /// naming a token for this configuration outright.
     fn hydrate_ollama_token(
         &mut self,
-        store: &crate::credentials::SecureStore,
+        store: Option<&crate::credentials::SecureStore>,
         env: &impl Fn(&str) -> Option<String>,
         unbound: UnboundOllamaToken<'_>,
     ) {
@@ -1165,6 +1180,9 @@ impl Config {
             self.llm.ollama_api_key = Some(token);
             return;
         }
+        let Some(store) = store else {
+            return;
+        };
         let Some(token) = store.ollama_token() else {
             return;
         };
@@ -1216,8 +1234,9 @@ impl Config {
     }
 
     /// [`Self::rebind_ollama_token_if_moved`] against a given store and
-    /// environment.
-    fn rebind_ollama_token_if_moved_with(
+    /// environment: the one a process loads with, when it is not the
+    /// process environment (a test's daemon control plane).
+    pub fn rebind_ollama_token_if_moved_with(
         &mut self,
         previous_host: &str,
         store: &crate::credentials::SecureStore,
@@ -1228,7 +1247,7 @@ impl Config {
         }
         self.llm.ollama_api_key = None;
         self.hydrate_ollama_token(
-            store,
+            Some(store),
             &env,
             UnboundOllamaToken::RunningServer(previous_host),
         );
@@ -1250,14 +1269,27 @@ impl Config {
         running_ollama_host: &str,
         store: &crate::credentials::SecureStore,
     ) -> Result<Self, ConfigError> {
+        Self::load_replacing_with(running_ollama_host, store, process_env)
+    }
+
+    /// [`Self::load_replacing`] against a given environment.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`].
+    pub fn load_replacing_with(
+        running_ollama_host: &str,
+        store: &crate::credentials::SecureStore,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
         let path = Self::default_config_path()?;
         if path.exists() {
-            Self::load_from_replacing(&path, running_ollama_host, store)
+            Self::load_from_replacing_with(&path, running_ollama_host, store, env)
         } else {
             let mut cfg = Self::default();
             cfg.load_secrets_with(
                 store,
-                &process_env,
+                &env,
                 UnboundOllamaToken::RunningServer(running_ollama_host),
             );
             Ok(cfg)
@@ -1278,7 +1310,11 @@ impl Config {
     }
 
     /// [`Self::load_from_replacing`] against a given environment.
-    fn load_from_replacing_with(
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_from`].
+    pub fn load_from_replacing_with(
         path: &Path,
         running_ollama_host: &str,
         store: &crate::credentials::SecureStore,
@@ -1554,7 +1590,8 @@ impl Config {
 
     /// [`Self::with_env_overrides`] against a given environment, so the
     /// override rules are testable without the process environment.
-    fn with_env_overrides_from(mut self, env: impl Fn(&str) -> Option<String>) -> Self {
+    #[must_use]
+    pub fn with_env_overrides_from(mut self, env: impl Fn(&str) -> Option<String>) -> Self {
         self.override_llm_keys(&env);
 
         // Server config

@@ -267,6 +267,7 @@ async fn config_set_does_not_hand_a_legacy_ollama_token_to_a_new_address() {
         .expect("set");
     let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
     cp.credential_store = store.clone();
+    cp.environment = environment(&[]);
     // Persisting, as the daemon does: the save files what a change brings in,
     // and must not file the old server's token for the new address either.
     cp.config_path = Some(dir.path().join("config.toml"));
@@ -336,6 +337,7 @@ async fn reset_and_import_record_a_legacy_ollama_tokens_server_first() {
             .expect("set");
         let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
         cp.credential_store = store.clone();
+        cp.environment = environment(&[]);
         cp.config_path = Some(dir.path().join("config.toml"));
         {
             let mut config = cp.config.write().await;
@@ -364,13 +366,25 @@ async fn reset_and_import_record_a_legacy_ollama_tokens_server_first() {
     }
 }
 
+/// An environment that sets `vars` and nothing else: what a test's control
+/// plane loads with instead of the environment the test runs in.
+fn environment(vars: &[(&str, &str)]) -> Environment {
+    let vars: std::collections::HashMap<String, String> = vars
+        .iter()
+        .map(|&(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    Arc::new(move |name| vars.get(name).cloned())
+}
+
 /// A control plane that persists as the daemon's does — a `config.toml` and a
-/// secure store of its own under `dir`, never the OS keyring.
+/// secure store of its own under `dir`, never the OS keyring — in an
+/// environment that sets nothing.
 fn persisting_control_plane(dir: &std::path::Path) -> (ControlPlane, nanna_config::SecureStore) {
     let store = nanna_config::SecureStore::file_only_at(dir.join("store"));
     let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
     cp.config_path = Some(dir.join("config.toml"));
     cp.credential_store = store.clone();
+    cp.environment = environment(&[]);
     (cp, store)
 }
 
@@ -698,6 +712,7 @@ async fn a_secret_the_store_cannot_file_is_refused_with_its_change() {
     let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
     cp.config_path = Some(dir.path().join("config.toml"));
     cp.credential_store = nanna_config::SecureStore::file_only_at(blocker.join("store"));
+    cp.environment = environment(&[]);
     let cp = Arc::new(cp);
 
     let resp = cp
@@ -733,6 +748,286 @@ async fn a_secret_the_store_cannot_file_is_refused_with_its_change() {
     );
     drop(config);
     assert_eq!(saved_config(dir.path()), "", "nothing is saved");
+}
+
+// -----------------------------------------------------------------------------
+// A secret the daemon's environment supplies
+// -----------------------------------------------------------------------------
+
+/// Boot `cp` as the daemon boots: `config` is its saved `config.toml`, and
+/// the running config is what loading that file gives, with the control
+/// plane's store and environment.
+async fn boot_from(cp: &ControlPlane, dir: &std::path::Path, config: &Config) {
+    let file = dir.join("config.toml");
+    config.save_to(&file).expect("save");
+    let loaded = Config::load_from_replacing_with(
+        &file,
+        &config.memory.ollama_host,
+        &cp.credential_store,
+        &*cp.environment,
+    )
+    .expect("loads")
+    .with_env_overrides_from(&*cp.environment);
+    *cp.config.write().await = loaded;
+}
+
+/// Assert that the running config is what the next load of the save gives:
+/// the config watcher reads the daemon's own save back within one poll, and
+/// here it does so at once. Where the two differ, the watcher applies the
+/// load, and a change that answered that it was made is undone seconds later.
+async fn assert_running_is_the_next_load(cp: &ControlPlane, dir: &std::path::Path, label: &str) {
+    let running = serde_json::to_value(&*cp.config.read().await).expect("json");
+    cp.reload_changed_config(&dir.join("config.toml")).await;
+    let reloaded = serde_json::to_value(&*cp.config.read().await).expect("json");
+    assert_eq!(
+        running, reloaded,
+        "{label}: the watcher reading the save back changes nothing"
+    );
+}
+
+/// The string at dotted `path` in `config`, when there is one.
+fn string_at(config: &Config, path: &str) -> Option<String> {
+    let value = serde_json::to_value(config).expect("json");
+    path.split('.')
+        .try_fold(&value, |node, part| node.get(part))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// A config naming the Telegram and Slack channels, with none of their
+/// secrets: every load fills those in from the environment or the store.
+fn naming_channels() -> Config {
+    let mut config = Config::default();
+    config.channels.telegram = Some(nanna_config::TelegramConfig {
+        bot_token: String::new(),
+        webhook_url: None,
+        allowed_users: Some(vec![42]),
+        webhook_secret: None,
+    });
+    config.channels.slack = Some(nanna_config::SlackConfig {
+        bot_token: String::new(),
+        app_token: None,
+        signing_secret: String::new(),
+    });
+    config
+}
+
+/// Every load fills a secret from its variable before the store, and
+/// `with_env_overrides` replaces some outright. A `config.set` of one the
+/// environment supplies answered `updated`, ran the new value and filed it —
+/// and the config watcher, reading the save back seconds later, put the
+/// environment's value back. It is refused instead, naming the variable, and
+/// nothing is applied, filed or saved.
+#[tokio::test]
+async fn a_secret_the_environment_supplies_is_refused_with_its_variable() {
+    for (path, variable) in [
+        ("llm.api_key", "ANTHROPIC_API_KEY"),
+        ("llm.openai_api_key", "OPENAI_API_KEY"),
+        ("llm.openrouter_api_key", "OPENROUTER_API_KEY"),
+        ("llm.github_token", "GITHUB_TOKEN"),
+        ("llm.anthropic_oauth_token", "ANTHROPIC_OAUTH_TOKEN"),
+        ("llm.ollama_api_key", "OLLAMA_API_KEY"),
+        ("tools.brave_api_key", "BRAVE_API_KEY"),
+        ("server.webhook_secret", "NANNA_WEBHOOK_SECRET"),
+        ("channels.telegram.bot_token", "TELEGRAM_BOT_TOKEN"),
+        (
+            "channels.telegram.webhook_secret",
+            "TELEGRAM_WEBHOOK_SECRET",
+        ),
+        ("channels.slack.signing_secret", "SLACK_SIGNING_SECRET"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut cp, store) = persisting_control_plane(dir.path());
+        cp.environment = environment(&[(variable, "from-the-environment")]);
+        boot_from(&cp, dir.path(), &naming_channels()).await;
+        let saved = saved_config(dir.path());
+        let cp = Arc::new(cp);
+
+        let resp = cp
+            .handle(
+                "test",
+                Action::Config(ConfigAction::Set {
+                    path: path.into(),
+                    value: json!("set-by-config-set"),
+                }),
+            )
+            .await;
+
+        assert_eq!(resp["error"], "env_overrides_secret", "{path}: {resp}");
+        assert_eq!(resp["variable"], variable, "{path}: {resp}");
+        assert_eq!(resp["secret"], path, "{path}: {resp}");
+        assert_eq!(resp["path"], path, "{path}: {resp}");
+        assert!(
+            resp["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(variable) && message.contains("unset")),
+            "{path}: says which variable to unset: {resp}"
+        );
+        assert_eq!(
+            string_at(&*cp.config.read().await, path).as_deref(),
+            Some("from-the-environment"),
+            "{path}: the running config keeps the environment's"
+        );
+        assert!(
+            store.list_keys().is_empty(),
+            "{path}: nothing is filed: {:?}",
+            store.list_keys()
+        );
+        assert_eq!(saved_config(dir.path()), saved, "{path}: nothing is saved");
+        assert_running_is_the_next_load(&cp, dir.path(), path).await;
+    }
+}
+
+/// A section set whole brings its secrets in with it: one the environment
+/// supplies refuses the whole set, which names the secret and the variable,
+/// and the section's other settings are left as they were.
+#[tokio::test]
+async fn a_section_carrying_a_secret_the_environment_supplies_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut cp, store) = persisting_control_plane(dir.path());
+    cp.environment = environment(&[("TELEGRAM_BOT_TOKEN", "telegram-from-the-environment")]);
+    boot_from(&cp, dir.path(), &naming_channels()).await;
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "channels.telegram".into(),
+                value: json!({ "bot_token": "telegram-set", "allowed_users": [7] }),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["error"], "env_overrides_secret", "{resp}");
+    assert_eq!(resp["path"], "channels.telegram", "{resp}");
+    assert_eq!(resp["secret"], "channels.telegram.bot_token", "{resp}");
+    assert_eq!(resp["variable"], "TELEGRAM_BOT_TOKEN", "{resp}");
+    let telegram = cp
+        .config
+        .read()
+        .await
+        .channels
+        .telegram
+        .clone()
+        .expect("the section is still set");
+    assert_eq!(telegram.bot_token, "telegram-from-the-environment");
+    assert_eq!(telegram.allowed_users, Some(vec![42]), "nothing is applied");
+    assert!(store.list_keys().is_empty(), "{:?}", store.list_keys());
+    assert_running_is_the_next_load(&cp, dir.path(), "channels.telegram").await;
+}
+
+/// An import brings in each secret it carries. One the environment supplies
+/// refuses the import: a variable `with_env_overrides` reads (the Anthropic
+/// key) used to replace the imported key before it ever ran, and one only
+/// the load reads (the Brave key) ran until the watcher put the
+/// environment's back. Either way the import answered `imported`.
+#[tokio::test]
+async fn an_import_carrying_a_secret_the_environment_supplies_is_refused() {
+    for (variable, carry) in [
+        (
+            "ANTHROPIC_API_KEY",
+            (|config: &mut Config| config.llm.api_key = Some("sk-ant-imported".to_string()))
+                as fn(&mut Config),
+        ),
+        ("BRAVE_API_KEY", |config: &mut Config| {
+            config.tools.brave_api_key = Some("brave-imported".to_string());
+        }),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut cp, store) = persisting_control_plane(dir.path());
+        cp.environment = environment(&[(variable, "from-the-environment")]);
+        boot_from(&cp, dir.path(), &Config::default()).await;
+        let saved = saved_config(dir.path());
+        let cp = Arc::new(cp);
+
+        let mut imported = Config::default();
+        imported.llm.model = "nanna-test-imported-model".to_string();
+        carry(&mut imported);
+        let resp = cp
+            .handle(
+                "test",
+                Action::Config(ConfigAction::Import {
+                    config: serde_json::to_value(&imported).expect("json"),
+                }),
+            )
+            .await;
+
+        assert_eq!(resp["error"], "env_overrides_secret", "{variable}: {resp}");
+        assert_eq!(resp["variable"], variable, "{resp}");
+        assert_ne!(
+            cp.config.read().await.llm.model,
+            "nanna-test-imported-model",
+            "{variable}: nothing is applied"
+        );
+        assert!(store.list_keys().is_empty(), "{:?}", store.list_keys());
+        assert_eq!(
+            saved_config(dir.path()),
+            saved,
+            "{variable}: nothing is saved"
+        );
+        assert_running_is_the_next_load(&cp, dir.path(), variable).await;
+    }
+}
+
+/// Only a secret the environment supplies is refused: a change of another
+/// secret or of a setting is made, and the next load keeps it. The watcher
+/// reads the save back with the control plane's environment, so the
+/// environment's key stays through each one; and a reset, which brings in no
+/// secret but the environment's own, is made too.
+#[tokio::test]
+async fn a_change_the_environment_does_not_undo_is_made() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut cp, store) = persisting_control_plane(dir.path());
+    cp.environment = environment(&[
+        ("BRAVE_API_KEY", "brave-from-the-environment"),
+        ("ANTHROPIC_API_KEY", "sk-ant-from-the-environment"),
+    ]);
+    boot_from(&cp, dir.path(), &Config::default()).await;
+    let cp = Arc::new(cp);
+
+    for (path, value) in [
+        ("llm.github_token", json!("ghp-set-by-config-set")),
+        ("llm.model", json!("nanna-test-other-model")),
+    ] {
+        let resp = cp
+            .handle(
+                "test",
+                Action::Config(ConfigAction::Set {
+                    path: path.into(),
+                    value,
+                }),
+            )
+            .await;
+        assert_eq!(resp["status"], "updated", "{path}: {resp}");
+        assert_running_is_the_next_load(&cp, dir.path(), path).await;
+    }
+    assert_eq!(
+        store.get(keys::GITHUB_TOKEN).ok().as_deref(),
+        Some("ghp-set-by-config-set")
+    );
+    assert!(
+        !store.exists(keys::BRAVE_API_KEY),
+        "the environment's is never filed"
+    );
+    assert_eq!(
+        cp.config.read().await.tools.brave_api_key.as_deref(),
+        Some("brave-from-the-environment")
+    );
+
+    let resp = cp
+        .handle("test", Action::Config(ConfigAction::Reset { path: None }))
+        .await;
+    assert_eq!(resp["status"], "reset", "{resp}");
+    assert_eq!(
+        cp.config.read().await.llm.api_key.as_deref(),
+        Some("sk-ant-from-the-environment")
+    );
+    assert!(
+        !store.exists(keys::ANTHROPIC_API_KEY),
+        "the environment's is never filed"
+    );
 }
 
 /// Negative space: with no memory configured at all, consolidation reports the
@@ -1196,54 +1491,10 @@ async fn a_retired_key_inside_a_parent_object_is_refused_too() {
 // Clearing a secret, and a change that merely lacks one
 // -----------------------------------------------------------------------------
 
-/// Boot `cp` as the daemon boots: `config` is its saved `config.toml`, and
-/// the running config is what loading that file gives, with `store`'s
-/// secrets and the environment's.
-async fn boot_from(cp: &ControlPlane, dir: &std::path::Path, config: &Config) {
-    let file = dir.join("config.toml");
-    config.save_to(&file).expect("save");
-    let loaded =
-        Config::load_from_replacing(&file, &config.memory.ollama_host, &cp.credential_store)
-            .expect("loads")
-            .with_env_overrides();
-    *cp.config.write().await = loaded;
-}
-
-/// Assert that the running config is what the next load of the save gives:
-/// a restart, or the config watcher reading the daemon's own save back
-/// within one poll (loaded here as the watcher loads it). Where the two
-/// differ, the watcher applies the load, and what the change did is undone
-/// seconds later.
-async fn assert_running_is_the_next_load(cp: &ControlPlane, dir: &std::path::Path, label: &str) {
-    let running = cp.config.read().await.clone();
-    let loaded = Config::load_from_replacing(
-        &dir.join("config.toml"),
-        &running.memory.ollama_host,
-        &cp.credential_store,
-    )
-    .expect("the save loads")
-    .with_env_overrides();
-    assert_eq!(
-        serde_json::to_value(&running).expect("json"),
-        serde_json::to_value(&loaded).expect("json"),
-        "{label}: the running config is what the next load gives"
-    );
-}
-
-/// What the environment supplies for `var`: a blank variable supplies nothing.
-fn env_supplies(var: &str) -> Option<String> {
-    std::env::var(var)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
-/// The string at dotted `path` in `config`, when there is one.
-fn string_at(config: &Config, path: &str) -> Option<String> {
-    let value = serde_json::to_value(config).expect("json");
-    path.split('.')
-        .try_fold(&value, |node, part| node.get(part))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+/// What `cp`'s environment supplies for `var`: a blank variable supplies
+/// nothing.
+fn env_supplies(cp: &ControlPlane, var: &str) -> Option<String> {
+    (cp.environment)(var).filter(|value| !value.trim().is_empty())
 }
 
 /// `config.set` of a secret's path to null or blank is someone clearing it.
@@ -1313,7 +1564,7 @@ async fn clearing_a_secret_deletes_it_from_the_store() {
         assert!(!store.exists(key), "{path}: deleted from the store");
         assert_eq!(
             string_at(&*cp.config.read().await, path).filter(|held| !held.is_empty()),
-            env_supplies(env_var),
+            env_supplies(&cp, env_var),
             "{path}: the running config holds only what the environment supplies"
         );
         assert_running_is_the_next_load(&cp, dir.path(), path).await;
@@ -1356,7 +1607,7 @@ async fn clearing_the_ollama_token_deletes_only_the_running_servers() {
     );
     assert_eq!(
         cp.config.read().await.llm.ollama_api_key,
-        env_supplies("OLLAMA_API_KEY")
+        env_supplies(&cp, "OLLAMA_API_KEY")
     );
     assert_running_is_the_next_load(&cp, dir.path(), "the running server's").await;
 
@@ -1459,14 +1710,14 @@ async fn a_reset_keeps_the_stored_credentials() {
         assert_eq!(store.get(key).ok().as_deref(), Some(secret), "{path}: kept");
         assert_eq!(
             string_at(&running, path),
-            Some(env_supplies(env_var).unwrap_or_else(|| secret.to_string())),
+            Some(env_supplies(&cp, env_var).unwrap_or_else(|| secret.to_string())),
             "{path}: still held by the running config"
         );
     }
     assert_eq!(store.ollama_token().as_deref(), Some("ollama-stored"));
     assert_eq!(
         running.llm.ollama_api_key,
-        Some(env_supplies("OLLAMA_API_KEY").unwrap_or_else(|| "ollama-stored".to_string()))
+        Some(env_supplies(&cp, "OLLAMA_API_KEY").unwrap_or_else(|| "ollama-stored".to_string()))
     );
     assert_running_is_the_next_load(&cp, dir.path(), "reset").await;
 }
@@ -1518,7 +1769,7 @@ async fn an_import_that_lacks_a_secret_keeps_it() {
         assert_eq!(store.get(key).ok().as_deref(), Some(secret), "{key}: kept");
         assert_eq!(
             held,
-            Some(env_supplies(env_var).unwrap_or_else(|| secret.to_string())),
+            Some(env_supplies(&cp, env_var).unwrap_or_else(|| secret.to_string())),
             "{key}: still held by the running config"
         );
     }
@@ -1557,7 +1808,7 @@ async fn a_set_of_a_section_that_lacks_a_secret_keeps_it() {
     );
     assert_eq!(
         cp.config.read().await.llm.openrouter_api_key,
-        Some(env_supplies("OPENROUTER_API_KEY").unwrap_or_else(|| "sk-or-stored".to_string()))
+        Some(env_supplies(&cp, "OPENROUTER_API_KEY").unwrap_or_else(|| "sk-or-stored".to_string()))
     );
     assert_running_is_the_next_load(&cp, dir.path(), "section set").await;
 }
