@@ -49,6 +49,15 @@ impl From<UserToolPermissions> for ToolPermissions {
     }
 }
 
+/// What a load of the user tool store found, for the boot log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserToolLoad {
+    /// Tools read from disk, disabled ones included.
+    pub loaded: usize,
+    /// How many of those were registered: the enabled ones.
+    pub registered: usize,
+}
+
 /// Manager for user-created tools
 pub struct UserToolManager {
     tools_dir: PathBuf,

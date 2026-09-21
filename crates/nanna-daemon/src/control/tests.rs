@@ -839,6 +839,58 @@ async fn enable_disable_reconciles_live_registry() {
     );
 }
 
+/// What a restarted daemon starts from: the tool files alone, read by a fresh
+/// manager into a fresh registry. Every tool comes back into the store; only
+/// the enabled one comes back callable.
+#[tokio::test]
+async fn load_user_tools_restores_the_store_and_registers_only_enabled_tools() {
+    use crate::user_tools::{UserToolLoad, UserToolManager};
+    use nanna_tools::ToolRegistry;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let before = UserToolManager::new(tmp.path().to_path_buf());
+    for name in ["t_kept_on", "t_kept_off"] {
+        let source = format!(
+            "export default {{ name: \"{name}\", description: \"d\", execute() {{ return \"ok\"; }} }}"
+        );
+        before
+            .create_tool(name.into(), "d".into(), source, None, None, None)
+            .await
+            .expect("create tool");
+    }
+    before
+        .update_tool("t_kept_off", None, None, None, None, Some(false))
+        .await
+        .expect("disable tool");
+    drop(before);
+
+    let registry = Arc::new(ToolRegistry::new());
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(Arc::clone(&registry));
+    cp.user_tools = Some(Arc::new(UserToolManager::new(tmp.path().to_path_buf())));
+
+    let load = cp.load_user_tools().await.expect("the store is readable");
+
+    let expected = UserToolLoad {
+        loaded: 2,
+        registered: 1,
+    };
+    assert_eq!(load, expected);
+    let user_tools = cp.user_tools().expect("wired above");
+    let on = user_tools.get_tool("t_kept_on").await;
+    let off = user_tools.get_tool("t_kept_off").await;
+    assert!(on.is_some_and(|t| t.enabled), "listed, enabled");
+    assert!(off.is_some_and(|t| !t.enabled), "listed, still disabled");
+    assert!(
+        registry.get("t_kept_on").await.is_some(),
+        "the enabled tool is callable"
+    );
+    assert!(
+        registry.get("t_kept_off").await.is_none(),
+        "a disabled tool must not become callable by a restart"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Universal per-tool toggle (bundled skills, not just user tools)
 // ---------------------------------------------------------------------------
