@@ -27,6 +27,9 @@ use nanna_daemon::service::{ServiceConfig, ServiceManager, ServiceStatus};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tracing::{error, info};
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Global log buffer initialized before the tracing subscriber
@@ -169,6 +172,16 @@ fn file_log_writer(
     }
 }
 
+/// Per-layer filter for the fmt layers: every event, but only Nanna's own
+/// spans. Span CLOSE lines are enabled for the agent loop's spans, and the
+/// setting cannot be scoped by target — without this, a dependency that opens
+/// INFO spans prints a close line for each (measured: zbus's keyring
+/// handshake emitted a burst of them at boot). A dependency's events still
+/// print; they only lose that dependency's own span prefix.
+fn own_spans_only(metadata: &tracing::Metadata<'_>) -> bool {
+    !metadata.is_span() || metadata.target().starts_with("nanna")
+}
+
 fn main() {
     let cli = Cli::parse();
     
@@ -204,15 +217,25 @@ fn main() {
         Some((writer, guard)) => {
             let layer = tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(writer);
+                .with_span_events(FmtSpan::CLOSE)
+                .with_writer(writer)
+                .with_filter(filter_fn(own_spans_only));
             (Some(layer), Some(guard))
         }
         None => (None, None),
     };
 
+    // Span CLOSE events carry what each span measured (P6): the agent loop's
+    // `llm_call` / `tool_call` / `agent_run` spans record latency, token and
+    // byte counts, and success as they settle, and this is the line that
+    // prints them — with `time.busy`/`time.idle` — once per span.
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_span_events(FmtSpan::CLOSE)
+                .with_filter(filter_fn(own_spans_only)),
+        )
         .with(log_layer)
         .with(file_layer)
         .init();

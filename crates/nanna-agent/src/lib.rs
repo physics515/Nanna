@@ -20,6 +20,7 @@ pub mod planner;
 pub mod prompts;
 pub mod tool_stats;
 mod registry;
+pub mod spans;
 mod summarizer;
 mod supervisor;
 

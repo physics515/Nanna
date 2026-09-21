@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument as _, debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::numeric::{f32_to_usize, millis_u64, usize_to_f32};
@@ -949,6 +949,18 @@ struct LlmResult {
     /// Error tool results from malformed JSON parsing failures.
     /// These need to be sent back to the model so it knows the call failed.
     error_tool_results: Vec<ContentBlock>,
+}
+
+/// Bytes a tool call returned, for its span: the content plus the error
+/// text, since a refusal (a breaker notice, a failed call) carries its
+/// message in `error` and would otherwise report as empty.
+fn tool_output_bytes(result: &ToolResult) -> usize {
+    let error_bytes = result.error.as_ref().map_or(0, String::len);
+    debug_assert!(
+        result.content.len().checked_add(error_bytes).is_some(),
+        "two in-memory strings cannot overflow usize together"
+    );
+    result.content.len() + error_bytes
 }
 
 /// Detect a literal tool-call loop: the newest tool call repeated an earlier
@@ -4385,7 +4397,11 @@ impl Agent {
         message: &str,
         options: RunOptions,
     ) -> Result<AgentResponse, AgentError> {
-        let (mut state, mut limits) = self.prepare_run(message, &options).await;
+        let run_span = crate::spans::run_span(&self.config.model);
+        let (mut state, mut limits) = self
+            .prepare_run(message, &options)
+            .instrument(run_span.clone())
+            .await;
 
         // Agent loop
         loop {
@@ -4395,18 +4411,38 @@ impl Agent {
             // walks that whole nesting — deep enough, through the streaming
             // LLM call, to exceed the compiler's recursion limit. Boxing
             // proves it once, here, from a shallow start.
+            //
+            // `begin_iteration` increments the count first thing, so the
+            // iteration this future runs is the next one.
+            let iteration_span = crate::spans::iteration_span(&run_span, state.iterations + 1);
+            // The span wraps the BOXED future, not the inner one: wrapping
+            // first would put `Instrumented` inside the coercion and send the
+            // `Send` proof back down the deep nesting the box exists to cut.
             let iteration: std::pin::Pin<
                 Box<dyn std::future::Future<Output = Pass> + Send + '_>,
             > = Box::pin(self.run_iteration(&mut state, &options, &mut limits));
-            match iteration.await {
+            match iteration.instrument(iteration_span).await {
                 ControlFlow::Continue(()) | ControlFlow::Break(RunExit::Next) => {}
                 ControlFlow::Break(RunExit::Respond { truncated }) => {
+                    let outcome = if truncated {
+                        "responded_truncated"
+                    } else {
+                        "responded"
+                    };
+                    state.record_on_span(&run_span, outcome);
                     return Ok(state.into_response(truncated));
                 }
                 ControlFlow::Break(RunExit::Cancelled) => {
-                    return self.finish_cancelled(state, &options).await;
+                    state.record_on_span(&run_span, "cancelled");
+                    return self
+                        .finish_cancelled(state, &options)
+                        .instrument(run_span)
+                        .await;
                 }
-                ControlFlow::Break(RunExit::Fail(error)) => return Err(error),
+                ControlFlow::Break(RunExit::Fail(error)) => {
+                    state.record_on_span(&run_span, "failed");
+                    return Err(error);
+                }
             }
         }
     }
@@ -4448,19 +4484,13 @@ impl Agent {
             }
 
         let (result, llm_latency, escalated) = self
-            .call_with_escalation(
+            .llm_exchange(
                 &mut request,
                 state,
                 options,
                 routed_model.is_some(),
                 complexity,
             )
-            .await;
-        let result = self
-            .heal_unserved_tool_rejection(&mut request, result, state, options)
-            .await;
-        let result = self
-            .retry_after_context_overflow(&mut request, result, state, options)
             .await;
         let mut result = Self::settle_llm_result(state, result)?;
         self.record_llm_call(
@@ -4543,6 +4573,49 @@ impl Agent {
         .await?;
         self.after_tool_round(state, options).await;
         ControlFlow::Continue(())
+    }
+
+    /// One iteration's whole LLM exchange — the call with its escalation
+    /// retry, then both heals — under one `llm_call` span that records how
+    /// it settled. The heals are further requests for the same turn, so
+    /// they belong to the same span rather than to spans of their own.
+    async fn llm_exchange(
+        &self,
+        request: &mut AnthropicRequest,
+        state: &mut RunState,
+        options: &RunOptions,
+        routed: bool,
+        complexity: Option<TaskComplexity>,
+    ) -> (Result<LlmResult, AgentError>, std::time::Duration, bool) {
+        let llm_span = crate::spans::llm_call_span(&request.model);
+        let requested_model = request.model.clone();
+        let (result, llm_latency, escalated) = self
+            .call_with_escalation(request, state, options, routed, complexity)
+            .instrument(llm_span.clone())
+            .await;
+        let result = self
+            .heal_unserved_tool_rejection(request, result, state, options)
+            .instrument(llm_span.clone())
+            .await;
+        let result = self
+            .retry_after_context_overflow(request, result, state, options)
+            .instrument(llm_span.clone())
+            .await;
+        crate::spans::record_llm_outcome(
+            &llm_span,
+            &crate::spans::LlmCallOutcome {
+                requested_model: &requested_model,
+                model: &request.model,
+                latency_ms: millis_u64(llm_latency),
+                escalated,
+                tokens: result
+                    .as_ref()
+                    .ok()
+                    .map(|r| (r.input_tokens, r.output_tokens)),
+                tool_calls: result.as_ref().map_or(0, |r| r.tool_uses.len()),
+            },
+        );
+        (result, llm_latency, escalated)
     }
 
     /// Size the context for the model, seed the run state, and add the
@@ -7293,6 +7366,8 @@ impl Agent {
                 let call = call.clone();
                 let breaker_notice = breaker_notice.clone();
                 let tools = Arc::clone(&self.tools);
+                let span = crate::spans::tool_call_span(&name, &call.id);
+                let outcome_span = span.clone();
                 async move {
                     // Short-circuited by one of the sibling breakers: the
                     // structured notice is RETURNED instantly (never thrown);
@@ -7313,6 +7388,13 @@ impl Agent {
                             // verbatim, never stubbed behind a memory handle.
                             output_target: OutputTarget::Context,
                         };
+                        crate::spans::record_tool_outcome(
+                            &outcome_span,
+                            0,
+                            tool_output_bytes(&response.result),
+                            false,
+                            true,
+                        );
                         return (response, 0u64);
                     }
                     let start = std::time::Instant::now();
@@ -7320,8 +7402,16 @@ impl Agent {
                     let response = tools.execute(call).await;
                     let duration_ms =
                         u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    crate::spans::record_tool_outcome(
+                        &outcome_span,
+                        duration_ms,
+                        tool_output_bytes(&response.result),
+                        response.result.success,
+                        false,
+                    );
                     (response, duration_ms)
                 }
+                .instrument(span)
             })
             .collect();
 
@@ -9462,6 +9552,17 @@ impl RunState {
                 before_tool,
             });
         }
+    }
+
+    /// Record how the run ended on its `agent_run` span.
+    fn record_on_span(&self, span: &tracing::Span, outcome: &'static str) {
+        crate::spans::record_run_outcome(
+            span,
+            self.iterations,
+            u64::from(self.input_tokens),
+            u64::from(self.output_tokens),
+            outcome,
+        );
     }
 
     fn into_response(mut self, truncated: bool) -> AgentResponse {

@@ -457,7 +457,15 @@ impl ControlPlane {
             parent_workdir,
         };
         let scope_sid = session_id.clone();
-        tokio::spawn(ToolRegistry::with_run_session(scope_sid, Box::pin(run.run())));
+        let sub_agent_span = tracing::info_span!(
+            "sub_agent",
+            session_id = %session_id,
+            parent_id = parent_id.as_deref().unwrap_or("none"),
+        );
+        tokio::spawn(tracing::Instrument::instrument(
+            ToolRegistry::with_run_session(scope_sid, Box::pin(run.run())),
+            sub_agent_span,
+        ));
 
         json!({
             "status": "spawned",

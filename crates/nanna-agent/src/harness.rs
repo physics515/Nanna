@@ -2698,8 +2698,10 @@ impl<'a> HarnessRun<'a> {
             cancel: self.cancel.clone(),
         };
 
+        let step_span =
+            crate::spans::harness_step_span(request.step_index, request.item_id, step_kind);
         let step_started = Instant::now();
-        match self.runner.run_step(request).await {
+        match tracing::Instrument::instrument(self.runner.run_step(request), step_span).await {
             Ok(outcome) => {
                 self.consecutive_errors = 0;
                 // One term of the hang re-stake cap: the largest cost

@@ -2319,10 +2319,14 @@ async fn run_scheduled_prompt_yielding(
         // this run cannot see the scheduled session (and vice versa).
         // Boxed: the chat future is ~23KB and would otherwise sit inline in
         // the spawned task's state machine.
-        Box::pin(ToolRegistry::with_run_session(
-            run_session.clone(),
-            run_agent.chat(&run_session, &run_payload, None, &[]),
-        ))
+        let run_span = tracing::info_span!("scheduled_run", session_id = %run_session);
+        tracing::Instrument::instrument(
+            Box::pin(ToolRegistry::with_run_session(
+                run_session.clone(),
+                run_agent.chat(&run_session, &run_payload, None, &[]),
+            )),
+            run_span,
+        )
         .await
     });
 

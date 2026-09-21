@@ -1681,8 +1681,33 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       and `nanna_channel_send_failures_total{channel}`, counted where a channel message crosses the
       daemon boundary (inbound + immediate replies in `process_message`, turn answers and reminders
       in the reply forwarder); names bounded at 16 then folded into `other`. Only histograms remain.
-- [ ] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
+- [x] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
+      *(2026-09-21)* The daemon had **zero** spans, so two overlapping turns interleaved their
+      lines with nothing to tell them apart. Now `chat_turn{session_id message_id}` (plus
+      `sub_agent` / `scheduled_run` roots) → `harness_step{step item_id kind}` → `agent_run{model}`
+      → `agent_iteration{iteration}` → `llm_call` / `tool_call`, from `nanna-agent::spans`.
+      Outcome fields are declared empty and recorded as each call settles — `llm_call` gets
+      latency, input/output tokens, tool-call count, `ok`/`error` (and `served_model` only when
+      escalation moved it: fmt *appends* a re-recorded field, so re-recording `model` printed it
+      twice); `tool_call` gets duration, output bytes (content + error text, so a breaker refusal
+      does not read as empty), success, short-circuited; `agent_run` gets iterations, tokens, and
+      how it ended. The fmt layers print them once per span via `FmtSpan::CLOSE`, **scoped by a
+      per-layer filter to `nanna*` spans** — the first real-daemon run showed zbus's keyring
+      handshake emitting a burst of INFO span-close lines at boot, which the unit test could not
+      have seen. Cost is per call, never per token. Guarded by `tests/tracing_spans.rs`, which
+      drives the real loop against an Ollama stub and asserts parents, closure, the recorded
+      fields, and that the tool's own log line fires *inside* its span (verified by removing the
+      `.instrument`: the test fails by name). One trap recorded in-code: instrumenting the
+      iteration future before boxing it re-deepened the `Send` proof the box exists to cut
+      (clippy: "overflow evaluating the requirement") — the span wraps the boxed future.
+      Real binary: scratch-isolated daemon + fake Ollama, one IPC chat turn → 14 `llm_call`,
+      4 `tool_call`, 5 `harness_step`, 1 `chat_turn` close lines, 0 foreign, 0 panics.
+      - [ ] **The GUI Logs page still sees none of it.** `nanna-core::LogBufferLayer` implements
+            only `on_event` and keeps the message text, so the span context and every close
+            line reach stdout and the file log but not `system logs`. Carrying it needs a
+            `LookupSpan` bound, per-span field storage in extensions, and a `LogEntry` field the
+            Logs page actually renders — ship both halves together, or it is a dead field.
 - [~] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by
       session/day/month/model/tool, surface in GUI.
       *(2026-07-12)* Core shipped in `nanna-agent::cost`: `ModelPricing` (input/output/cache-read/cache-write

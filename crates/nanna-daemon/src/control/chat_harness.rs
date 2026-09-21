@@ -598,7 +598,16 @@ impl ControlPlane {
         // without them.
         let watcher = TurnWatcher::for_turn(&chat_turn);
         let scope_session_id = session_id.to_string();
-        let turn = tokio::spawn(ToolRegistry::with_run_session(scope_session_id, Box::pin(chat_turn.run(sink))));
+        // The root of the turn's span tree (P6): every line the turn logs —
+        // prep, each harness step, each LLM and tool call — names the session
+        // and message it belongs to. Outside `with_run_session` so the span is
+        // entered on every poll of the whole turn.
+        let turn_span =
+            tracing::info_span!("chat_turn", session_id = %session_id, message_id = %message_id);
+        let turn = tokio::spawn(tracing::Instrument::instrument(
+            ToolRegistry::with_run_session(scope_session_id, Box::pin(chat_turn.run(sink))),
+            turn_span,
+        ));
 
         // Death watcher: a turn that dies before its release tail must not
         // leak its registrations. The task above is fire-and-forget, releases
