@@ -18,14 +18,14 @@ pub use mcp::{MCP_SERVERS_MAX, McpConfig, McpServerEntry, mcp_secret_key};
 /// Which Ollama server an address names — what the bearer token is bound to.
 pub mod ollama;
 pub use ollama::{normalize_ollama_host, ollama_server_changed, same_ollama_server};
-/// `[server].webhook_secret` in the secure store, and out of `config.toml`.
-mod server_secret;
 /// Each provider's API key in its own `[llm]` field and keyring entry, and
 /// the move of keys the old layout filed as Anthropic's.
 mod provider_key;
 /// Channel secrets (bot tokens, signing and webhook secrets) in the secure
 /// store, and out of `config.toml`.
 mod channel_secrets;
+/// `[server].webhook_secret` in the secure store, and out of `config.toml`.
+mod server_secret;
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
@@ -810,6 +810,42 @@ fn retired_ollama_url_notice(content: &str, config: &Config) -> Option<String> {
     ))
 }
 
+/// File in `store` under `key` a secret `config.toml` itself holds — `held`,
+/// trimmed and not blank — as the file loads, so that the save which next
+/// strips it from the file loses nothing ([`channel_secrets::adopt`],
+/// [`server_secret::adopt`]). A different stored value is replaced: every load
+/// of the file runs with the file's, so the one kept must be the file's, or
+/// that save would switch to another. Each load says the line can be deleted.
+///
+/// `field` names the secret in `config.toml` and `env_var` is where else it can
+/// come from, for the messages (never the value).
+fn adopt_file_secret(field: &str, env_var: &str, key: &str, held: &str, store: &SecureStore) {
+    let stored = store.get(key);
+    if stored.as_deref().is_ok_and(|stored| stored == held) {
+        warn!(
+            "config.toml holds {field} in plain text. It is in the secure store, so the line \
+             can be deleted; the next save of the settings removes it."
+        );
+        return;
+    }
+    match store.set(key, held) {
+        Ok(()) => warn!(
+            "config.toml holds {field} in plain text. It is now filed in the secure store{}, so \
+             the line can be deleted; the next save of the settings removes it.",
+            if stored.is_ok() {
+                " in place of the one there"
+            } else {
+                ""
+            }
+        ),
+        Err(e) => tracing::error!(
+            "config.toml holds {field} in plain text and it cannot be filed in the secure store \
+             ({e}). This process runs with it; once the settings are next saved it is no longer \
+             in config.toml, and must be set again or supplied as {env_var}."
+        ),
+    }
+}
+
 impl Config {
     /// Load config from default location.
     ///
@@ -853,9 +889,10 @@ impl Config {
 
     /// Read and parse the config file at `path`, with a non-Anthropic
     /// `[llm].provider`'s key filed under its own name
-    /// ([`provider_key::refile_provider_key`]) and each channel secret the
-    /// file itself holds filed in `store` ([`channel_secrets::adopt`]) —
-    /// before any secret is hydrated, so only a key the old layout left
+    /// ([`provider_key::refile_provider_key`]) and each channel secret and the
+    /// webhook secret the file itself holds filed in `store`
+    /// ([`channel_secrets::adopt`], [`server_secret::adopt`]) — before any
+    /// secret is hydrated, so only a key the old layout left
     /// behind is moved and only the file's own secrets are filed. The file's
     /// text comes back too, for what only the raw text can show.
     fn parse_file(
@@ -865,10 +902,9 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&content)?;
         info!("Loaded config from {path:?}");
-        // Also before any secret is hydrated: only the file's own is filed.
-        server_secret::adopt(&mut config.server, store);
         provider_key::refile_provider_key(&mut config.llm, store);
         channel_secrets::adopt(&mut config.channels, store);
+        server_secret::adopt(&mut config.server, store);
         Ok((config, content))
     }
 
@@ -911,8 +947,8 @@ impl Config {
         self.llm.github_token = None;
         self.llm.anthropic_oauth_token = None;
         self.llm.ollama_api_key = None;
-        self.server.webhook_secret = None;
         self.tools.brave_api_key = None;
+        self.server.webhook_secret = None;
         channel_secrets::strip(&mut self.channels);
     }
 

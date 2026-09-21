@@ -20,7 +20,7 @@
 
 use crate::ChannelsConfig;
 use crate::credentials::{CredentialError, SecureStore, keys};
-use tracing::{error, warn};
+use tracing::warn;
 
 /// Where a channel's config holds one secret.
 enum Slot<'a> {
@@ -228,33 +228,7 @@ pub fn adopt(channels: &mut ChannelsConfig, store: &SecureStore) {
         else {
             continue;
         };
-        let stored = store.get(secret.key);
-        if stored.as_deref().is_ok_and(|stored| *stored == held) {
-            warn!(
-                "config.toml holds {} in plain text. It is in the secure store, so the \
-                 line can be deleted; the next save of the settings removes it.",
-                secret.field
-            );
-            continue;
-        }
-        match store.set(secret.key, &held) {
-            Ok(()) => warn!(
-                "config.toml holds {} in plain text. It is now filed in the secure store{}, \
-                 so the line can be deleted; the next save of the settings removes it.",
-                secret.field,
-                if stored.is_ok() {
-                    " in place of the one there"
-                } else {
-                    ""
-                }
-            ),
-            Err(e) => error!(
-                "config.toml holds {} in plain text and it cannot be filed in the secure \
-                 store ({e}). This process runs with it; once the settings are next saved \
-                 it is no longer in config.toml, and must be set again.",
-                secret.field
-            ),
-        }
+        crate::adopt_file_secret(secret.field, secret.env, secret.key, &held, store);
     }
 }
 

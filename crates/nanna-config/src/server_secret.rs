@@ -17,21 +17,19 @@
 
 use crate::ServerConfig;
 use crate::credentials::{SecureStore, keys};
-use tracing::{error, warn};
 
 /// The environment variable that supplies the secret when `config.toml` does
 /// not. Never filed in the store.
 pub const WEBHOOK_SECRET_ENV: &str = "NANNA_WEBHOOK_SECRET";
 
 /// Its key in `config.toml`, for messages (never the value).
-const FIELD: &str = "[server].webhook_secret";
+const FIELD: &str = "server.webhook_secret";
 
 /// File in `store` the webhook secret `server` holds as parsed from
-/// `config.toml` — so that the save which next strips it from the file loses
-/// nothing. `server` keeps it, and a stored secret it differs from is
-/// replaced: every load of this file runs with the file's, so the one kept
-/// must be the file's, or that save would switch the endpoint to another and
-/// refuse every caller set up with this one. A blank one is none.
+/// `config.toml` ([`crate::adopt_file_secret`]: the file's replaces a
+/// different stored one, or the save that strips it would switch the endpoint
+/// to another and refuse every caller set up with this one). `server` keeps
+/// it. A blank one is none.
 ///
 /// It is filed trimmed, and `server` keeps it trimmed: the loads after that
 /// save read it from the store, and must run with what this one did.
@@ -48,31 +46,13 @@ pub fn adopt(server: &mut ServerConfig, store: &SecureStore) {
     else {
         return;
     };
-    let stored = store.get(keys::SERVER_WEBHOOK_SECRET);
-    if stored.as_deref().is_ok_and(|stored| *stored == held) {
-        warn!(
-            "config.toml holds {FIELD} in plain text. It is in the secure store, so the line \
-             can be deleted; the next save of the settings removes it."
-        );
-    } else {
-        match store.set(keys::SERVER_WEBHOOK_SECRET, &held) {
-            Ok(()) => warn!(
-                "config.toml holds {FIELD} in plain text. It is now filed in the secure store{}, \
-                 so the line can be deleted; the next save of the settings removes it.",
-                if stored.is_ok() {
-                    " in place of the one there"
-                } else {
-                    ""
-                }
-            ),
-            Err(e) => error!(
-                "config.toml holds {FIELD} in plain text and it cannot be filed in the secure \
-                 store ({e}). This process runs with it; once the settings are next saved it is \
-                 no longer in config.toml, and must be set again there or in \
-                 {WEBHOOK_SECRET_ENV}."
-            ),
-        }
-    }
+    crate::adopt_file_secret(
+        FIELD,
+        WEBHOOK_SECRET_ENV,
+        keys::SERVER_WEBHOOK_SECRET,
+        &held,
+        store,
+    );
     server.webhook_secret = Some(held);
 }
 
