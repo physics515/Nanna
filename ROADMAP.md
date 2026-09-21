@@ -2024,6 +2024,12 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             - [ ] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
                   for the same per-chunk decode once #344 merges (it is not on master, so it could
                   not be fixed here).
+      - [x] *(2026-09-21)* **Planner prose fallback pinned end to end.** e2e
+            `a_planner_that_answers_in_prose_still_gets_the_question_answered`: the scripted planner
+            replies in prose instead of JSON (routine for small models); the request becomes the one
+            task and the reply is exactly the answer. The stub's planner reply is now scriptable
+            (`start_with_plan`). Also probed, no defect: a two-task plan streams as two paragraphs
+            (the step-separator fix above) with the multi-item summary line.
       - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
             behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
             comment says "the next message decides what happens to them" — but the harness simply

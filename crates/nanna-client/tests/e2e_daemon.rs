@@ -801,6 +801,15 @@ struct ScriptedOllama {
 
 impl ScriptedOllama {
     async fn start(steps: Vec<String>) -> Self {
+        Self::start_with_plan(
+            r#"[{"title":"Answer the question","description":"Reply directly.","acceptance":null}]"#,
+            steps,
+        )
+        .await
+    }
+
+    /// [`Self::start`] with the planner's reply scripted too.
+    async fn start_with_plan(plan: &str, steps: Vec<String>) -> Self {
         assert!(
             !steps.is_empty(),
             "a scripted model needs at least one step reply"
@@ -811,9 +820,7 @@ impl ScriptedOllama {
         let base_url = format!("http://{}", listener.local_addr().expect("stub address"));
         let chat_bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let seen = std::sync::Arc::clone(&chat_bodies);
-        let plan = scripted_reply(
-            r#"[{"title":"Answer the question","description":"Reply directly.","acceptance":null}]"#,
-        );
+        let plan = scripted_reply(plan);
         // `WAIT <ms> <script>` delays that reply — a step still in flight.
         let steps: std::sync::Arc<Vec<(u64, String)>> = std::sync::Arc::new(
             steps
@@ -1603,6 +1610,38 @@ async fn a_long_multibyte_reply_survives_chunk_boundaries() {
         answered.chars().take(160).collect::<String>()
     );
     assert_eq!(answered.trim(), reply.trim());
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A planner that answers in prose instead of the JSON array it was asked
+/// for — routine for small local models — still gets the question answered:
+/// the request itself becomes the one task, and the turn reads like chat.
+#[tokio::test]
+async fn a_planner_that_answers_in_prose_still_gets_the_question_answered() {
+    let ollama = ScriptedOllama::start_with_plan(
+        "Sure! I'll answer the question about France.",
+        vec!["Paris.\nTASK COMPLETE".to_string()],
+    )
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("prose plan".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let reply = converse(&client, &session, "What is the capital of France?").await;
+    assert_eq!(reply.trim(), "Paris.", "no planning mechanics in the reply");
 
     client.disconnect().await;
     daemon.stop();
