@@ -210,6 +210,10 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
 }
 
 /// Run the daemon server (background mode)
+///
+/// A full daemon under the `nanna` executable's name, on the same PID file,
+/// store and port as `nanna-daemon`. The single-instance probe recognizes it
+/// by `nanna_daemon::health::DAEMON_MODE_FLAG` on its command line.
 pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
     use nanna_daemon::agent_service::AgentServiceConfig;
     use nanna_daemon::server::{EmbeddingConfig, LlmConfig};

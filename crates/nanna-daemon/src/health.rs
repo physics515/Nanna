@@ -32,21 +32,64 @@ use tracing::{error, info, warn};
 #[cfg(any(target_os = "linux", windows, test))]
 const DAEMON_EXE_PREFIX: &str = "nanna-daemon";
 
+/// File name of the `nanna` CLI, which runs a full daemon — same data dir,
+/// same PID file, same port — when started with [`DAEMON_MODE_FLAG`]. That is
+/// what `nanna daemon start` launches.
+#[cfg(any(target_os = "linux", windows, test))]
+const CLI_EXE_NAME: &str = "nanna";
+
+/// The flag that turns the `nanna` CLI into a daemon.
+///
+/// The probe looks for it on a `nanna` process's command line, so the CLI
+/// launches its daemon with this very constant (and a CLI test pins that clap
+/// parses it).
+pub const DAEMON_MODE_FLAG: &str = "--daemon-mode";
+
 /// What a PID recorded in the PID file refers to right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessProbe {
     /// No such process — or a zombie awaiting its parent's reap, which runs no
     /// code and holds no port, lock or database.
     Dead,
-    /// A live process whose executable is a nanna daemon.
+    /// A live nanna daemon: a `nanna-daemon` executable, or the `nanna` CLI
+    /// running [`DAEMON_MODE_FLAG`].
     Daemon,
     /// A live process running some other program: the recorded PID was reused
     /// after the daemon that wrote it died.
     Other,
     /// A live process whose identity could not be read (access denied, no
-    /// `/proc`). Treated as a daemon: a refused start is recoverable, two
-    /// daemons against one store is not.
+    /// `/proc`) — or, on Windows, a `nanna` CLI, whose command line (daemon
+    /// mode or not) the probe does not read there. Treated as a daemon: a
+    /// refused start is recoverable, two daemons against one store is not.
     Unknown,
+}
+
+/// What a PID file says about the daemon role, judged the one way
+/// [`PidFile::acquire`] and the `nanna daemon` commands both judge it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PidFileState {
+    /// No PID file.
+    Absent,
+    /// Content that is no PID: empty, torn by a death mid-write, or not a
+    /// number at all (0 included: `kill(0, 0)` addresses a process GROUP).
+    Unparseable(String),
+    /// The reader's own PID, left by an earlier process that had it: nothing
+    /// else can be running under it.
+    OwnPid(u32),
+    /// Another process's PID, and what that PID refers to right now.
+    Recorded(u32, ProcessProbe),
+}
+
+impl PidFileState {
+    /// The PID of the live daemon holding the role — `Some` exactly when
+    /// [`PidFile::acquire`] refuses.
+    #[must_use]
+    pub const fn live_daemon(&self) -> Option<u32> {
+        match *self {
+            Self::Recorded(pid, ProcessProbe::Daemon | ProcessProbe::Unknown) => Some(pid),
+            _ => None,
+        }
+    }
 }
 
 /// Single-instance guard: `nanna-daemon.pid` records the PID of THE daemon.
@@ -130,38 +173,81 @@ impl PidFile {
         }
 
         let _section = self.lock_section();
-        let own_pid = std::process::id();
 
-        match read_recorded_pid(&self.path).map_err(|e| PidFileError::Io(e.to_string()))? {
-            RecordedPid::Absent => {}
-            RecordedPid::Unparseable(content) => {
+        match self.read_state(probe)? {
+            PidFileState::Absent => {}
+            PidFileState::Unparseable(content) => {
                 info!("Replacing unparseable PID file {:?} (content: {:?})", self.path, content);
             }
-            RecordedPid::Pid(pid) if pid == own_pid => {
-                // Nothing else can be running under this process's own PID.
+            PidFileState::OwnPid(pid) => {
                 info!("PID file records this process's own PID {} (left by an earlier process that had it) — taking over", pid);
             }
-            RecordedPid::Pid(pid) => match probe(pid) {
-                ProcessProbe::Daemon => return Err(PidFileError::AlreadyRunning(pid)),
-                ProcessProbe::Unknown => {
-                    warn!("PID {} from the PID file is alive but its program could not be identified — assuming it is a daemon", pid);
-                    return Err(PidFileError::AlreadyRunning(pid));
-                }
-                ProcessProbe::Dead => {
-                    info!("Taking over stale PID file (process {} no longer exists)", pid);
-                }
-                ProcessProbe::Other => {
-                    info!("Taking over stale PID file (PID {} now belongs to a different program)", pid);
-                }
-            },
+            PidFileState::Recorded(pid, ProcessProbe::Daemon) => {
+                return Err(PidFileError::AlreadyRunning(pid));
+            }
+            PidFileState::Recorded(pid, ProcessProbe::Unknown) => {
+                warn!("PID {} from the PID file is alive but its program could not be identified — assuming it is a daemon", pid);
+                return Err(PidFileError::AlreadyRunning(pid));
+            }
+            PidFileState::Recorded(pid, ProcessProbe::Dead) => {
+                info!("Taking over stale PID file (process {} no longer exists)", pid);
+            }
+            PidFileState::Recorded(pid, ProcessProbe::Other) => {
+                info!("Taking over stale PID file (PID {} now belongs to a different program)", pid);
+            }
         }
 
+        let own_pid = std::process::id();
         std::fs::write(&self.path, own_pid.to_string())
             .map_err(|e| PidFileError::Io(e.to_string()))?;
         self.owned.store(true, Ordering::Release);
 
         info!("PID file created at {:?} (PID: {})", self.path, own_pid);
         Ok(())
+    }
+
+    /// Judge the PID file without claiming it: whether a live daemon holds the
+    /// role, decided exactly as [`Self::acquire`] decides it, with nothing
+    /// written or removed. For observers — `nanna daemon start/stop/status` —
+    /// which must not judge the file their own way: a liveness-only check
+    /// reads a PID reused by another program as a running daemon, and `stop`
+    /// would then signal it.
+    ///
+    /// # Errors
+    ///
+    /// [`PidFileError::Io`] when the existing file cannot be read.
+    pub fn state(&self) -> Result<PidFileState, PidFileError> {
+        self.state_with(probe_process)
+    }
+
+    /// [`Self::state`] with the process probe injected.
+    pub(crate) fn state_with(
+        &self,
+        probe: impl Fn(u32) -> ProcessProbe,
+    ) -> Result<PidFileState, PidFileError> {
+        // A missing directory holds no PID file, and an observer creates
+        // nothing — not even the lock file.
+        let _section = if self.path.parent().is_none_or(Path::is_dir) {
+            self.lock_section()
+        } else {
+            None
+        };
+        self.read_state(probe)
+    }
+
+    /// Read the file and probe the PID it records. The caller holds the lock
+    /// section, when there is one.
+    fn read_state(
+        &self,
+        probe: impl Fn(u32) -> ProcessProbe,
+    ) -> Result<PidFileState, PidFileError> {
+        let recorded = read_recorded_pid(&self.path).map_err(|e| PidFileError::Io(e.to_string()))?;
+        Ok(match recorded {
+            RecordedPid::Absent => PidFileState::Absent,
+            RecordedPid::Unparseable(content) => PidFileState::Unparseable(content),
+            RecordedPid::Pid(pid) if pid == std::process::id() => PidFileState::OwnPid(pid),
+            RecordedPid::Pid(pid) => PidFileState::Recorded(pid, probe(pid)),
+        })
     }
 
     /// Release the PID file — only if this handle acquired it AND the file
@@ -265,11 +351,51 @@ pub enum PidFileError {
     Io(String),
 }
 
+/// The file-name part of an executable path, under either separator.
+#[cfg(any(target_os = "linux", windows, test))]
+fn file_name(executable: &str) -> &str {
+    executable.rsplit(['/', '\\']).next().unwrap_or(executable)
+}
+
 /// True when an executable file name (or full path) names a nanna daemon.
 #[cfg(any(target_os = "linux", windows, test))]
 fn names_daemon(executable: &str) -> bool {
-    let file_name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
-    file_name.to_ascii_lowercase().starts_with(DAEMON_EXE_PREFIX)
+    file_name(executable).to_ascii_lowercase().starts_with(DAEMON_EXE_PREFIX)
+}
+
+/// True when an executable file name (or full path) names the `nanna` CLI:
+/// `nanna`, or `nanna.exe`.
+#[cfg(any(target_os = "linux", windows, test))]
+fn names_cli(executable: &str) -> bool {
+    let name = file_name(executable).to_ascii_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name) == CLI_EXE_NAME
+}
+
+/// True when a `/proc/<pid>/cmdline` — argv, each NUL-terminated — passes
+/// [`DAEMON_MODE_FLAG`]. argv\[0\] is the program, not an argument.
+#[cfg(any(target_os = "linux", test))]
+fn runs_daemon_mode(cmdline: &[u8]) -> bool {
+    cmdline
+        .split(|&byte| byte == 0)
+        .skip(1)
+        .any(|arg| arg == DAEMON_MODE_FLAG.as_bytes())
+}
+
+/// Classify a live process by its executable path alone (Windows).
+///
+/// The `nanna` CLI is a daemon only with [`DAEMON_MODE_FLAG`], and the
+/// Windows probe reads the image path, not the command line (that takes the
+/// native `NtQueryInformationProcess` API) — so a live `nanna.exe` is
+/// `Unknown`: refused, never taken over.
+#[cfg(any(windows, test))]
+fn classify_image(image: &str) -> ProcessProbe {
+    if names_daemon(image) {
+        ProcessProbe::Daemon
+    } else if names_cli(image) {
+        ProcessProbe::Unknown
+    } else {
+        ProcessProbe::Other
+    }
 }
 
 /// Split `/proc/<pid>/stat` into `(comm, state)`. `comm` is parenthesized and
@@ -291,7 +417,13 @@ fn parse_proc_stat(stat: &str) -> Option<(&str, char)> {
 /// Linux reads `/proc/<pid>/stat`, which answers liveness AND identity in one
 /// read: `comm` is the executable's file name (truncated to 15 bytes, which
 /// keeps the whole `nanna-daemon` prefix), and state `Z`/`X` marks a process
-/// that has already exited.
+/// that has already exited. A `nanna` process takes one more read: the CLI is
+/// a daemon only in daemon mode, which its command line tells.
+///
+/// Reproduced live 2026-09-21: a `nanna --daemon-mode` daemon (what `nanna
+/// daemon start` launches) held the PID file; a `nanna-daemon` probing it
+/// by name alone read "reused by another program", took the file over, was
+/// refused at the IPC bind — and, owning the file, removed it on the way out.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn probe_process(pid: u32) -> ProcessProbe {
@@ -302,10 +434,28 @@ pub fn probe_process(pid: u32) -> ProcessProbe {
         |bytes| match parse_proc_stat(&String::from_utf8_lossy(&bytes)) {
             Some((_, 'Z' | 'X')) => ProcessProbe::Dead,
             Some((comm, _)) if names_daemon(comm) => ProcessProbe::Daemon,
+            Some((comm, _)) if names_cli(comm) => probe_cli_mode(pid),
             Some(_) => ProcessProbe::Other,
             None => signal_probe(pid),
         },
     )
+}
+
+/// A live `nanna` process: a daemon when its command line passes
+/// [`DAEMON_MODE_FLAG`], any other CLI command otherwise.
+#[cfg(target_os = "linux")]
+fn probe_cli_mode(pid: u32) -> ProcessProbe {
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) if runs_daemon_mode(&cmdline) => ProcessProbe::Daemon,
+        // Empty mid-execve (the process is already named `nanna`, but its
+        // new arguments are not laid out yet) and again once it has released
+        // its memory on the way out; unreadable once it is gone. Liveness
+        // decides all three, as for an unreadable stat: a live one stays
+        // `Unknown`, refused rather than taken over.
+        Ok(cmdline) if cmdline.is_empty() => signal_probe(pid),
+        Ok(_) => ProcessProbe::Other,
+        Err(_) => signal_probe(pid),
+    }
 }
 
 /// Non-Linux Unix has no `/proc` to name the program, so a live PID is
@@ -386,10 +536,8 @@ pub fn probe_process(pid: u32) -> ProcessProbe {
             let mut len = MAX_NT_PATH_UNITS as u32;
             if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32_CODE, name.as_mut_ptr(), &mut len) == 0 {
                 ProcessProbe::Unknown
-            } else if names_daemon(&String::from_utf16_lossy(&name[..len as usize])) {
-                ProcessProbe::Daemon
             } else {
-                ProcessProbe::Other
+                classify_image(&String::from_utf16_lossy(&name[..len as usize]))
             }
         } else {
             // Signaled: the process has exited.
@@ -937,6 +1085,97 @@ mod tests {
         for name in ["nanna_daemon-4f3a", "nanna-gui", "sleep", "/opt/nanna-daemon/bin/other", ""] {
             assert!(!names_daemon(name), "{name} is not a daemon");
         }
+    }
+
+    #[test]
+    fn names_cli_matches_only_the_cli_executable() {
+        for name in [
+            "nanna",
+            "nanna.exe",
+            "NANNA.EXE",
+            "/home/me/.cargo/bin/nanna",
+            r"C:\Program Files\Nanna\nanna.exe",
+        ] {
+            assert!(names_cli(name), "{name} is the CLI");
+        }
+        // "nanna-4f3a2b…" is a cargo test binary of the CLI crate.
+        for name in ["nanna-daemon", "nanna-daemon.exe", "nanna-gui", "nanna-4f3a2b", "nannas", "anna", ".exe", ""] {
+            assert!(!names_cli(name), "{name} is not the CLI");
+        }
+    }
+
+    #[test]
+    fn runs_daemon_mode_reads_the_arguments_not_the_program() {
+        assert!(runs_daemon_mode(b"nanna\0--daemon-mode\0"));
+        // `nanna daemon start` passes host and port after the flag.
+        assert!(runs_daemon_mode(b"/usr/bin/nanna\0--daemon-mode\0--host\0localhost\0--port\0"));
+        assert!(runs_daemon_mode(b"nanna\0--log-level\0debug\0--daemon-mode\0"));
+
+        assert!(!runs_daemon_mode(b"nanna\0daemon\0status\0"));
+        assert!(!runs_daemon_mode(b"--daemon-mode\0"), "argv[0] is the program name");
+        assert!(!runs_daemon_mode(b"nanna\0--daemon-modes\0"));
+        assert!(!runs_daemon_mode(b""));
+    }
+
+    #[test]
+    fn classify_image_refuses_a_cli_whose_mode_it_cannot_read() {
+        assert_eq!(classify_image(r"C:\Nanna\nanna-daemon.exe"), ProcessProbe::Daemon);
+        // Maybe `nanna.exe --daemon-mode`: refusing is recoverable, a second
+        // daemon on one store is not.
+        assert_eq!(classify_image(r"C:\Nanna\nanna.exe"), ProcessProbe::Unknown);
+        assert_eq!(classify_image(r"C:\Windows\System32\notepad.exe"), ProcessProbe::Other);
+    }
+
+    #[test]
+    fn state_names_a_live_daemon_exactly_when_acquire_refuses() {
+        // One judgement for the daemon's own claim and for the `nanna daemon`
+        // commands: the CLI's own liveness-only check was how they drifted.
+        for probe in [ProcessProbe::Dead, ProcessProbe::Daemon, ProcessProbe::Other, ProcessProbe::Unknown] {
+            let temp_dir = TempDir::new().unwrap();
+            let pid = another_pid();
+            let pid_file = staged(&temp_dir, &pid.to_string());
+
+            let state = pid_file.state_with(|_| probe).unwrap();
+            assert_eq!(state, PidFileState::Recorded(pid, probe));
+            assert_eq!(recorded(&pid_file), pid.to_string(), "judging writes nothing");
+
+            let refused = match pid_file.acquire_with(|_| probe) {
+                Ok(()) => None,
+                Err(PidFileError::AlreadyRunning(holder)) => Some(holder),
+                Err(e) => panic!("{probe:?}: {e}"),
+            };
+            assert_eq!(state.live_daemon(), refused, "{probe:?}");
+        }
+    }
+
+    #[test]
+    fn state_without_a_recorded_pid_names_no_daemon_and_never_probes() {
+        let temp_dir = TempDir::new().unwrap();
+        let pid_file = PidFile::new(temp_dir.path());
+        assert_eq!(pid_file.state_with(unreachable_probe).unwrap(), PidFileState::Absent);
+
+        std::fs::write(pid_file.path(), "not a pid").unwrap();
+        let state = pid_file.state_with(unreachable_probe).unwrap();
+        assert_eq!(state, PidFileState::Unparseable("not a pid".to_string()));
+        assert_eq!(state.live_daemon(), None);
+
+        let own_pid = std::process::id();
+        std::fs::write(pid_file.path(), own_pid.to_string()).unwrap();
+        let state = pid_file.state_with(unreachable_probe).unwrap();
+        assert_eq!(state, PidFileState::OwnPid(own_pid));
+        assert_eq!(state.live_daemon(), None);
+        assert_eq!(recorded(&pid_file), own_pid.to_string(), "judging writes nothing");
+    }
+
+    #[test]
+    fn state_of_a_missing_data_dir_creates_nothing() {
+        // `nanna daemon status` on a machine that never ran a daemon.
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().join("never-created");
+        let pid_file = PidFile::new(&data_dir);
+
+        assert_eq!(pid_file.state_with(unreachable_probe).unwrap(), PidFileState::Absent);
+        assert!(!data_dir.exists());
     }
 
     #[tokio::test]
