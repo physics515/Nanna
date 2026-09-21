@@ -1,9 +1,18 @@
 //! `daemon` subcommand handlers and background process management.
+//!
+//! The daemon owns its single-instance PID file: it claims the file under a
+//! lock at startup and removes it on the way out. These commands only read
+//! it, judged by the daemon's own [`PidFile::state`]. They never write or
+//! delete it: a write from here ran outside the daemon's lock (and could
+//! overwrite a live daemon's record with a child about to be refused), and a
+//! liveness-only check of their own read a PID reused by another program as
+//! a running daemon, which `stop` would then signal.
 
 use crate::DaemonAction;
 use nanna_config::Config;
 use nanna_config::bind::LOOPBACK_HOST;
 use nanna_daemon::DEFAULT_IPC_PORT;
+use nanna_daemon::health::{DAEMON_MODE_FLAG, PidFile, PidFileState, ProcessProbe};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -12,18 +21,18 @@ use std::os::windows::process::CommandExt;
 
 /// Handle daemon subcommands
 pub async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> anyhow::Result<()> {
-    let pid_file = Config::default_data_dir()?.join("nanna-daemon.pid");
+    let pid_file = PidFile::new(&Config::default_data_dir()?);
 
     match action {
         DaemonAction::Start { host, port } => {
             println!("🌙 Starting Nanna daemon...\n");
-            if is_daemon_running(&pid_file) {
-                println!("⚠️  Daemon is already running");
+            if let Some(pid) = pid_file.state()?.live_daemon() {
+                println!("⚠️  Daemon is already running (PID {pid})");
                 println!("   Run 'nanna daemon status' to check details");
                 println!("   Run 'nanna daemon stop' to stop it");
                 return Ok(());
             }
-            let (pid, log_file) = spawn_daemon_process(&host, port, &pid_file)?;
+            let (pid, log_file) = spawn_daemon_process(&host, port)?;
             println!("✅ Daemon started!");
             println!("   PID: {pid}");
             println!("   Address: ws://{host}:{port}/ws");
@@ -40,17 +49,17 @@ pub async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> an
         }
         DaemonAction::Restart { host, port } => {
             println!("🌙 Restarting Nanna daemon...\n");
-            if is_daemon_running(&pid_file) {
+            if pid_file.state()?.live_daemon().is_some() {
                 println!("Stopping current daemon...");
                 stop_daemon_process(&pid_file)?;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             println!("Starting daemon...");
-            if is_daemon_running(&pid_file) {
-                println!("⚠️  Daemon is already running");
+            if let Some(pid) = pid_file.state()?.live_daemon() {
+                println!("⚠️  Daemon is already running (PID {pid})");
                 return Ok(());
             }
-            let (pid, _) = spawn_daemon_process(&host, port, &pid_file)?;
+            let (pid, _) = spawn_daemon_process(&host, port)?;
             println!("✅ Daemon restarted!");
             println!("   PID: {pid}");
             println!("   Address: ws://{host}:{port}/ws");
@@ -61,7 +70,10 @@ pub async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> an
 }
 
 /// Spawn a daemon process in the background. Returns (PID, log file path).
-fn spawn_daemon_process(host: &str, port: u16, pid_file: &std::path::Path) -> anyhow::Result<(u32, PathBuf)> {
+///
+/// The child claims the PID file itself, under the daemon's lock, once it
+/// starts — or is refused if another daemon won the role in the meantime.
+fn spawn_daemon_process(host: &str, port: u16) -> anyhow::Result<(u32, PathBuf)> {
     use std::fs;
     use std::process::{Command, Stdio};
 
@@ -79,7 +91,7 @@ fn spawn_daemon_process(host: &str, port: u16, pid_file: &std::path::Path) -> an
 
     #[cfg(windows)]
     let child = Command::new(exe)
-        .arg("--daemon-mode")
+        .arg(DAEMON_MODE_FLAG)
         .arg("--host")
         .arg(host)
         .arg("--port")
@@ -91,7 +103,7 @@ fn spawn_daemon_process(host: &str, port: u16, pid_file: &std::path::Path) -> an
 
     #[cfg(not(windows))]
     let child = Command::new(exe)
-        .arg("--daemon-mode")
+        .arg(DAEMON_MODE_FLAG)
         .arg("--host")
         .arg(host)
         .arg("--port")
@@ -100,23 +112,21 @@ fn spawn_daemon_process(host: &str, port: u16, pid_file: &std::path::Path) -> an
         .stderr(Stdio::from(log_handle))
         .spawn()?;
 
-    let pid = child.id();
-    fs::write(pid_file, pid.to_string())?;
-    Ok((pid, log_file))
+    Ok((child.id(), log_file))
 }
 
-/// Stop the daemon process identified by the PID file.
-fn stop_daemon_process(pid_file: &std::path::Path) -> anyhow::Result<()> {
-    use std::fs;
-
-    if !pid_file.exists() {
-        println!("❌ No daemon PID file found");
-        println!("   Daemon may not be running");
+/// Stop the daemon the PID file names — only a process the daemon's own probe
+/// calls a daemon: a PID since reused by another program is never signalled.
+fn stop_daemon_process(pid_file: &PidFile) -> anyhow::Result<()> {
+    let state = pid_file.state()?;
+    let Some(pid) = state.live_daemon() else {
+        println!("❌ No running daemon found");
+        match stale_note(&state) {
+            Some(note) => println!("   ({note})"),
+            None => println!("   No PID file at {}", pid_file.path().display()),
+        }
         return Ok(());
-    }
-
-    let pid_str = fs::read_to_string(pid_file)?;
-    let pid: u32 = pid_str.trim().parse()?;
+    };
 
     #[cfg(windows)]
     {
@@ -160,87 +170,65 @@ fn stop_daemon_process(pid_file: &std::path::Path) -> anyhow::Result<()> {
         }
     }
 
-    let _ = fs::remove_file(pid_file);
+    // The PID file is the daemon's to remove on its way out. One left behind
+    // by a hard kill records a dead PID, which the next start takes over.
     Ok(())
 }
 
 /// Print daemon status information.
-async fn print_daemon_status(pid_file: &std::path::Path) -> anyhow::Result<()> {
+async fn print_daemon_status(pid_file: &PidFile) -> anyhow::Result<()> {
     use nanna_client::{Client, ClientConfig};
 
     println!("🌙 Nanna Daemon Status\n");
 
-    if !pid_file.exists() {
-        println!("   Status: Not running");
+    let state = pid_file.state()?;
+    let Some(pid) = state.live_daemon() else {
+        match stale_note(&state) {
+            Some(note) => println!("   Status: ❌ Not running ({note})"),
+            None => println!("   Status: Not running"),
+        }
         println!("   Start with: nanna daemon start");
         return Ok(());
+    };
+
+    println!("   Status: ✅ Running");
+    println!("   PID: {pid}");
+    if matches!(state, PidFileState::Recorded(_, ProcessProbe::Unknown)) {
+        println!("   (alive, but its program could not be identified — treated as the daemon)");
     }
 
-    let pid_str = std::fs::read_to_string(pid_file)?;
-    let pid: u32 = pid_str.trim().parse()?;
-    let is_running = is_process_alive(pid);
-
-    if is_running {
-        println!("   Status: ✅ Running");
-        println!("   PID: {pid}");
-
-        // Same constant `daemon start` binds, so status can never probe a different port
-        // than the one the daemon was launched on — which is exactly what used to happen.
-        let address = format!("ws://{LOOPBACK_HOST}:{DEFAULT_IPC_PORT}");
-        let client_config = ClientConfig::new(&address);
-        if let Ok(Ok(_)) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            Client::connect(client_config)
-        ).await {
-            println!("   Connection: ✅ Healthy");
-            println!("   Address: {address}");
-        } else {
-            println!("   Connection: ⚠️  Not responding");
-            println!("   (Daemon may be starting up or misconfigured)");
-        }
+    // Same constant `daemon start` binds, so status can never probe a different port
+    // than the one the daemon was launched on — which is exactly what used to happen.
+    let address = format!("ws://{LOOPBACK_HOST}:{DEFAULT_IPC_PORT}");
+    let client_config = ClientConfig::new(&address);
+    if let Ok(Ok(_)) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        Client::connect(client_config)
+    ).await {
+        println!("   Connection: ✅ Healthy");
+        println!("   Address: {address}");
     } else {
-        println!("   Status: ❌ Not running (stale PID file)");
-        println!("   Cleaning up...");
-        let _ = std::fs::remove_file(pid_file);
-        println!("   Start with: nanna daemon start");
+        println!("   Connection: ⚠️  Not responding");
+        println!("   (Daemon may be starting up or misconfigured)");
     }
     Ok(())
 }
 
-/// Check if daemon is running based on PID file
-fn is_daemon_running(pid_file: &PathBuf) -> bool {
-    if !pid_file.exists() {
-        return false;
-    }
-
-    if let Ok(pid_str) = std::fs::read_to_string(pid_file)
-        && let Ok(pid) = pid_str.trim().parse::<u32>() {
-            return is_process_alive(pid);
+/// Why a PID file that names no live daemon is stale; `None` when there is no
+/// file, or when it does name a live daemon. A stale file is left in place:
+/// the next daemon to start takes it over under the daemon's lock.
+fn stale_note(state: &PidFileState) -> Option<String> {
+    match state {
+        PidFileState::Unparseable(content) => {
+            Some(format!("stale PID file: it holds no PID ({content:?})"))
         }
-
-    false
-}
-
-/// Check if a process with given PID is alive
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        use std::process::Command;
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
-            .is_ok_and(|output| {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout.contains(&pid.to_string())
-            })
-    }
-
-    #[cfg(not(windows))]
-    {
-        // A value beyond `pid_t` cannot name a running process.
-        libc::pid_t::try_from(pid).is_ok_and(|target| {
-            // SAFETY: kill(2) with signal 0 checks process existence without sending a signal
-            unsafe { libc::kill(target, 0) == 0 }
-        })
+        PidFileState::OwnPid(pid) | PidFileState::Recorded(pid, ProcessProbe::Dead) => {
+            Some(format!("stale PID file: process {pid} has exited"))
+        }
+        PidFileState::Recorded(pid, ProcessProbe::Other) => {
+            Some(format!("stale PID file: PID {pid} now belongs to another program"))
+        }
+        PidFileState::Absent
+        | PidFileState::Recorded(_, ProcessProbe::Daemon | ProcessProbe::Unknown) => None,
     }
 }

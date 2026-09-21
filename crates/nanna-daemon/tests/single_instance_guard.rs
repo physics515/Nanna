@@ -68,7 +68,9 @@ async fn run_refuses_a_held_ipc_port_before_touching_storage() {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use nanna_daemon::health::{probe_process, PidFile, PidFileError, ProcessProbe};
+    use nanna_daemon::health::{
+        probe_process, PidFile, PidFileError, PidFileState, ProcessProbe, DAEMON_MODE_FLAG,
+    };
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Child, Command};
@@ -87,9 +89,9 @@ mod linux {
     }
 
     /// A long-lived process whose executable FILE is named `name`: a copy of
-    /// `sleep`. The kernel names a process (`comm`) after the executed file,
-    /// while argv[0] stays `sleep` so multi-call coreutils builds still
-    /// dispatch.
+    /// a system program. The kernel names a process (`comm`) after the
+    /// executed file, while argv[0] stays the program's own name so
+    /// multi-call builds (coreutils, busybox) still dispatch.
     ///
     /// The kernel renames the task late in `execve`, AFTER the point where
     /// `spawn` returns: glibc's `posix_spawn` resumes the parent once the
@@ -102,19 +104,39 @@ mod linux {
     }
 
     impl Staged {
+        /// `sleep 600`, named `name`.
         fn spawn(name: &str) -> Self {
+            Self::spawn_program("sleep", name, &["600"])
+        }
+
+        /// The `nanna` CLI with `args` on its command line: a shell copied to
+        /// a file named `nanna`, which stops itself (`kill -STOP $$` — a
+        /// builtin, so no child ever takes over the name) until it is killed.
+        fn spawn_cli(args: &[&str]) -> Self {
+            let mut shell_args = vec!["-c", "kill -STOP $$", "sh"];
+            shell_args.extend_from_slice(args);
+            let cli = Self::spawn_program("sh", "nanna", &shell_args);
+            // The rename comes before execve lays out the new argv, so right
+            // after it `/proc/<pid>/cmdline` can still read empty (the probe
+            // then falls back to liveness: `Unknown`). Stopped = the shell ran
+            // its script, so the exec, argv included, is long finished.
+            wait_for_proc(cli.pid(), "stopped itself", |_, state| state == 'T');
+            cli
+        }
+
+        fn spawn_program(program: &str, name: &str, args: &[&str]) -> Self {
             // Beside the build output, which is executable by construction
             // (a system temp dir may be mounted noexec).
             let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
             let exe = dir.path().join(name);
-            std::fs::copy(find_on_path("sleep"), &exe).unwrap();
+            std::fs::copy(find_on_path(program), &exe).unwrap();
 
             // Executing a just-written binary fails with ETXTBSY while a
             // sibling test thread's fork still holds the copy's descriptor
             // (until that child execs) — transient by construction.
             let deadline = Instant::now() + SETTLE_CEILING;
             let child = loop {
-                match Command::new(&exe).arg0("sleep").arg("600").spawn() {
+                match Command::new(&exe).arg0(program).args(args).spawn() {
                     Ok(child) => break child,
                     Err(e)
                         if e.kind() == std::io::ErrorKind::ExecutableFileBusy
@@ -268,5 +290,45 @@ mod linux {
         assert!(matches!(result, Err(DaemonError::AlreadyRunning)), "got {result:?}");
         assert_refused_before_storage(data_dir.path());
         assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), daemon.pid().to_string());
+    }
+
+    #[test]
+    fn probe_names_the_cli_a_daemon_only_in_daemon_mode() {
+        // `nanna daemon start` runs the daemon as `nanna --daemon-mode`: the
+        // `nanna` executable, not `nanna-daemon`.
+        let legacy = Staged::spawn_cli(&[DAEMON_MODE_FLAG, "--port", "5149"]);
+        assert_eq!(probe_process(legacy.pid()), ProcessProbe::Daemon);
+
+        // Any other `nanna` command holding a reused PID is just a program.
+        let cli = Staged::spawn_cli(&["daemon", "status"]);
+        assert_eq!(probe_process(cli.pid()), ProcessProbe::Other);
+    }
+
+    #[tokio::test]
+    async fn run_refuses_a_live_cli_daemon_and_leaves_its_pid_file() {
+        // Reproduced live 2026-09-21: `nanna --daemon-mode` held the PID file
+        // and the IPC port. A `nanna-daemon` read its PID as "reused by
+        // another program", took the file over, was refused at the IPC bind —
+        // and, owning the file by then, removed it on the way out, leaving the
+        // live daemon unguarded for every later start.
+        let legacy = Staged::spawn_cli(&[DAEMON_MODE_FLAG]);
+        let data_dir = tempfile::tempdir().unwrap();
+        let pid_path = data_dir.path().join("nanna-daemon.pid");
+        std::fs::write(&pid_path, legacy.pid().to_string()).unwrap();
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+
+        let mut duplicate = hermetic_daemon(data_dir.path(), port);
+        let result = duplicate.run().await;
+        drop(duplicate);
+
+        assert!(matches!(result, Err(DaemonError::AlreadyRunning)), "got {result:?}");
+        assert_refused_before_storage(data_dir.path());
+        assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), legacy.pid().to_string());
+
+        // `nanna daemon status/stop` judge the file the same way.
+        let state = PidFile::new(data_dir.path()).state().unwrap();
+        assert_eq!(state, PidFileState::Recorded(legacy.pid(), ProcessProbe::Daemon));
+        assert_eq!(state.live_daemon(), Some(legacy.pid()));
     }
 }

@@ -491,6 +491,18 @@ mod tests {
         );
     }
 
+    /// `nanna daemon start` launches `nanna <DAEMON_MODE_FLAG>`, and the
+    /// daemon's single-instance probe tells that legacy daemon from any other
+    /// `nanna` command by the same flag on its command line — so the constant
+    /// must be exactly the flag clap parses.
+    #[test]
+    fn the_daemon_mode_flag_the_probe_looks_for_is_the_one_clap_parses() {
+        let cli = Cli::try_parse_from(["nanna", nanna_daemon::health::DAEMON_MODE_FLAG])
+            .expect("the daemon-mode flag parses");
+        assert!(cli.daemon_mode);
+        assert!(!Cli::try_parse_from(["nanna"]).expect("bare `nanna` parses").daemon_mode);
+    }
+
     /// `doctor` stays offline unless asked: the network leg is opt-in.
     #[test]
     fn doctor_is_offline_unless_asked() {
