@@ -231,6 +231,46 @@ async fn ask(deps: &AskUserDeps, params: &Value) -> Result<Value, String> {
     }
 }
 
+/// Put `question` to the user of `session_id` and wait for the reply.
+///
+/// The wait is the default [`ASK_USER_WAIT_SECS_DEFAULT`], on the same path the
+/// `ask_user` tool takes, for callers inside the daemon (an MCP server's
+/// elicitation). `None` when nothing came back: no such conversation, no
+/// live turn to take the reply from, or no reply in time.
+pub async fn ask_in_conversation(
+    deps: &AskUserDeps,
+    session_id: &str,
+    question: &str,
+) -> Option<String> {
+    let params = json!({ "session_id": session_id, "question": question });
+    match ask(deps, &params).await {
+        Ok(outcome) if outcome["answered"] == json!(true) => {
+            outcome["answer"].as_str().map(str::to_string)
+        }
+        Ok(_) => None,
+        Err(reason) => {
+            tracing::warn!("could not put a question to the user: {reason}");
+            None
+        }
+    }
+}
+
+/// An MCP server's form elicitation, put to the user through `ask_user` in
+/// the conversation whose turn made the tool call.
+pub struct McpAskUser {
+    pub deps: AskUserDeps,
+}
+
+#[async_trait::async_trait]
+impl nanna_mcp::Elicitor for McpAskUser {
+    async fn ask(&self, question: &str) -> Option<String> {
+        // The tool call runs on its turn's own task, which carries the
+        // conversation; a call from outside a turn has no one to ask.
+        let session_id = nanna_tools::ToolRegistry::run_session_id()?;
+        ask_in_conversation(&self.deps, &session_id, question).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +352,43 @@ mod tests {
             events.try_recv(),
             Ok(Event::SessionMessageAdded { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn an_mcp_elicitation_is_asked_in_the_calling_turns_conversation() {
+        use nanna_mcp::Elicitor as _;
+        let (deps, _events) = deps();
+        let session = deps.sessions.create(None).await;
+        assert!(
+            deps.chat_runs.try_claim(&session.id).await,
+            "a turn is live"
+        );
+        let pending = deps.chat_runs.pending_for(&session.id).await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            pending.push("teal".to_string()).await;
+        });
+        let asker = McpAskUser { deps: deps.clone() };
+        let answer = nanna_tools::ToolRegistry::with_run_session(
+            session.id.clone(),
+            asker.ask("The MCP server `paint` asks: Favorite color?"),
+        )
+        .await;
+        assert_eq!(answer.as_deref(), Some("teal"));
+        let stored = deps.sessions.get(&session.id).await.expect("session");
+        assert!(
+            stored
+                .messages
+                .last()
+                .expect("question")
+                .content
+                .contains("Favorite color?"),
+            "the question is in the conversation"
+        );
+
+        // Outside any turn there is no conversation to ask in: no answer, and
+        // nothing is posted anywhere.
+        assert_eq!(asker.ask("orphan question").await, None);
     }
 
     #[tokio::test]

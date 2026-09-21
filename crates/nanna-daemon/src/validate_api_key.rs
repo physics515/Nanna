@@ -1,7 +1,7 @@
 //! Live validation of a provider API key the user just typed.
 //!
 //! One minimal, cheap, read-only request per provider — a `GET` of the
-//! model catalogue (or, for OpenRouter, the key's own info endpoint) — sent
+//! model catalogue (or, for `OpenRouter`, the key's own info endpoint) — sent
 //! with the key **as supplied by the caller**. This module never reads the
 //! keyring and never persists anything: it answers the single question
 //! "does this string open the door?", so onboarding and Settings can say so
@@ -93,8 +93,9 @@ impl KeyVerdict {
     }
 }
 
-/// How long one validation may take, connect and answer together. The
-/// catalogue endpoints answer in well under a second; 8 s covers a slow
+/// How long one validation may take, connect and answer together.
+///
+/// The catalogue endpoints answer in well under a second; 8 s covers a slow
 /// first TLS handshake without letting a black-holed host pin the
 /// onboarding wizard.
 pub const VALIDATE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -104,7 +105,9 @@ pub const VALIDATE_TIMEOUT: Duration = Duration::from_secs(8);
 /// recognise.
 const REASON_BODY_MAX: usize = 512;
 
-/// Classify an HTTP answer. Pure — the whole verdict table lives here.
+/// Classify an HTTP answer.
+///
+/// Pure — the whole verdict table lives here.
 ///
 /// * `2xx` → valid.
 /// * `401` / `403` → invalid: the provider read the credential and said no.
@@ -119,24 +122,24 @@ const REASON_BODY_MAX: usize = 512;
 pub fn classify_status(status: u16, body: &str) -> KeyVerdict {
     let detail = body_detail(body);
     match status {
-        200..=299 => KeyVerdict::Valid,
+        // 429 counts as valid: see the table above.
+        200..=299 | 429 => KeyVerdict::Valid,
         401 | 403 => KeyVerdict::Invalid {
             reason: with_detail(
                 format!("the provider rejected this key (HTTP {status})"),
-                &detail,
+                detail.as_ref(),
             ),
         },
-        429 => KeyVerdict::Valid,
         500..=599 => KeyVerdict::Unreachable {
             reason: with_detail(
                 format!("the provider is having trouble (HTTP {status}); the key was not checked"),
-                &detail,
+                detail.as_ref(),
             ),
         },
         other => KeyVerdict::Unreachable {
             reason: with_detail(
                 format!("unexpected answer from the provider (HTTP {other}); the key was not checked"),
-                &detail,
+                detail.as_ref(),
             ),
         },
     }
@@ -191,7 +194,7 @@ fn body_detail(body: &str) -> Option<String> {
     Some(truncate_chars(&one_line, REASON_BODY_MAX))
 }
 
-fn with_detail(base: String, detail: &Option<String>) -> String {
+fn with_detail(base: String, detail: Option<&String>) -> String {
     match detail {
         Some(detail) => format!("{base}: {detail}"),
         None => base,
@@ -290,9 +293,10 @@ async fn read_bounded_body(mut response: reqwest::Response) -> String {
     String::from_utf8_lossy(&collected).into_owned()
 }
 
-/// The `system.validate_api_key` handler body: parse the provider name a
-/// client sent, run the one probe under the default timeout, and shape the
-/// wire answer. A provider name this cannot check (`ollama` — keyless — or a
+/// The `system.validate_api_key` handler body.
+///
+/// Parse the provider name a client sent, run the one probe under the
+/// default timeout, and shape the wire answer. A provider name this cannot check (`ollama` — keyless — or a
 /// typo) is answered as an `unreachable` verdict naming the accepted names,
 /// not as a network attempt: there is no endpoint to ask, and the caller
 /// needs to know the request itself was wrong.

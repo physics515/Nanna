@@ -192,9 +192,16 @@ enum McpAction {
     /// stdout carries the protocol, so all logging goes to stderr.
     Serve {
         /// Directory of JS/TS tool skills (default: `[tools] tools_dir`,
-        /// `NANNA_TOOLS_DIR`, or the dev tree)
+        /// `NANNA_TOOLS_DIR`, or the dev tree) — used by the standalone surface
         #[arg(long)]
         tools_dir: Option<std::path::PathBuf>,
+        /// Serve the locally loaded skills even if a daemon is running
+        #[arg(long)]
+        standalone: bool,
+        /// The daemon's IPC address (default: the local daemon); naming one
+        /// makes its absence an error instead of a fallback
+        #[arg(long)]
+        daemon: Option<String>,
     },
 
     /// Store or remove a secret an MCP server gets as an environment variable
@@ -323,7 +330,11 @@ fn init_logging(log_level: Level, logs_to_stderr: bool) {
 /// `nanna mcp …`.
 async fn run_mcp(config: &Config, action: McpAction) -> anyhow::Result<()> {
     match action {
-        McpAction::Serve { tools_dir } => commands::mcp::serve(config, tools_dir).await,
+        McpAction::Serve {
+            tools_dir,
+            standalone,
+            daemon,
+        } => commands::mcp::serve(config, tools_dir, standalone, daemon).await,
         McpAction::Secret { action } => match action {
             McpSecretAction::Set { server, var } => commands::mcp::secret_set(config, &server, &var),
             McpSecretAction::Delete { server, var } => commands::mcp::secret_delete(&server, &var),

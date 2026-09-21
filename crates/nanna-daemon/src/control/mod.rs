@@ -43,6 +43,7 @@ mod workspace;
 #[cfg(test)]
 mod tests;
 
+
 /// The control plane provides unified access to all daemon functionality
 pub struct ControlPlane {
     pub(crate) sessions: Arc<SessionManager>,
@@ -134,6 +135,15 @@ pub struct ControlPlane {
     degradations: Option<Arc<nanna_agent::DegradationLedger>>,
     /// Per-server MCP state from the boot task; `None` outside a daemon.
     mcp_status: Option<crate::mcp_startup::McpStatus>,
+    /// The running embedding clients' side of a config change: every
+    /// committed change is applied to it, so a token saved while the daemon
+    /// runs reaches the embedder. `None` outside a daemon.
+    live_embedding: Option<Arc<crate::embedding_reload::LiveEmbeddingSettings>>,
+    /// Where config reloads and `config.set` read the saved secrets from: the
+    /// OS keyring with its encrypted-file fallback. A field, not a
+    /// `SecureStore::new()` at each use, so a test can hand the control plane
+    /// a store of its own instead of the machine's keyring.
+    pub(crate) credential_store: nanna_config::SecureStore,
 }
 
 impl ControlPlane {
@@ -175,6 +185,8 @@ impl ControlPlane {
             shutdown_tx: None,
             degradations: None,
             mcp_status: None,
+            live_embedding: None,
+            credential_store: nanna_config::SecureStore::new(),
         }
     }
 
@@ -240,6 +252,8 @@ impl ControlPlane {
             shutdown_tx: None,
             degradations: None,
             mcp_status: None,
+            live_embedding: None,
+            credential_store: nanna_config::SecureStore::new(),
         }
     }
 
@@ -307,6 +321,8 @@ impl ControlPlane {
             shutdown_tx: None,
             degradations: None,
             mcp_status: None,
+            live_embedding: None,
+            credential_store: nanna_config::SecureStore::new(),
         }
     }
 
@@ -426,6 +442,17 @@ impl ControlPlane {
     /// A new receiver on the daemon event bus, if one is attached.
     pub fn subscribe_events(&self) -> Option<tokio::sync::broadcast::Receiver<Event>> {
         self.event_tx.as_ref().map(tokio::sync::broadcast::Sender::subscribe)
+    }
+
+    /// Share the daemon's live embedding settings, so config changes reach
+    /// the embedding clients the router was built with.
+    #[must_use]
+    pub fn with_live_embedding(
+        mut self,
+        live: Arc<crate::embedding_reload::LiveEmbeddingSettings>,
+    ) -> Self {
+        self.live_embedding = Some(live);
+        self
     }
 
     /// Attach the MCP boot task's per-server state.

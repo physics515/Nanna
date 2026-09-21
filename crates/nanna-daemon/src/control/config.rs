@@ -28,21 +28,15 @@ impl ControlPlane {
         );
     }
 
-    /// Tell every connected client the config changed.
-    ///
-    /// Carries no payload — see [`Event::ConfigChanged`]. Fired once per
-    /// COMMITTED mutation (the in-memory config was replaced and the router
-    /// re-derived); a rejected write emits nothing. Fire-and-forget: a send
-    /// error only means nobody is subscribed.
     /// Make `new_config` the running configuration and push it everywhere a
-    /// live change must reach: the agent, the router, the scheduler loop, and
-    /// every client (`config_changed`).
+    /// live change must reach: the agent, then [`Self::propagate_committed`].
     ///
     /// This is the reload the GUI triggers after saving a credential — the step
     /// that makes a post-boot login actually reach the router. The Scheduler
     /// tab rides the same hop, and so does a hand edit of `config.toml` (see
     /// `config_watch`). What it does NOT re-apply is anything wired only at
-    /// boot (channels, MCP servers, the webhook server).
+    /// boot (channels, MCP servers, the webhook server, and the embedding
+    /// server and models — see `embedding_reload`).
     pub(super) async fn apply_loaded_config(&self, new_config: Config) {
         let mut config = self.config.write().await;
         *config = new_config;
@@ -52,11 +46,36 @@ impl ControlPlane {
         }
         let snapshot = config.clone();
         drop(config);
-        self.rebuild_llm_providers(&snapshot).await;
-        self.apply_scheduler_settings(&snapshot).await;
+        self.propagate_committed(&snapshot).await;
+    }
+
+    /// Push a committed config to everything that holds live settings — the
+    /// LLM router's provider set, the scheduler loop, the embedding clients'
+    /// Ollama token — and then tell every client.
+    ///
+    /// The one tail every mutation path (set, reset, reload, import, the file
+    /// watcher) shares, so a live setting cannot reach one path and miss
+    /// another. The Ollama token did exactly that: every path pushed it to the
+    /// chat router, none to the embedder, so a server that wanted the token
+    /// refused every memory embed until a restart.
+    ///
+    /// Called with the config lock released: provider resolution can block on
+    /// the keyring or refresh an expired Claude CLI token over the network.
+    async fn propagate_committed(&self, config: &Config) {
+        self.rebuild_llm_providers(config).await;
+        self.apply_scheduler_settings(config).await;
+        if let Some(ref live) = self.live_embedding {
+            live.apply(config);
+        }
         self.notify_config_changed();
     }
 
+    /// Tell every connected client the config changed.
+    ///
+    /// Carries no payload — see [`Event::ConfigChanged`]. Fired once per
+    /// COMMITTED mutation (the in-memory config was replaced and the router
+    /// re-derived); a rejected write emits nothing. Fire-and-forget: a send
+    /// error only means nobody is subscribed.
     pub(super) fn notify_config_changed(&self) {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(Event::ConfigChanged);
@@ -117,6 +136,7 @@ impl ControlPlane {
                     // Reset specific path - would need more complex logic
                     json!({ "error": "partial_reset_not_supported", "hint": "Use Reset without path to reset all" })
                 } else {
+                    let previous_ollama_host = config.memory.ollama_host.clone();
                     *config = Config::default().with_env_overrides();
 
                     // Save to disk
@@ -133,22 +153,18 @@ impl ControlPlane {
 
                     let snapshot = config.clone();
                     drop(config);
-                    self.rebuild_llm_providers(&snapshot).await;
-                    self.apply_scheduler_settings(&snapshot).await;
-                    self.notify_config_changed();
+                    // The reset moves the Ollama address like a `config.set`
+                    // of it: a token saved with no server recorded was the
+                    // old address's.
+                    let snapshot = self
+                        .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
+                        .await;
+                    self.propagate_committed(&snapshot).await;
 
                     json!({ "status": "reset" })
                 }
             }
-            ConfigAction::Reload => {
-                match Config::load() {
-                    Ok(new_config) => {
-                        self.apply_loaded_config(new_config.with_env_overrides()).await;
-                        json!({ "status": "reloaded" })
-                    }
-                    Err(e) => json!({ "error": "reload_failed", "message": e.to_string() })
-                }
-            }
+            ConfigAction::Reload => self.config_reload().await,
             ConfigAction::Export => {
                 let config = self.config.read().await;
                 // Export as JSON (TOML export would require additional dependencies)
@@ -165,6 +181,7 @@ impl ControlPlane {
                 match new_config {
                     Ok(cfg) => {
                         let mut config = self.config.write().await;
+                        let previous_ollama_host = config.memory.ollama_host.clone();
                         *config = cfg.with_env_overrides();
                         
                         // Save to disk
@@ -184,9 +201,11 @@ impl ControlPlane {
 
                         let snapshot = config.clone();
                         drop(config);
-                        self.rebuild_llm_providers(&snapshot).await;
-                        self.apply_scheduler_settings(&snapshot).await;
-                        self.notify_config_changed();
+                        // As for a reset: the address may have moved.
+                        let snapshot = self
+                            .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
+                            .await;
+                        self.propagate_committed(&snapshot).await;
 
                         json!({ "status": "imported" })
                     }
@@ -196,8 +215,34 @@ impl ControlPlane {
         }
     }
 
+    /// `ConfigAction::Reload`: load `config.toml` again and apply it live.
+    ///
+    /// Loaded as the replacement for what is running, so a token saved with
+    /// no server recorded stays the running server's rather than following an
+    /// address edited in the file. Off the async runtime: keyring reads can
+    /// block on an unlock prompt.
+    async fn config_reload(&self) -> Value {
+        let running_host = self.config.read().await.memory.ollama_host.clone();
+        let store = self.credential_store.clone();
+        let loaded =
+            tokio::task::spawn_blocking(move || Config::load_replacing(&running_host, &store))
+                .await;
+        match loaded {
+            Ok(Ok(new_config)) => {
+                self.apply_loaded_config(new_config.with_env_overrides())
+                    .await;
+                json!({ "status": "reloaded" })
+            }
+            Ok(Err(e)) => json!({ "error": "reload_failed", "message": e.to_string() }),
+            Err(e) => json!({ "error": "reload_failed", "message": e.to_string() }),
+        }
+    }
+
     /// `ConfigAction::Set`: write one dotted path, persist, and propagate the change live.
     async fn config_set(&self, path: String, value: Value) -> Value {
+        if let Some(instead) = retired_key_set(&path, &value) {
+            return json!({ "error": "retired_key", "message": instead, "path": path });
+        }
         let mut config = self.config.write().await;
         let mut config_value = match serde_json::to_value(&*config) {
             Ok(v) => v,
@@ -216,7 +261,21 @@ impl ControlPlane {
 
         // Deserialize back to config
         match serde_json::from_value::<Config>(config_value) {
-            Ok(new_config) => {
+            Ok(mut new_config) => {
+                // The Ollama token is bound to the server it was saved for;
+                // edited in place, the config would carry the old server's
+                // token to a new `memory.ollama_host`. Dropped here, under the
+                // lock, so nothing ever reads it paired with the new address;
+                // which token the new address gets is read from the secure
+                // store below, once the lock is released.
+                let previous_ollama_host = config.memory.ollama_host.clone();
+                let ollama_moved = nanna_config::ollama_server_changed(
+                    &previous_ollama_host,
+                    &new_config.memory.ollama_host,
+                );
+                if ollama_moved {
+                    new_config.llm.ollama_api_key = None;
+                }
                 *config = new_config;
 
                 // Save to disk if we have a path
@@ -240,19 +299,106 @@ impl ControlPlane {
                 }
 
                 // Re-derive the router's provider set (registration is
-                // not boot-only). Lock released first: resolution can
-                // block on keyring/network.
+                // not boot-only) and the rest of the live settings. Lock
+                // released first: resolution can block on keyring/network.
                 let snapshot = config.clone();
                 drop(config);
-                self.rebuild_llm_providers(&snapshot).await;
-                self.apply_scheduler_settings(&snapshot).await;
-                self.notify_config_changed();
+                let snapshot = self
+                    .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
+                    .await;
+                self.propagate_committed(&snapshot).await;
 
                 json!({ "status": "updated", "path": path })
             }
             Err(e) => json!({ "error": "invalid_config", "message": e.to_string() })
         }
     }
+
+    /// After a `config.set`, reset or import that may have moved
+    /// `[memory].ollama_host` away from `previous_host`, give the running
+    /// config the token the new address is owed, if any, and return
+    /// `changed` as the rest of the change should propagate it.
+    ///
+    /// Nothing to do when the address did not move, or when the new config
+    /// names a token of its own (an imported one — the operator's say-so, as
+    /// a token written into `config.toml` is). Read with no config lock held,
+    /// because keyring reads can block on an unlock prompt. A stored token
+    /// with no recorded server was `previous_host`'s, and is recorded as such
+    /// (see `Config::rebind_ollama_token_if_moved`). The token only lands if
+    /// the address is still the one it was resolved for: a change that moved
+    /// it again meanwhile resolves its own.
+    async fn adopt_moved_ollama_token(&self, previous_host: &str, changed: Config) -> Config {
+        let names_its_own = changed
+            .llm
+            .ollama_api_key
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        if names_its_own
+            || !nanna_config::ollama_server_changed(previous_host, &changed.memory.ollama_host)
+        {
+            return changed;
+        }
+        let store = self.credential_store.clone();
+        let previous_host = previous_host.to_string();
+        let mut resolved = changed.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            resolved.rebind_ollama_token_if_moved(&previous_host, &store);
+            resolved
+        })
+        .await;
+        let token = match resolved {
+            Ok(resolved) => resolved.llm.ollama_api_key,
+            Err(e) => {
+                warn!("Resolving the Ollama token for the new address failed: {e}");
+                None
+            }
+        };
+        let Some(token) = token else {
+            return changed;
+        };
+        let mut config = self.config.write().await;
+        if nanna_config::same_ollama_server(&config.memory.ollama_host, &changed.memory.ollama_host)
+            && config.llm.ollama_api_key.is_none()
+        {
+            config.llm.ollama_api_key = Some(token);
+        }
+        config.clone()
+    }
+}
+
+/// Keys the daemon once read and no longer does, each with the sentence
+/// saying what replaced it.
+///
+/// A `config.set` of one would answer `updated` and change nothing: serde
+/// drops an unknown key on the round trip, and the next save removes it from
+/// disk. Refusing it by name is how a script that used it learns it stopped
+/// working.
+const RETIRED_KEYS: [(&str, &str); 1] = [(
+    "llm.ollama_url",
+    "[llm].ollama_url is no longer read: summaries go through chat's router, so an \
+     `ollama/` summarization model uses chat's one Ollama server and its token. Set \
+     memory.ollama_host to move it.",
+)];
+
+/// What replaced the retired key a `set` of `value` at `path` would write, or
+/// `None` when it writes none.
+///
+/// Either the key's own path, or a parent of it given an object that carries
+/// the key (`llm` with `{"ollama_url": …}`): the round trip drops the key the
+/// same way in both, so both are refused the same way.
+fn retired_key_set(path: &str, value: &Value) -> Option<&'static str> {
+    RETIRED_KEYS.iter().find_map(|(key, instead)| {
+        let written = *key == path
+            || key
+                .strip_prefix(path)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|rest| {
+                    rest.split('.')
+                        .try_fold(value, |node, part| node.get(part))
+                        .is_some()
+                });
+        written.then_some(*instead)
+    })
 }
 
 /// Set `value` at the dotted `parts` path inside `obj`, creating intermediate

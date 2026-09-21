@@ -55,46 +55,40 @@ impl Default for CompressionConfig {
     }
 }
 
-/// Compress text by scoring sentences and dropping low-importance ones.
-///
-/// Returns the compressed text, or `None` if compression failed or wasn't worthwhile.
-pub async fn compress_text(
-    client: &LlmClient,
-    model: &str,
-    content: &str,
-    target_ratio: usize,
-) -> Option<String> {
-    compress_text_with_config(
-        client,
-        model,
-        content,
-        &CompressionConfig {
-            ratio: target_ratio.max(1),
-            ..CompressionConfig::default()
-        },
-    )
-    .await
+/// What one model's scoring made of the content.
+#[derive(Debug)]
+enum Attempt {
+    /// A reduction to hand back.
+    Reduced(String),
+    /// The model answered, but not with one score per sentence — nothing,
+    /// prose, too few or too many lines. Its answer selects nothing, so the
+    /// next model is asked, and the mechanical reduction is the walk's last
+    /// resort once none scores.
+    Unscored,
+    /// Nothing came of it: the content is not worth compressing, or the call
+    /// failed.
+    Nothing,
 }
 
-/// Compress text using an explicit [`CompressionConfig`].
-pub async fn compress_text_with_config(
+/// Ask one model to score `content`'s sentences and keep the best of them.
+async fn score_and_select(
     client: &LlmClient,
     model: &str,
     content: &str,
     config: &CompressionConfig,
-) -> Option<String> {
+) -> Attempt {
     if content.len() < config.min_content_length {
-        return None;
+        return Attempt::Nothing;
     }
 
     let sentences = split_sentences(content);
     if sentences.len() < config.min_sentences {
-        return None;
+        return Attempt::Nothing;
     }
 
     let target_count = sentences.len() / config.ratio.max(1);
     if target_count < 2 {
-        return None;
+        return Attempt::Nothing;
     }
 
     let model_cache = nanna_llm::ModelInfoCache::default_location();
@@ -108,7 +102,7 @@ pub async fn compress_text_with_config(
             max_tokens, reason, model = %model,
             "Skipping the scoring round-trip and reducing by whole lines"
         );
-        return elide_by_lines(content, config.ratio);
+        return elide_by_lines(content, config.ratio).map_or(Attempt::Nothing, Attempt::Reduced);
     }
 
     let request = scoring_request(model, &sentences, max_tokens);
@@ -116,7 +110,7 @@ pub async fn compress_text_with_config(
         Ok(r) => r,
         Err(e) => {
             debug!(error = %e, model = %model, "Compression scoring failed");
-            return None;
+            return Attempt::Nothing;
         }
     };
 
@@ -126,9 +120,9 @@ pub async fn compress_text_with_config(
             expected = sentences.len(),
             got = scores.len(),
             model = %model,
-            "Score count mismatch, falling back to head/tail reduction"
+            "Score count mismatch: this model's answer selects nothing"
         );
-        return elide_by_lines(content, config.ratio);
+        return Attempt::Unscored;
     }
 
     let keep_count = target_count.max(2).min(sentences.len());
@@ -138,7 +132,7 @@ pub async fn compress_text_with_config(
     let original_len = content.len();
     let compressed_len = compressed.len();
     if compressed_len == 0 || compressed_len >= original_len {
-        return None;
+        return Attempt::Nothing;
     }
     let actual_ratio = original_len / compressed_len.max(1);
 
@@ -152,7 +146,7 @@ pub async fn compress_text_with_config(
         "🗜️ LLMLingua compression: {original_len} → {compressed_len} chars ({actual_ratio}x)"
     );
 
-    Some(compressed)
+    Attempt::Reduced(compressed)
 }
 
 /// The scoring round-trip: every sentence numbered, one score per line asked
@@ -227,16 +221,28 @@ fn join_survivors(sentences: &[&str], keep_indices: &[usize]) -> String {
     compressed.trim_end().to_string()
 }
 
-/// Try each summarization model in priority order.
+/// Compress `content` with the summarization models, walking `models` in the
+/// order given (the Settings order).
 ///
-/// Walks `models` with the supplied client factory. The factory should map a
-/// settings model spec (`"ollama/phi3:mini"`, `"openai/gpt-4o-mini"`, bare
-/// model names, …) onto an [`LlmClient`] + bare model name. Mirrors how the
-/// agent already builds clients for tool-output summarization.
+/// `make_client` maps a Settings spec (`"ollama/phi3:mini"`,
+/// `"openai/gpt-4o-mini"`, …) onto an [`LlmClient`] and the bare model id —
+/// the agent's summarizer resolver. A model is passed over when it cannot be
+/// resolved, when its call fails, or when its answer does not score every
+/// sentence (nothing, prose, a short count): the next one is asked. Only when
+/// no listed model scores does the walk fall back to the mechanical
+/// whole-line reduction an unscored answer used to produce at once, so a
+/// model that cannot score no longer stops a later one that can.
+///
+/// `deadline` bounds the whole walk, each model's info lookup included. Every
+/// caller is inline, on a step's critical path, and a model that never
+/// answers must not hold the step for the transport's timeout once per
+/// candidate. When it passes, the walk ends where it is and no later model
+/// is started.
 pub async fn compress_with_priority<F>(
     content: &str,
     target_ratio: usize,
     models: &[String],
+    deadline: tokio::time::Instant,
     mut make_client: F,
 ) -> Option<String>
 where
@@ -265,6 +271,7 @@ where
         return elide_by_lines(content, config.ratio);
     }
 
+    let mut any_unscored = false;
     for model_spec in models {
         let (client, model_name) = match make_client(model_spec) {
             Ok(pair) => pair,
@@ -273,17 +280,32 @@ where
                 continue;
             }
         };
-        match compress_text_with_config(&client, &model_name, content, &config).await {
-            Some(compressed) if compressed.len() < content.len() => {
+        let attempt = score_and_select(&client, &model_name, content, &config);
+        let Ok(attempt) = tokio::time::timeout_at(deadline, attempt).await else {
+            warn!(
+                model = %model_spec,
+                "Compression ran out of time; no further model is tried"
+            );
+            break;
+        };
+        match attempt {
+            Attempt::Reduced(compressed) if compressed.len() < content.len() => {
                 return Some(compressed);
             }
-            Some(_) => {
+            Attempt::Reduced(_) => {
                 debug!(
                     model = %model_spec,
                     "Compression returned non-shrinking result, trying next model"
                 );
             }
-            None => {
+            Attempt::Unscored => {
+                any_unscored = true;
+                warn!(
+                    model = %model_spec,
+                    "Compression model did not score every sentence, trying the next"
+                );
+            }
+            Attempt::Nothing => {
                 debug!(
                     model = %model_spec,
                     "Compression returned None, trying next model"
@@ -291,7 +313,16 @@ where
             }
         }
     }
-    None
+
+    // The last resort is what an unscored answer always led to: whole lines
+    // kept, the gap named. Only when some model did answer — a list whose
+    // every call failed reduces nothing here, as before, and the caller takes
+    // its own fallback.
+    if any_unscored {
+        elide_by_lines(content, config.ratio)
+    } else {
+        None
+    }
 }
 
 /// Parse one score per line from the scorer model output.
@@ -617,9 +648,14 @@ mod tests {
             "fixture must be the shape the gate is for"
         );
 
-        let out = compress_with_priority(&listing, 4, &["ollama/whatever".to_string()], |_| {
-            panic!("line-structured content must be reduced without a scoring round-trip")
-        })
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let out = compress_with_priority(
+            &listing,
+            4,
+            &["ollama/whatever".to_string()],
+            deadline,
+            |_| panic!("line-structured content must be reduced without a scoring round-trip"),
+        )
         .await;
 
         let out = out.expect("the line reducer answers");

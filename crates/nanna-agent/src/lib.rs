@@ -61,6 +61,7 @@ pub use supervisor::{
 };
 pub use summarizer::{
     Summarizer,
+    SummarizerClients,
     SummarizerConfig,
 };
 pub use planner::{Plan, PlanOrigin, PlannedTask, build_plan_prompt, parse_plan, plan_or_fallback};

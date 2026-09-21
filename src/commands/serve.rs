@@ -215,8 +215,12 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
             openai_api_key: config.llm.openai_api_key.clone(),
             openrouter_api_key: config.llm.openrouter_api_key.clone(),
             github_token: config.llm.github_token.clone(),
-            ollama_host: "http://localhost:11434".to_string(),
-            ollama_api_key: None,
+            // The configured Ollama server and its token, as the daemon binary
+            // reads them (DaemonBuilder::from_nanna_config) — this entry point
+            // hardcoded localhost and no token, so a remote server set in
+            // Settings was never reached from here.
+            ollama_host: config.memory.ollama_host.clone(),
+            ollama_api_key: config.llm.ollama_api_key.clone(),
             api_key: config.llm.api_key.clone(),
         },
         agent: AgentServiceConfig::default(),
@@ -263,6 +267,13 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         provider: config.memory.embedding_provider.clone(),
         model: config.memory.embedding_model.clone(),
         ollama_host: config.memory.ollama_host.clone(),
+        ollama_api_key: config
+            .llm
+            .ollama_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string),
         priority: config.memory.embedding_priority.clone(),
     };
     let mut server = DaemonServer::new(daemon_config, embedding, None, None);

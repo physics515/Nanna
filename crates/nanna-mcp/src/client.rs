@@ -2,12 +2,15 @@
 
 use crate::{
     McpError, Result,
+    era::{
+        DiscoverResult, LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSIONS, ProbeVerdict,
+        ProtocolEra, classify_probe, ensure_complete, with_modern_meta,
+    },
     protocol::{
         CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, GetPromptParams,
         GetPromptResult, InitializeParams, InitializeResult, JsonRpcNotification, JsonRpcRequest,
         ListPromptsResult, ListResourcesResult, ListToolsResult, Prompt, ReadResourceParams,
-        ReadResourceResult, RequestId, Resource, RootsCapability, ServerCapabilities, ServerInfo,
-        Tool,
+        ReadResourceResult, RequestId, Resource, ServerCapabilities, ServerInfo, Tool,
     },
     transport::{McpList, Transport},
 };
@@ -19,8 +22,8 @@ use tracing::{debug, info, warn};
 
 use crate::schema_guard::validate_tool_schema;
 
-/// MCP protocol version
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// The legacy MCP revision the `initialize` handshake offers.
+pub const PROTOCOL_VERSION: &str = LEGACY_PROTOCOL_VERSION;
 
 /// Map a `resources/read` failure onto a typed error.
 ///
@@ -58,6 +61,12 @@ pub struct McpClient<T: Transport> {
     prompts: RwLock<Vec<Prompt>>,
     /// Whether client is initialized
     initialized: RwLock<bool>,
+    /// The server's protocol era, decided once by [`McpClient::initialize`]
+    /// and cached for the server's lifetime. `Legacy` until then.
+    era: RwLock<ProtocolEra>,
+    /// Puts a modern server's elicitation to the user. `None`: the
+    /// capability is not declared and an `input_required` answer is an error.
+    elicitor: Option<Arc<dyn crate::elicit::Elicitor>>,
 }
 
 impl<T: Transport> McpClient<T> {
@@ -72,6 +81,40 @@ impl<T: Transport> McpClient<T> {
             resources: RwLock::new(Vec::new()),
             prompts: RwLock::new(Vec::new()),
             initialized: RwLock::new(false),
+            era: RwLock::new(ProtocolEra::Legacy),
+            elicitor: None,
+        }
+    }
+
+    /// Serve the server's form elicitations through `elicitor` (modern era).
+    /// Set before [`Self::initialize`]: it decides what the client declares.
+    #[must_use]
+    pub fn with_elicitor(mut self, elicitor: Arc<dyn crate::elicit::Elicitor>) -> Self {
+        self.elicitor = Some(elicitor);
+        self
+    }
+
+    /// The client capabilities a modern request declares.
+    fn declared_capabilities(&self) -> serde_json::Value {
+        if self.elicitor.is_some() {
+            crate::elicit::elicitation_capability()
+        } else {
+            serde_json::json!({})
+        }
+    }
+
+    /// `params` with the modern `_meta` attached when the era is modern.
+    async fn with_era_meta(
+        &self,
+        params: Option<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>> {
+        match &*self.era.read().await {
+            ProtocolEra::Modern { version } => Ok(Some(crate::era::with_modern_meta_declaring(
+                params,
+                version,
+                &self.declared_capabilities(),
+            )?)),
+            ProtocolEra::Legacy => Ok(params),
         }
     }
 
@@ -80,11 +123,36 @@ impl<T: Transport> McpClient<T> {
         RequestId::Number(self.id_counter.fetch_add(1, Ordering::SeqCst))
     }
 
-    /// Send a request and parse the result
+    /// Send a request and parse the result. Under the modern era every
+    /// request carries the per-request `_meta`.
     async fn request<R>(&self, method: &str, params: Option<serde_json::Value>) -> Result<R>
     where
         R: serde::de::DeserializeOwned,
     {
+        let params = self.with_era_meta(params).await?;
+        let result = self.request_value(method, params).await?;
+        serde_json::from_value(result).map_err(Into::into)
+    }
+
+    /// Send a request exactly as given and return its result, which must be
+    /// `complete`.
+    async fn request_value(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let result = self.request_value_raw(method, params).await?;
+        ensure_complete(&result)?;
+        Ok(result)
+    }
+
+    /// Send a request exactly as given and return its result whatever its
+    /// `resultType`.
+    async fn request_value_raw(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
         let request = JsonRpcRequest::new(self.next_id(), method, params);
         let response = self.transport.request(request).await?;
 
@@ -96,25 +164,101 @@ impl<T: Transport> McpClient<T> {
             });
         }
 
-        let result = response
+        response
             .result
-            .ok_or_else(|| McpError::Protocol("Missing result in response".into()))?;
-
-        serde_json::from_value(result).map_err(Into::into)
+            .ok_or_else(|| McpError::Protocol("Missing result in response".into()))
     }
 
-    /// Initialize the connection with the server
+    /// Connect to the server in whichever protocol era it speaks.
     ///
-    /// Must be called before using any other methods.
+    /// Must be called before using any other methods. Probes with
+    /// `server/discover` (MCP 2026-07-28): a modern server is then spoken to
+    /// statelessly with per-request `_meta`; any other answer, or none within
+    /// the transport's request timeout, falls back to the legacy
+    /// `initialize` handshake. The era is cached for the client's lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the server dies during the probe, is a modern server
+    /// sharing no revision with this client, or rejects the connection.
+    pub async fn initialize(&self) -> Result<InitializeResult> {
+        let probe_version = MODERN_PROTOCOL_VERSIONS[0];
+        let outcome = self
+            .request_value(
+                "server/discover",
+                Some(with_modern_meta(None, probe_version)?),
+            )
+            .await;
+        let answered = outcome.as_ref().ok().cloned();
+        match classify_probe(outcome)? {
+            ProbeVerdict::Modern { version } => {
+                let discover = match answered {
+                    Some(result) if version == probe_version => result,
+                    // The server named another mutual revision: ask again in it.
+                    _ => {
+                        let params = with_modern_meta(None, &version)?;
+                        self.request_value("server/discover", Some(params)).await?
+                    }
+                };
+                self.finish_modern(version, discover).await
+            }
+            ProbeVerdict::Legacy => {
+                debug!(
+                    "MCP server did not answer server/discover as a modern server; using initialize"
+                );
+                self.initialize_legacy().await
+            }
+            ProbeVerdict::Incompatible { reason } => Err(McpError::Protocol(reason)),
+        }
+    }
+
+    /// Adopt the modern era from a `server/discover` answer.
+    async fn finish_modern(
+        &self,
+        version: String,
+        discover: serde_json::Value,
+    ) -> Result<InitializeResult> {
+        assert!(!version.is_empty(), "a modern era names its revision");
+        let discover: DiscoverResult = serde_json::from_value(discover)?;
+        debug_assert!(discover.supported_versions.contains(&version));
+        let server_info = discover.server_info().unwrap_or_else(|| ServerInfo {
+            name: "unnamed MCP server".to_string(),
+            version: None,
+        });
+        info!(
+            server = %server_info.name,
+            version = server_info.version.as_deref().unwrap_or("unknown"),
+            protocol = %version,
+            "Connected to MCP server (modern, no handshake)"
+        );
+        *self.era.write().await = ProtocolEra::Modern {
+            version: version.clone(),
+        };
+        let result = InitializeResult {
+            protocol_version: version,
+            capabilities: discover.capabilities,
+            server_info,
+            instructions: discover.instructions,
+        };
+        self.adopt(&result).await;
+        self.open_listen(&result.capabilities).await;
+        Ok(result)
+    }
+
+    /// Connect with the legacy `initialize` handshake only, skipping the
+    /// era probe. For transports whose era detection is not the stdio probe
+    /// (the deprecated HTTP+SSE transport speaks only this).
     ///
     /// # Errors
     ///
     /// Returns error if initialization fails or server rejects the connection
-    pub async fn initialize(&self) -> Result<InitializeResult> {
+    pub async fn initialize_legacy(&self) -> Result<InitializeResult> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            // No `roots`: this client has none to list, and a declared
+            // capability invites a `roots/list` request it would only refuse.
             capabilities: ClientCapabilities {
-                roots: Some(RootsCapability { list_changed: true }),
+                roots: None,
                 sampling: None,
                 experimental: None,
             },
@@ -134,49 +278,79 @@ impl<T: Transport> McpClient<T> {
             "Connected to MCP server"
         );
 
-        // Store server info and capabilities
-        {
-            let mut info = self.server_info.write().await;
-            *info = Some(result.server_info.clone());
-        }
-        {
-            let mut caps = self.capabilities.write().await;
-            *caps = Some(result.capabilities.clone());
-        }
-
         // Send initialized notification
         self.transport
             .notify(JsonRpcNotification::new("notifications/initialized", None))
             .await?;
+        self.adopt(&result).await;
+        Ok(result)
+    }
 
-        {
-            let mut init = self.initialized.write().await;
-            *init = true;
-        }
+    /// Record a connected server's identity and capabilities, mark the client
+    /// initialized, and pre-fetch the lists the server says it has.
+    async fn adopt(&self, result: &InitializeResult) {
+        *self.server_info.write().await = Some(result.server_info.clone());
+        *self.capabilities.write().await = Some(result.capabilities.clone());
+        *self.initialized.write().await = true;
 
-        // Pre-fetch tools, resources, and prompts if supported
         if result.capabilities.tools.is_some()
             && let Ok(tools_result) = self.list_tools_internal().await
         {
-            let mut tools = self.tools.write().await;
-            *tools = Self::gate_tool_schemas(tools_result.tools);
+            *self.tools.write().await = Self::gate_tool_schemas(tools_result.tools);
         }
-
         if result.capabilities.resources.is_some()
             && let Ok(resources_result) = self.list_resources_internal().await
         {
-            let mut resources = self.resources.write().await;
-            *resources = resources_result.resources;
+            *self.resources.write().await = resources_result.resources;
         }
-
         if result.capabilities.prompts.is_some()
             && let Ok(prompts_result) = self.list_prompts_internal().await
         {
-            let mut prompts = self.prompts.write().await;
-            *prompts = prompts_result.prompts;
+            *self.prompts.write().await = prompts_result.prompts;
         }
+    }
 
-        Ok(result)
+    /// Ask a modern server for its change notifications. Revision
+    /// 2026-07-28 sends `list_changed` only on a `subscriptions/listen`
+    /// stream, so without one a cached list never learns it is stale.
+    /// Best effort: a failure is logged and the lists stay as fetched.
+    async fn open_listen(&self, capabilities: &ServerCapabilities) {
+        let Some(filter) = crate::era::listen_filter(capabilities) else {
+            return;
+        };
+        let version = match &*self.era.read().await {
+            ProtocolEra::Modern { version } => version.clone(),
+            ProtocolEra::Legacy => return,
+        };
+        let params = match with_modern_meta(Some(filter), &version) {
+            Ok(params) => params,
+            Err(e) => {
+                warn!(error = %e, "Could not build subscriptions/listen");
+                return;
+            }
+        };
+        let request = JsonRpcRequest::new(self.next_id(), "subscriptions/listen", Some(params));
+        if let Err(e) = self.transport.open_listen(request).await {
+            warn!(error = %e, "Could not open the MCP change-notification stream");
+        }
+    }
+
+    /// The transport's list-changed flags, if it tracks any.
+    #[must_use]
+    pub fn list_changed_flags(&self) -> Option<Arc<crate::transport::ListChangedFlags>> {
+        self.transport.list_changed_flags()
+    }
+
+    /// Mark the client connected without a handshake — for tests that drive
+    /// a scripted transport through the real code paths.
+    #[cfg(all(test, feature = "tools-integration"))]
+    pub(crate) async fn mark_initialized_for_test(&self) {
+        *self.initialized.write().await = true;
+    }
+
+    /// The protocol era this client settled on (`Legacy` before `initialize`).
+    pub async fn era(&self) -> ProtocolEra {
+        self.era.read().await.clone()
     }
 
     /// Check if client is initialized
@@ -279,13 +453,86 @@ impl<T: Transport> McpClient<T> {
 
         debug!(tool = name, "Calling MCP tool");
 
-        let params = CallToolParams {
+        let params = serde_json::to_value(&CallToolParams {
             name: name.to_string(),
             arguments,
+        })?;
+        let result = match self.request_with_input("tools/call", params.clone()).await {
+            // The server's headers and our cached tool definition disagree —
+            // typically a parameter that gained `x-mcp-header` since our last
+            // `tools/list`. The binding says: re-list, then retry. Once: a
+            // second mismatch is the server's problem, not a stale cache.
+            Err(McpError::JsonRpc { code, .. })
+                if code == crate::protocol::error_codes::HEADER_MISMATCH =>
+            {
+                debug!(
+                    tool = name,
+                    "MCP header mismatch; re-listing tools and retrying once"
+                );
+                self.refresh_tools().await?;
+                self.request_with_input("tools/call", params).await?
+            }
+            other => other?,
         };
+        serde_json::from_value(result).map_err(Into::into)
+    }
 
-        self.request("tools/call", Some(serde_json::to_value(&params)?))
-            .await
+    /// Send `method` and serve any multi-round-trip input it asks for: while
+    /// the server answers `input_required`, put its form questions to the
+    /// elicitor and retry with the answers (a new request id each time, the
+    /// server's `requestState` echoed verbatim), at most
+    /// [`crate::elicit::MRTR_ROUNDS_MAX`] times.
+    async fn request_with_input(
+        &self,
+        method: &str,
+        original: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use crate::elicit::{
+            MRTR_ROUNDS_MAX, elicit_result, elicitation_question, form_requests, retry_params,
+        };
+        let mut params = original.clone();
+        // Whether the last round got no answer at all: the server was told
+        // `cancel`, so asking again cannot get a different reply.
+        let mut unanswered = false;
+        for round in 0..=MRTR_ROUNDS_MAX {
+            let wire = self.with_era_meta(Some(params)).await?;
+            let result = self.request_value_raw(method, wire).await?;
+            let asks = result.get("resultType").and_then(serde_json::Value::as_str)
+                == Some("input_required");
+            let Some(elicitor) = self.elicitor.as_ref().filter(|_| asks) else {
+                ensure_complete(&result)?;
+                return Ok(result);
+            };
+            if unanswered {
+                return Err(McpError::Protocol(
+                    "the MCP server needs an answer from the user, and none came \
+                     (no conversation to ask in, or no reply in time)"
+                        .into(),
+                ));
+            }
+            if round == MRTR_ROUNDS_MAX {
+                break;
+            }
+            let server = self
+                .server_info
+                .read()
+                .await
+                .as_ref()
+                .map_or_else(|| "unnamed".to_string(), |info| info.name.clone());
+            let mut responses = serde_json::Map::new();
+            let mut answered = false;
+            for form in form_requests(&result)? {
+                let question = elicitation_question(&server, &form.message, &form.schema);
+                let answer = elicitor.ask(&question).await;
+                answered |= answer.is_some();
+                responses.insert(form.key.clone(), elicit_result(&form, answer.as_deref()));
+            }
+            unanswered = !answered;
+            params = retry_params(&original, responses, result.get("requestState"));
+        }
+        Err(McpError::Protocol(format!(
+            "the MCP server was still asking for input after {MRTR_ROUNDS_MAX} rounds"
+        )))
     }
 
     /// Get a tool by name
@@ -547,6 +794,29 @@ impl McpClient<crate::HttpTransport> {
     pub async fn connect(url: impl Into<String>) -> Result<Self> {
         let transport = crate::HttpTransport::connect(url).await?;
         let client = Self::new(transport);
+        // The deprecated HTTP+SSE transport predates the modern era entirely.
+        client.initialize_legacy().await?;
+        Ok(client)
+    }
+}
+
+#[cfg(feature = "http")]
+impl McpClient<crate::StreamableHttpTransport> {
+    /// Connect to a Streamable HTTP MCP endpoint in whichever era it speaks:
+    /// a modern (2026-07-28) server is used statelessly, a 2025-era one
+    /// through its `initialize` handshake and session. `bearer_token` is sent
+    /// as `Authorization: Bearer` on every request.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the URL is not http(s), the server refuses the
+    /// credential, or the connection fails.
+    pub async fn connect_streamable(
+        url: impl Into<String>,
+        bearer_token: Option<String>,
+    ) -> Result<Self> {
+        let transport = crate::StreamableHttpTransport::new(url, bearer_token)?;
+        let client = Self::new(transport);
         client.initialize().await?;
         Ok(client)
     }
@@ -756,5 +1026,405 @@ mod tests {
             McpError::JsonRpc { code, .. } => assert_eq!(code, -32601),
             other => panic!("method-not-found must pass through, got {other:?}"),
         }
+    }
+
+    /// A server that answers like either reference SDK: `modern` like
+    /// `@modelcontextprotocol/server` 2.0 (discover answered, `initialize`
+    /// rejected with -32022), otherwise like `@modelcontextprotocol/sdk` 1.30
+    /// (discover is `-32601`, `initialize` answered). Records what it saw.
+    struct EraTransport {
+        modern: bool,
+        requests: std::sync::Mutex<Vec<JsonRpcRequest>>,
+        notifications: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl EraTransport {
+        fn new(modern: bool) -> Self {
+            Self {
+                modern,
+                requests: std::sync::Mutex::new(Vec::new()),
+                notifications: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn answer(
+            &self,
+            method: &str,
+        ) -> std::result::Result<serde_json::Value, (i32, serde_json::Value)> {
+            let tools = serde_json::json!({ "tools": [{ "name": "shout", "inputSchema": { "type": "object" } }] });
+            match (self.modern, method) {
+                (true, "server/discover") => Ok(serde_json::json!({
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": { "tools": { "listChanged": true } },
+                    "resultType": "complete",
+                    "_meta": { "io.modelcontextprotocol/serverInfo": { "name": "modern", "version": "2" } }
+                })),
+                (true, "initialize") => {
+                    Err((-32022, serde_json::json!({ "supported": ["2026-07-28"] })))
+                }
+                (false, "initialize") => Ok(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "legacy" }
+                })),
+                (_, "tools/list") => Ok(tools),
+                _ => Err((-32601, serde_json::Value::Null)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for EraTransport {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            let answer = self.answer(&request.method);
+            let id = request.id.clone();
+            self.requests.lock().unwrap().push(request);
+            let (result, error) = match answer {
+                Ok(result) => (Some(result), None),
+                Err((code, data)) => (
+                    None,
+                    Some(crate::protocol::JsonRpcError {
+                        code,
+                        message: "refused".to_string(),
+                        data: Some(data),
+                    }),
+                ),
+            };
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result,
+                error,
+            })
+        }
+        async fn notify(&self, n: JsonRpcNotification) -> Result<()> {
+            self.notifications.lock().unwrap().push(n.method);
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_modern_server_is_spoken_to_without_a_handshake() {
+        let client = McpClient::new(EraTransport::new(true));
+        let connected = client
+            .initialize()
+            .await
+            .expect("modern server must connect");
+        assert_eq!(connected.protocol_version, "2026-07-28");
+        assert_eq!(connected.server_info.name, "modern");
+        assert_eq!(
+            client.era().await,
+            ProtocolEra::Modern {
+                version: "2026-07-28".into()
+            }
+        );
+        assert_eq!(client.list_tools().await.unwrap()[0].name, "shout");
+
+        let transport = &client.transport;
+        let methods: Vec<String> = transport
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.method.clone())
+            .collect();
+        assert_eq!(
+            methods,
+            ["server/discover", "tools/list"],
+            "no initialize to a modern server"
+        );
+        assert!(
+            transport.notifications.lock().unwrap().is_empty(),
+            "no notifications/initialized"
+        );
+        for request in transport.requests.lock().unwrap().iter() {
+            let meta = &request
+                .params
+                .as_ref()
+                .expect("modern requests carry params")["_meta"];
+            assert_eq!(
+                meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28",
+                "{}",
+                request.method
+            );
+            assert!(
+                meta["io.modelcontextprotocol/clientCapabilities"].is_object(),
+                "{}",
+                request.method
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legacy_server_falls_back_to_initialize() {
+        let client = McpClient::new(EraTransport::new(false));
+        let connected = client
+            .initialize()
+            .await
+            .expect("legacy server must connect");
+        assert_eq!(connected.server_info.name, "legacy");
+        assert_eq!(client.era().await, ProtocolEra::Legacy);
+        assert_eq!(client.list_tools().await.unwrap()[0].name, "shout");
+
+        let transport = &client.transport;
+        let requests = transport.requests.lock().unwrap();
+        let methods: Vec<&str> = requests.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(methods, ["server/discover", "initialize", "tools/list"]);
+        assert!(
+            requests[2].params.is_none(),
+            "legacy requests carry no modern _meta"
+        );
+        drop(requests);
+        assert_eq!(
+            *transport.notifications.lock().unwrap(),
+            ["notifications/initialized"]
+        );
+    }
+
+    /// A modern server whose `tools/call` needs client input (MRTR).
+    struct InputRequiredTransport;
+
+    #[async_trait::async_trait]
+    impl Transport for InputRequiredTransport {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(
+                    serde_json::json!({ "resultType": "input_required", "inputRequests": {} }),
+                ),
+                error: None,
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_input_required_result_is_an_error_not_an_empty_success() {
+        let client = McpClient::new(InputRequiredTransport);
+        *client.initialized.write().await = true;
+        match client.call_tool("ask", None).await {
+            Err(McpError::Protocol(message)) => {
+                assert!(message.contains("more input"), "{message}");
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    /// A modern server whose `tools/call` asks for a color until it gets one
+    /// (or forever, with `always_ask`). Records every call's params and id.
+    struct AskingServer {
+        always_ask: bool,
+        calls: std::sync::Mutex<Vec<(RequestId, serde_json::Value)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for AskingServer {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            let params = request.params.clone().unwrap_or_default();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((request.id.clone(), params.clone()));
+            let color = params["inputResponses"]["color"]["content"]["color"].as_str();
+            let result = match color {
+                Some(color) if !self.always_ask => serde_json::json!({
+                    "resultType": "complete",
+                    "content": [{ "type": "text", "text": format!("favorite={color}") }]
+                }),
+                _ => serde_json::json!({
+                    "resultType": "input_required",
+                    "inputRequests": { "color": { "method": "elicitation/create", "params": {
+                        "mode": "form", "message": "Favorite color?",
+                        "requestedSchema": { "type": "object",
+                            "properties": { "color": { "type": "string" } }, "required": ["color"] }
+                    } } },
+                    "requestState": "state-1"
+                }),
+            };
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Replies(std::sync::Mutex<Vec<String>>, Option<&'static str>);
+
+    #[async_trait::async_trait]
+    impl crate::elicit::Elicitor for Replies {
+        async fn ask(&self, question: &str) -> Option<String> {
+            self.0.lock().unwrap().push(question.to_string());
+            self.1.map(str::to_string)
+        }
+    }
+
+    async fn modern_client(
+        always_ask: bool,
+        reply: Option<&'static str>,
+    ) -> (McpClient<AskingServer>, Arc<Replies>) {
+        let replies = Arc::new(Replies(std::sync::Mutex::new(Vec::new()), reply));
+        let client = McpClient::new(AskingServer {
+            always_ask,
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+        .with_elicitor(replies.clone());
+        *client.initialized.write().await = true;
+        *client.era.write().await = ProtocolEra::Modern {
+            version: "2026-07-28".into(),
+        };
+        (client, replies)
+    }
+
+    /// A server whose first `tools/call` is refused with `-32020`; records
+    /// every method so the recovery order can be checked.
+    struct MismatchOnce {
+        methods: std::sync::Mutex<Vec<String>>,
+        refusals_left: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for MismatchOnce {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            self.methods.lock().unwrap().push(request.method.clone());
+            let (result, error) = match request.method.as_str() {
+                "tools/call"
+                    if self
+                        .refusals_left
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok() =>
+                {
+                    (
+                        None,
+                        Some(crate::protocol::JsonRpcError {
+                            code: -32020,
+                            message: "Mcp-Param-Region header is absent".into(),
+                            data: None,
+                        }),
+                    )
+                }
+                "tools/call" => (
+                    Some(serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })),
+                    None,
+                ),
+                _ => (Some(serde_json::json!({ "tools": [] })), None),
+            };
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result,
+                error,
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_mismatch_relists_tools_and_retries_once() {
+        let client = McpClient::new(MismatchOnce {
+            methods: std::sync::Mutex::new(Vec::new()),
+            refusals_left: AtomicUsize::new(1),
+        });
+        *client.initialized.write().await = true;
+        client.call_tool("regional", None).await.expect("recovered");
+        let methods = client.transport.methods.lock().unwrap().clone();
+        assert_eq!(methods, ["tools/call", "tools/list", "tools/call"]);
+
+        // A server that keeps refusing gets one retry, not a loop.
+        let stubborn = McpClient::new(MismatchOnce {
+            methods: std::sync::Mutex::new(Vec::new()),
+            refusals_left: AtomicUsize::new(5),
+        });
+        *stubborn.initialized.write().await = true;
+        let error = stubborn
+            .call_tool("regional", None)
+            .await
+            .expect_err("still refused");
+        assert!(
+            matches!(error, McpError::JsonRpc { code: -32020, .. }),
+            "{error:?}"
+        );
+        assert_eq!(stubborn.transport.methods.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_elicitation_is_asked_and_the_call_retried_with_the_answer() {
+        let (client, replies) = modern_client(false, Some("teal")).await;
+        let result = client
+            .call_tool("favorite", None)
+            .await
+            .expect("answered on the retry");
+        let text = serde_json::to_value(&result).unwrap()["content"][0]["text"].clone();
+        assert_eq!(text, "favorite=teal");
+
+        let asked = replies.0.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].contains("Favorite color?"), "{}", asked[0]);
+
+        let calls = client.transport.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].0, calls[1].0, "the retry is a new request id");
+        let retry = &calls[1].1;
+        assert_eq!(retry["requestState"], "state-1", "state echoed verbatim");
+        assert_eq!(retry["name"], "favorite", "the original params are kept");
+        assert_eq!(
+            retry["_meta"]["io.modelcontextprotocol/clientCapabilities"]["elicitation"],
+            serde_json::json!({ "form": {} }),
+            "elicitation is declared when an elicitor is installed"
+        );
+        assert!(calls[0].1.get("inputResponses").is_none());
+    }
+
+    #[tokio::test]
+    async fn no_answer_is_sent_as_cancel_once_then_the_call_ends() {
+        let (client, _) = modern_client(false, None).await;
+        let error = client
+            .call_tool("favorite", None)
+            .await
+            .expect_err("unanswered");
+        assert!(error.to_string().contains("none came"), "{error}");
+        let calls = client.transport.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "one cancel retry, not a cancel per round");
+        assert_eq!(
+            calls[1].1["inputResponses"]["color"],
+            serde_json::json!({ "action": "cancel" })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_stops_asking_is_bounded() {
+        let (client, replies) = modern_client(true, Some("teal")).await;
+        let error = client
+            .call_tool("favorite", None)
+            .await
+            .expect_err("bounded");
+        assert!(error.to_string().contains("still asking"), "{error}");
+        let calls = client.transport.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), crate::elicit::MRTR_ROUNDS_MAX + 1);
+        assert_eq!(
+            replies.0.lock().unwrap().len(),
+            crate::elicit::MRTR_ROUNDS_MAX
+        );
     }
 }

@@ -1,5 +1,6 @@
 import { test as base, expect, type Page } from '@playwright/test'
 import {
+  e2eAttach,
   e2eEmit,
   e2eGetState,
   e2eSetBackendStatus,
@@ -13,6 +14,8 @@ export type MockHandle = {
   gotoWithMock: (path?: string, config?: MockOptions) => Promise<void>
   emit: (event: string, payload?: unknown) => Promise<void>
   setDisconnected: (message?: string) => Promise<void>
+  /** The daemon answers: what ends a `boot` scenario's splash. */
+  attach: () => Promise<void>
   getState: () => Promise<Record<string, unknown>>
 }
 
@@ -73,6 +76,9 @@ export const test = base.extend<NannaFixtures>({
           .first()
           .waitFor({ state: 'visible', timeout: 8_000 })
           .catch(() => {})
+      },
+      async attach() {
+        await e2eAttach(page)
       },
       async getState() {
         return e2eGetState(page)

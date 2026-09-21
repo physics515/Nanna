@@ -99,7 +99,15 @@ impl ControlPlane {
     /// Load `path`, and apply it when it parses and differs from what is running.
     async fn reload_changed_config(&self, path: &Path) {
         let owned: PathBuf = path.to_path_buf();
-        let loaded = tokio::task::spawn_blocking(move || Config::load_from(&owned)).await;
+        // Loaded as the replacement for what is running: a token saved with
+        // no server recorded stays the running server's instead of following
+        // the address the edit names.
+        let running_host = self.config.read().await.memory.ollama_host.clone();
+        let store = self.credential_store.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            Config::load_from_replacing(&owned, &running_host, &store)
+        })
+        .await;
         let loaded = match loaded {
             Ok(Ok(config)) => config.with_env_overrides(),
             Ok(Err(e)) => {
@@ -137,6 +145,48 @@ mod tests {
         let mut edited = Config::default();
         edited.scheduler.heartbeat_enabled = !running.scheduler.heartbeat_enabled;
         assert!(differs(&running, &edited));
+    }
+
+    /// A hand edit of the address (which the agent can make) with a token
+    /// saved by an older build, which records no server: the reload used to
+    /// load the file as if it were the first, read the token as the new
+    /// address's, and apply it — chat, embeddings and the probe all sent the
+    /// old server's token to the edited one.
+    #[tokio::test]
+    async fn a_hand_edit_does_not_hand_a_legacy_ollama_token_to_the_new_address() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = nanna_config::SecureStore::file_only_at(dir.path().to_path_buf());
+        store
+            .set(
+                nanna_config::credentials::keys::OLLAMA_API_KEY,
+                "legacy-token",
+            )
+            .expect("set");
+        let mut control = ControlPlane::new(Arc::new(crate::session::SessionManager::new()));
+        control.credential_store = store;
+        {
+            // As the boot load left it: the legacy token, for the configured server.
+            let mut config = control.config.write().await;
+            config.memory.ollama_host = "https://gpu.example/ollama".to_string();
+            config.llm.ollama_api_key = Some("legacy-token".to_string());
+        }
+
+        let file = dir.path().join("config.toml");
+        let mut edited = Config::default();
+        edited.memory.ollama_host = "https://elsewhere.example".to_string();
+        edited.save_to(&file).expect("save");
+        control.reload_changed_config(&file).await;
+
+        let config = control.config.read().await;
+        assert_eq!(
+            config.memory.ollama_host, "https://elsewhere.example",
+            "the edit applied"
+        );
+        assert_ne!(
+            config.llm.ollama_api_key.as_deref(),
+            Some("legacy-token"),
+            "the edited address must not get the token that was going to the old one"
+        );
     }
 
     #[test]

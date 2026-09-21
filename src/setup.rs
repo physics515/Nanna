@@ -5,6 +5,7 @@ use chrono::Utc;
 use nanna_agent::{Agent, AgentConfig, AgentContext, RunOptions};
 use nanna_config::Config;
 use nanna_core::{LlmClient, Scheduler, SchedulerConfig, ScheduledTask, TaskResult};
+use nanna_daemon::llm_router::ProviderId;
 use nanna_storage::{Storage, StorageConfig};
 use nanna_tools::{
     CancelReminderTool, EchoTool, ExecTool, ExploreTool, ListDirTool, ListRemindersTool,
@@ -65,7 +66,6 @@ pub fn create_scheduler(
                 temperature: 0.7,
                 max_iterations: Some(5),
                 summarization_priority: vec![],
-                summarization_ollama_url: Some("http://localhost:11434".to_string()),
                 ..Default::default()
             };
 
@@ -139,14 +139,33 @@ pub fn create_scheduler(
         .with_executor(executor)
 }
 
+/// The provider the CLI's chat client belongs to, and so the provider whose
+/// key `[llm].api_key` holds.
+///
+/// In the CLI `[llm].api_key` is the key of whichever `[llm].provider` was
+/// picked — `nanna init` and the missing-key prompt store it there — and an
+/// unrecognised provider name is served by Anthropic. One definition because
+/// two consumers must agree on it: the chat client [`init_components`] builds,
+/// and the summarizers' credentials (`commands::cli`), which may hand that key
+/// to this provider and to no other.
+#[must_use]
+pub fn chat_provider(provider: &str) -> ProviderId {
+    match provider {
+        "openai" => ProviderId::OpenAI,
+        "openrouter" => ProviderId::OpenRouter,
+        _ => ProviderId::Anthropic,
+    }
+}
+
 /// Initialize common components
 pub async fn init_components(
     config: &Config,
 ) -> anyhow::Result<(Arc<LlmClient>, Arc<ToolRegistry>, Arc<Storage>)> {
+    let chat_provider = chat_provider(&config.llm.provider);
     // Get API key - default to Anthropic
-    let env_var = match config.llm.provider.as_str() {
-        "openai" => "OPENAI_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
+    let env_var = match chat_provider {
+        ProviderId::OpenAI => "OPENAI_API_KEY",
+        ProviderId::OpenRouter => "OPENROUTER_API_KEY",
         _ => "ANTHROPIC_API_KEY", // anthropic or unknown
     };
     
@@ -160,10 +179,11 @@ pub async fn init_components(
         ))?;
 
     // Create LLM client - default to Anthropic
-    let llm = Arc::new(match config.llm.provider.as_str() {
-        "openai" => LlmClient::openai(&api_key),
-        "openrouter" => LlmClient::openrouter(&api_key),
-        provider => {
+    let llm = Arc::new(match chat_provider {
+        ProviderId::OpenAI => LlmClient::openai(&api_key),
+        ProviderId::OpenRouter => LlmClient::openrouter(&api_key),
+        _ => {
+            let provider = &config.llm.provider;
             if provider != "anthropic" {
                 error!("Unknown LLM provider: {provider}, defaulting to anthropic");
             }

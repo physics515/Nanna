@@ -414,15 +414,13 @@ pub struct AgentConfig {
     pub nudge_interval_iterations: usize,
     /// Thinking mode for extended reasoning
     pub thinking_mode: ThinkingMode,
-    /// Model priority list for summarization (first working model is used)
-    /// Format: "provider/model" e.g. `["ollama/llama3.2", "openai/gpt-4o-mini", "anthropic/claude-haiku"]`
+    /// Model priority list for summarization, walked in this order: the next
+    /// model is tried whenever one cannot be reached or gives no usable answer.
+    /// Format: "provider/model" e.g. `["ollama/llama3.2", "openai/gpt-4o-mini", "anthropic/claude-haiku-4-5"]`.
+    /// Each entry becomes a client through the agent's resolver
+    /// ([`Agent::with_summarizer_clients`]), which owns the provider grammar
+    /// and the credentials; this config carries no address or key of its own.
     pub summarization_priority: Vec<String>,
-    /// Ollama URL for summarization (if using ollama)
-    pub summarization_ollama_url: Option<String>,
-    /// `OpenRouter` API key (for summarization/extraction via `OpenRouter` models)
-    pub openrouter_api_key: Option<String>,
-    /// `OpenAI` API key (for summarization/extraction via `OpenAI` models)
-    pub openai_api_key: Option<String>,
     /// Threshold (in chars) above which tool results are replaced with a
     /// memory-reference stub in context. 0 = auto (scales with model context window).
     /// Default: 0 (auto).
@@ -526,9 +524,6 @@ impl Default for AgentConfig {
             // budget and not another.
             thinking_mode: ThinkingMode::default(),
             summarization_priority: vec![],
-            summarization_ollama_url: Some("http://localhost:11434".to_string()),
-            openrouter_api_key: None,
-            openai_api_key: None,
             context_result_threshold: 0, // 0 = auto (scales with model context window)
             distillation_interval: 5,
             model_routing: vec![],
@@ -3287,6 +3282,69 @@ pub const CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS: usize = 2;
 /// the iteration its first distillation fired.
 const DISTILLATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Upper bound on compacting one large tool output: the compression walk and
+/// the summary walk after it, across every model in the summarization list.
+///
+/// Both walks are inline, on the step's critical path, and had no bound at
+/// all: the same wedge [`DISTILLATION_TIMEOUT`] closes for distillation. The
+/// bound is the transport's own declared silence tolerance
+/// ([`nanna_llm::STREAM_READ_TIMEOUT_SECS`]), because neither request is
+/// streamed: a whole generation is silence on the wire, so one call the
+/// transport would let live takes at most that long. Holding both walks
+/// together to that one figure means a later model — or the summary after a
+/// compression that came to nothing — is tried only in time a fast failure
+/// left over (a refused connection, a 401, a missing provider, an answer with
+/// no scores), which is what the fallbacks are for. A model too slow to
+/// finish in that time is not one the step should wait on; the output is cut
+/// to a preview instead, and the cut says so.
+const TOOL_OUTPUT_COMPACTION_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(nanna_llm::STREAM_READ_TIMEOUT_SECS);
+
+/// Upper bound on one proactive (Tier 1) compression pass: every older tool
+/// result it compresses, and every listed model for each, together.
+///
+/// The pass is inline — it runs before the step's next request — and each
+/// compression is one scoring call that is not streamed, so its whole
+/// generation is silence on the wire, bounded by
+/// [`nanna_llm::STREAM_READ_TIMEOUT_SECS`]. Held per result, that figure
+/// would let a server that takes requests and never answers hold the step
+/// once per older result per listed model; held per pass, a hung server costs
+/// the step one call the transport would let live, while a healthy scorer
+/// (seconds a result) still gets through the pass. Results the pass did not
+/// reach stay whole for the next pass or the tiers above, and a pass that
+/// compressed nothing takes the ladder's drop fallback, as it does when no
+/// model answers.
+const PROACTIVE_COMPRESSION_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(nanna_llm::STREAM_READ_TIMEOUT_SECS);
+
+/// Upper bound on one memory extraction: every listed summarization model and
+/// the chat-model fallback after them, together.
+///
+/// Extraction is inline: it runs before a turn's reply is returned, and every
+/// tenth iteration of a long one. Before the list had fallbacks it made
+/// exactly one call, so a turn waited at most one call the transport lets
+/// live — the request is not streamed, so its whole generation is silence on
+/// the wire, bounded by [`nanna_llm::STREAM_READ_TIMEOUT_SECS`]. Holding the
+/// whole walk to that same figure keeps the bound rather than multiplying it
+/// by the list's length plus one: a later model, and then the chat model, get
+/// the time a fast failure (a refused connection, a 401, a missing provider)
+/// left over. Running out of time extracts nothing this time, which is what a
+/// failed call did before, and the next extraction tries again.
+const MEMORY_EXTRACTION_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(nanna_llm::STREAM_READ_TIMEOUT_SECS);
+
+/// The text blocks of a model's answer, concatenated; everything else (a
+/// thinking block, a stray tool call) is not part of a summary.
+fn joined_text(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// First `max_bytes` of `text`, cut on a char boundary, `...`-suffixed when cut.
 ///
 /// The cut MUST walk back to a boundary: byte `max_bytes` can land inside a
@@ -4176,6 +4234,9 @@ pub struct Agent {
     stats: Option<crate::model_stats::ModelStatsTracker>,
     /// Optional tool statistics tracker (shared across sessions)
     tool_stats: Option<crate::tool_stats::ToolStatsTracker>,
+    /// How `summarization_priority` entries become clients. `None` resolves
+    /// nothing: every summarizer then falls through to its no-model path.
+    summarizers: Option<crate::SummarizerClients>,
 }
 
 /// Assembles a streaming assistant turn, keying each content block by its
@@ -4350,6 +4411,7 @@ impl Agent {
             context: RwLock::new(context),
             stats: None,
             tool_stats: None,
+            summarizers: None,
         }
     }
 
@@ -4358,6 +4420,21 @@ impl Agent {
     pub fn with_stats(mut self, stats: crate::model_stats::ModelStatsTracker) -> Self {
         self.stats = Some(stats);
         self
+    }
+
+    /// Resolve every summarization model through `clients` — the daemon's
+    /// chat router, so each entry reaches its provider with chat's
+    /// credentials. See [`crate::SummarizerClients`].
+    #[must_use]
+    pub fn with_summarizer_clients(mut self, clients: crate::SummarizerClients) -> Self {
+        self.summarizers = Some(clients);
+        self
+    }
+
+    /// The summarization resolver this agent was given, if any.
+    #[must_use]
+    pub const fn summarizer_clients(&self) -> Option<&crate::SummarizerClients> {
+        self.summarizers.as_ref()
     }
 
     /// Set a shared tool stats tracker.
@@ -4586,9 +4663,10 @@ impl Agent {
         );
         // The window the budgets above were derived from. `get_model_info` is
         // already clamped to the LIVE effective runner window (the Ollama
-        // num_ctx latch), so a step starting AFTER a demotion budgets small
-        // from its first token. The loop below re-reads the latch every
-        // iteration and re-derives when it shrinks mid-run.
+        // num_ctx latch of the server this agent's client sends to), so a
+        // step starting AFTER a demotion budgets small from its first token.
+        // The loop below re-reads the latch every iteration, through the same
+        // client, and re-derives when it shrinks mid-run.
         let configured_window = model_info.context_window;
 
         // Mission mode: put the completion contract in the system prompt UP
@@ -4786,11 +4864,12 @@ impl Agent {
         // budgets from the live window here, and the tiered compression
         // ladder directly below shrinks history down to the new
         // thresholds in this same iteration.
-        let live_window =
-            nanna_llm::effective_context_window(&self.config.model, limits.configured_window);
+        let live_window = self
+            .llm
+            .effective_context_window(&self.config.model, limits.configured_window);
         let mut window_shrink_note: Option<String> = None;
         if live_window != limits.configured_window {
-            let live_info = nanna_llm::clamp_model_info_to_effective_window(
+            let live_info = self.llm.clamp_model_info_to_effective_window(
                 &self.config.model,
                 limits.model_info.clone(),
             );
@@ -4842,13 +4921,14 @@ impl Agent {
         // definitions, step frame, or output reserve — so when the window
         // drops under their sum the ONLY honest move is a loud stop (the
         // step/eval is resumable); anything else is a silently truncated
-        // prompt. Scoped to models the runner latch actually governs (a
-        // latch exists only once the Ollama sizing/demotion path has run;
-        // cloud models keep their provider-error path) and checked on the
-        // first iteration (a fresh step may start already-demoted) and
-        // again on every further shrink.
+        // prompt. Scoped to models the runner latch actually governs (this
+        // client's server has a known num_ctx: the Ollama sizing/demotion
+        // path has run there, or the size its first request will carry is
+        // known without measuring; cloud models keep their provider-error
+        // path) and checked on the first iteration (a fresh step may start
+        // already-demoted) and again on every further shrink.
         let mut tool_pressure_note: Option<String> = None;
-        if nanna_llm::LlmClient::effective_num_ctx(&self.config.model).is_some()
+        if self.llm.effective_num_ctx(&self.config.model).is_some()
             && (state.iterations == 1 || window_shrunk)
         {
             let restrict = options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active;
@@ -5004,9 +5084,11 @@ impl Agent {
                 );
                 ctx.push_summarization_failure_notice(
                     dropped,
-                    "proactive compression found no tool results \
-                     to shrink, and measured growth says the next \
-                     step could overflow the context window",
+                    "proactive compression shrank no tool results \
+                     (there were none, or no summarization model \
+                     could shorten them in time), and measured growth \
+                     says the next step could overflow the context \
+                     window",
                 );
             }
         } else {
@@ -5038,13 +5120,7 @@ impl Agent {
                 "no summarization models are configured",
             );
         } else {
-            let summarization_config = ContextSummarizationConfig {
-                model_priority: self.config.summarization_priority.clone(),
-                ollama_url: self.config.summarization_ollama_url.clone(),
-                max_iterations: 20,
-                openrouter_api_key: self.config.openrouter_api_key.clone(),
-                openai_api_key: self.config.openai_api_key.clone(),
-            };
+            let summarization_config = self.context_summarization_config();
             info!(
                 estimated_tokens = estimated,
                 compression_threshold = compression_threshold,
@@ -5087,13 +5163,7 @@ impl Agent {
                  context exceeded the hard input limit",
             );
         } else {
-            let summarization_config = ContextSummarizationConfig {
-                model_priority: self.config.summarization_priority.clone(),
-                ollama_url: self.config.summarization_ollama_url.clone(),
-                max_iterations: 20,
-                openrouter_api_key: self.config.openrouter_api_key.clone(),
-                openai_api_key: self.config.openai_api_key.clone(),
-            };
+            let summarization_config = self.context_summarization_config();
             warn!(
                 estimated_tokens = estimated,
                 hard_limit = hard_limit,
@@ -5365,10 +5435,7 @@ impl Agent {
             nanna_llm::anthropic_model_contract(&request.model);
         let primary_mode =
             options.thinking_mode.unwrap_or(self.config.thinking_mode);
-        let primary_info = nanna_llm::model_info_from_cache_or_unknown(
-            &request.model,
-            "",
-        );
+        let primary_info = self.llm.model_info_from_cache_or_unknown(&request.model);
         request.max_tokens = request_output_budget(
             &request.model,
             &primary_info,
@@ -5569,10 +5636,10 @@ impl Agent {
                 // The live latch, not `configured_window`: an escalated or
                 // routed request may run a different model than the one
                 // the loop budgets for.
-                effective_context_window: nanna_llm::LlmClient::effective_num_ctx(
-                    &actual_model,
-                )
-                .map(|n| n as usize),
+                effective_context_window: self
+                    .llm
+                    .effective_num_ctx(&actual_model)
+                    .map(|n| n as usize),
             });
 
         if let Some(ref tracker) = self.stats {
@@ -7845,20 +7912,44 @@ impl Agent {
 
     /// What CONTEXT gets from a context-targeted result: the whole result, or
     /// — past `threshold` — its compression, summary or truncation.
+    /// Fit a context-targeted tool result into the window: compress it, else
+    /// summarize it, else cut it to a preview — within
+    /// [`TOOL_OUTPUT_COMPACTION_DEADLINE`].
     async fn compact_context_result(
         &self,
         name: &str,
         result_content: String,
         threshold: usize,
     ) -> String {
+        self.compact_context_result_within(
+            name,
+            result_content,
+            threshold,
+            TOOL_OUTPUT_COMPACTION_DEADLINE,
+        )
+        .await
+    }
+
+    /// [`Self::compact_context_result`] with its time bound passed in, so the
+    /// bound can be exercised without waiting it out.
+    async fn compact_context_result_within(
+        &self,
+        name: &str,
+        result_content: String,
+        threshold: usize,
+        budget: std::time::Duration,
+    ) -> String {
         // Context-targeted tools: never store in memory, never stub.
         // For large outputs: try LLMLingua compression → summarization → truncation.
-        // Compression walks `summarization_priority` (settings) with client failover.
+        // Both walk `summarization_priority` (settings) with client failover,
+        // under ONE deadline: the summary gets what the compression left.
         if result_content.len() > threshold {
+            let deadline = tokio::time::Instant::now() + budget;
             let compressed = crate::compressor::compress_with_priority(
                 &result_content,
                 4,
                 &self.config.summarization_priority,
+                deadline,
                 |model_spec| self.create_client_for_model(model_spec),
             )
             .await;
@@ -7875,7 +7966,7 @@ impl Agent {
                     );
                     compressed
                 } else if let Some(summarized) =
-                    self.summarize_tool_output(name, &result_content).await
+                    self.summarize_tool_output(name, &result_content, deadline).await
                 {
                     summarized
                 } else {
@@ -7890,7 +7981,7 @@ impl Agent {
                     )
                 }
             } else if let Some(summarized) =
-                self.summarize_tool_output(name, &result_content).await
+                self.summarize_tool_output(name, &result_content, deadline).await
             {
                 info!(
                     tool = name,
@@ -7936,96 +8027,144 @@ impl Agent {
     }
 
     /// Compress large tool results in older messages using the summarization-model
-    /// priority from settings (LLMLingua-style selective compression).
+    /// priority from settings (LLMLingua-style selective compression), within
+    /// [`PROACTIVE_COMPRESSION_DEADLINE`] for the whole pass.
     ///
-    /// Returns how many tool results were rewritten. Zero means either nothing
-    /// was large enough or no summarization model is configured — callers may
-    /// fall back to `drop_oldest`.
+    /// Returns how many tool results were rewritten. Zero means nothing was
+    /// large enough, no summarization model is configured or reachable, or
+    /// none answered in time — callers may fall back to `drop_oldest`.
     async fn compress_older_context_tool_results(
         &self,
         ctx: &mut AgentContext,
         keep_recent: usize,
     ) -> usize {
+        self.compress_older_context_tool_results_within(
+            ctx,
+            keep_recent,
+            PROACTIVE_COMPRESSION_DEADLINE,
+        )
+        .await
+    }
+
+    /// [`Self::compress_older_context_tool_results`] with its time bound
+    /// passed in, so the bound can be exercised without waiting it out.
+    async fn compress_older_context_tool_results_within(
+        &self,
+        ctx: &mut AgentContext,
+        keep_recent: usize,
+        budget: std::time::Duration,
+    ) -> usize {
         if self.config.summarization_priority.is_empty() {
             return 0;
         }
-        // Pre-resolve every model client once so the awaitable compressor can
-        // own them without re-borrowing `&self`.
-        let mut clients: Vec<(LlmClient, String)> = Vec::new();
-        for model_spec in &self.config.summarization_priority {
-            match self.create_client_for_model(model_spec) {
-                Ok(pair) => clients.push(pair),
-                Err(e) => {
-                    debug!(
-                        model = %model_spec,
-                        error = %e,
-                        "Skipping compression model for older context"
-                    );
-                }
+        // A list none of whose models resolves compresses nothing, exactly as
+        // an empty one — the ladder then takes its drop fallback. Each refusal
+        // is a warning, as in every other summarizing consumer: it is where an
+        // absent or expired credential shows. (When some model resolves, the
+        // walk below warns about the others itself.)
+        let refused: Vec<(&String, String)> = self
+            .config
+            .summarization_priority
+            .iter()
+            .filter_map(|spec| self.create_client_for_model(spec).err().map(|e| (spec, e)))
+            .collect();
+        if refused.len() == self.config.summarization_priority.len() {
+            for (model_spec, e) in &refused {
+                warn!(
+                    model = %model_spec,
+                    error = %e,
+                    "Skipping compression model for older context"
+                );
             }
-        }
-        if clients.is_empty() {
             return 0;
         }
 
+        // The compressor owns what it resolves with, so each result's walk
+        // resolves afresh — a router rebuild mid-pass reaches the next result.
+        let summarizers = self.summarizers.clone();
+        let models = self.config.summarization_priority.clone();
+        let deadline = tokio::time::Instant::now() + budget;
         ctx.compress_older_tool_results(keep_recent, 500, |content| {
-            let clients = clients.clone();
+            let summarizers = summarizers.clone();
+            let models = models.clone();
             async move {
-                for (client, model_name) in &clients {
-                    if let Some(compressed) =
-                        crate::compressor::compress_text(client, model_name, &content, 4).await
-                        && compressed.len() < content.len() {
-                            return Some(compressed);
-                        }
-                }
-                None
+                crate::compressor::compress_with_priority(&content, 4, &models, deadline, |spec| {
+                    crate::summarizer::resolve_summarizer(summarizers.as_ref(), spec)
+                })
+                .await
             }
         })
         .await
     }
 
-    /// Create an LLM client for the specified model
-    /// Model format: "provider/model" or just "model" (uses main client's provider)
+    /// The client and bare model id for one `summarization_priority` entry,
+    /// through the injected resolver (see [`crate::SummarizerClients`]).
+    ///
+    /// This used to be a grammar of its own: `anthropic/` borrowed the CHAT
+    /// client, so with chat on Ollama a Claude id went to Ollama; a bare name
+    /// did the same; `ollama/` went to `[llm].ollama_url` without the token.
     fn create_client_for_model(&self, model_spec: &str) -> Result<(LlmClient, String), String> {
-        if let Some((provider, model)) = model_spec.split_once('/') {
-            let client = match provider.to_lowercase().as_str() {
-                "ollama" => {
-                    let url = self
-                        .config
-                        .summarization_ollama_url
-                        .as_deref()
-                        .unwrap_or("http://localhost:11434");
-                    LlmClient::ollama(url)
-                }
-                "openai" => {
-                    let api_key = self
-                        .config
-                        .openai_api_key
-                        .as_ref()
-                        .ok_or("OpenAI summarization requires API key configuration")?;
-                    LlmClient::openai(api_key)
-                }
-                "anthropic" => {
-                    // Use the same client (it already has auth)
-                    (*self.llm).clone()
-                }
-                "openrouter" => {
-                    let api_key = self
-                        .config
-                        .openrouter_api_key
-                        .as_ref()
-                        .ok_or("OpenRouter summarization requires API key configuration")?;
-                    LlmClient::openrouter(api_key)
-                }
-                _ => {
-                    return Err(format!("Unknown provider: {provider}"));
+        crate::summarizer::resolve_summarizer(self.summarizers.as_ref(), model_spec)
+    }
+
+    /// The context ladder's summarization settings: the Settings list, in
+    /// order, resolved through this agent's resolver.
+    fn context_summarization_config(&self) -> ContextSummarizationConfig {
+        ContextSummarizationConfig {
+            clients: self.summarizers.clone(),
+            ..ContextSummarizationConfig::new(self.config.summarization_priority.clone())
+        }
+    }
+
+    /// Walk `summarization_priority` in the order Settings lists it and return
+    /// the first answer `usable` accepts.
+    ///
+    /// A model is passed over when it cannot be resolved, when its call fails,
+    /// or when its answer is empty or implausible — the next one is tried, and
+    /// `None` means none answered (or the list is empty). The order is the
+    /// user's, never reordered by health: the owner asked for the Settings
+    /// order, and chat's stats say nothing about a summarizer.
+    ///
+    /// `deadline` bounds the WHOLE walk, not each model: an inline caller's
+    /// liveness bound must not multiply by the length of the list. When it
+    /// passes, the walk ends there — trying a later model with no time left
+    /// would only fail again. It is not optional: every caller of this walk
+    /// is on a step's critical path, and a walk with no bound is exactly the
+    /// wedge each caller's own deadline exists to close.
+    async fn complete_with_summarizers<T>(
+        &self,
+        purpose: &'static str,
+        deadline: tokio::time::Instant,
+        request_for: impl Fn(String) -> AnthropicRequest,
+        usable: impl Fn(&[ContentBlock]) -> Option<T>,
+    ) -> Option<T> {
+        for spec in &self.config.summarization_priority {
+            let (client, model) = match self.create_client_for_model(spec) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    warn!(purpose, model = %spec, error = %e, "Summarization model unavailable, trying the next");
+                    continue;
                 }
             };
-            Ok((client, model.to_string()))
-        } else {
-            // No provider prefix - use the main LLM client with the specified model
-            Ok(((*self.llm).clone(), model_spec.to_string()))
+            let request = request_for(model);
+            let call = client.complete_anthropic(&request);
+            let Ok(outcome) = tokio::time::timeout_at(deadline, call).await else {
+                warn!(purpose, model = %spec, "Summarization ran out of time; no further model is tried");
+                return None;
+            };
+            match outcome {
+                Ok(response) => {
+                    if let Some(value) = usable(&response.content) {
+                        return Some(value);
+                    }
+                    warn!(purpose, model = %spec, "Summarization model gave no usable answer, trying the next");
+                }
+                Err(e) => {
+                    warn!(purpose, model = %spec, error = %e, "Summarization call failed, trying the next");
+                }
+            }
         }
+        None
     }
 
     /// Classify the current iteration's complexity and route to the cheapest capable model.
@@ -8115,16 +8254,14 @@ impl Agent {
     /// unbounded inline network call wedges the whole step if it never
     /// returns. Distillation is an optimization; skipping a round is always
     /// acceptable, stalling the step never is.
+    ///
+    /// The Settings list is walked in order, and [`DISTILLATION_TIMEOUT`] is
+    /// ONE deadline for the whole walk rather than one per model: a list of N
+    /// models must not stretch the step's liveness bound N-fold.
     async fn run_progressive_distillation(&self) {
         if self.config.summarization_priority.is_empty() {
             return;
         }
-
-        let Ok((client, model_name)) =
-            self.create_client_for_model(&self.config.summarization_priority[0])
-        else {
-            return;
-        };
 
         let ctx = self.context.read().await;
         // Only distill if we have enough messages
@@ -8167,64 +8304,51 @@ impl Agent {
         );
         drop(ctx);
 
-        let request = AnthropicRequest {
-            context_limit: None,
-            messages: vec![AnthropicMessage::user_text(prompt)],
-            max_tokens: 512,
-            temperature: nanna_llm::sampling_temperature_for_model(&model_name, 0.2),
-            model: model_name,
-            system: Some("You are a conversation distiller. Output ONLY structured key-value facts, one per line. No prose.".to_string()),
-            tools: None,
-            stream: None,
-            thinking: None,
-            cache_control: None,
-        };
-
-        let completion = tokio::time::timeout(
-            DISTILLATION_TIMEOUT,
-            client.complete_anthropic(&request),
-        )
-        .await;
-        match completion {
-            Ok(Ok(response)) => {
-                let facts: String = response
-                    .content
-                    .iter()
-                    .filter_map(|b| {
-                        if let ContentBlock::Text { text } = b {
-                            Some(text.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !facts.is_empty() {
-                    // Rolling replace of the distilled-facts slot ONLY. This
-                    // used to overwrite `consolidated_summary` wholesale,
-                    // which destroyed every earlier summarization product —
-                    // including the record of verified-passing work — with
-                    // ≤512 tokens about the last ten messages (observed live
-                    // 2026-08-10: 2571→934 chars right before a from-scratch
-                    // rewrite over passing work).
-                    self.context.write().await.set_distilled_facts(facts.as_str());
-                    info!(
-                        facts_len = facts.len(),
-                        "🧬 Progressive distillation complete"
-                    );
-                }
-            }
+        let deadline = tokio::time::Instant::now() + DISTILLATION_TIMEOUT;
+        let facts = self
+            .complete_with_summarizers(
+                "distillation",
+                deadline,
+                |model| AnthropicRequest {
+                    context_limit: None,
+                    messages: vec![AnthropicMessage::user_text(prompt.clone())],
+                    max_tokens: 512,
+                    temperature: nanna_llm::sampling_temperature_for_model(&model, 0.2),
+                    model,
+                    system: Some("You are a conversation distiller. Output ONLY structured key-value facts, one per line. No prose.".to_string()),
+                    tools: None,
+                    stream: None,
+                    thinking: None,
+                    cache_control: None,
+                },
+                |content| {
+                    let facts = joined_text(content);
+                    (!facts.trim().is_empty()).then_some(facts)
+                },
+            )
+            .await;
+        if let Some(facts) = facts {
+            // Rolling replace of the distilled-facts slot ONLY. This
+            // used to overwrite `consolidated_summary` wholesale,
+            // which destroyed every earlier summarization product —
+            // including the record of verified-passing work — with
+            // ≤512 tokens about the last ten messages (observed live
+            // 2026-08-10: 2571→934 chars right before a from-scratch
+            // rewrite over passing work).
+            self.context.write().await.set_distilled_facts(facts.as_str());
+            info!(
+                facts_len = facts.len(),
+                "🧬 Progressive distillation complete"
+            );
+        } else {
             // warn, not debug: a failure here is rare (at most once per
             // distillation interval) and a silent one is exactly how the
-            // 2026-08-10 wedge stayed undiagnosable for 50 minutes.
-            Ok(Err(e)) => {
-                warn!(error = %e, "Progressive distillation failed — skipping this round");
-            }
-            Err(_elapsed) => {
-                warn!(
-                    timeout_secs = DISTILLATION_TIMEOUT.as_secs(),
-                    "Progressive distillation timed out — skipping this round"
-                );
-            }
+            // 2026-08-10 wedge stayed undiagnosable for 50 minutes. The
+            // walk has already named each model's failure.
+            warn!(
+                timeout_secs = DISTILLATION_TIMEOUT.as_secs(),
+                "Progressive distillation: no summarization model produced facts — skipping this round"
+            );
         }
     }
 
@@ -8437,18 +8561,23 @@ impl Agent {
         None
     }
 
-    /// Summarize a large tool output using the cheapest available summarization model.
-    /// Returns None if no summarization model is configured.
-    async fn summarize_tool_output(&self, tool_name: &str, content: &str) -> Option<String> {
+    /// Summarize a large tool output with the summarization models, in the
+    /// order Settings lists them.
+    ///
+    /// Returns `None` — and the caller cuts the output to a preview — when the
+    /// list is empty, when no listed model gives a plausible summary, or when
+    /// `deadline` passes first. The caller's deadline is the whole
+    /// compaction's ([`TOOL_OUTPUT_COMPACTION_DEADLINE`]), so this walk gets
+    /// what the compression walk before it left.
+    async fn summarize_tool_output(
+        &self,
+        tool_name: &str,
+        content: &str,
+        deadline: tokio::time::Instant,
+    ) -> Option<String> {
         if self.config.summarization_priority.is_empty() {
             return None;
         }
-
-        let Ok((client, model_name)) =
-            self.create_client_for_model(&self.config.summarization_priority[0])
-        else {
-            return None;
-        };
 
         // Tool-type-aware summarization prompts
         let instruction = match tool_name {
@@ -8477,39 +8606,31 @@ impl Agent {
             content.len()
         );
 
-        let request = AnthropicRequest {
-            context_limit: None,
-            messages: vec![AnthropicMessage::user_text(prompt)],
-            max_tokens: 1024,
-            temperature: nanna_llm::sampling_temperature_for_model(&model_name, 0.2),
-            model: model_name,
-            system: Some("You are a tool output summarizer. Output ONLY the summarized content, no preamble or explanation. Preserve key information density.".to_string()),
-            tools: None,
-            stream: None,
-            thinking: None,
-            cache_control: None,
-        };
-
-        match client.complete_anthropic(&request).await {
-            Ok(response) => {
-                let text: String = response
-                    .content
-                    .iter()
-                    .filter_map(|b| {
-                        if let ContentBlock::Text { text } = b {
-                            Some(text.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if text.is_empty() { None } else { Some(text) }
-            }
-            Err(e) => {
-                debug!(error = %e, "Tool output summarization failed, falling back to truncation");
-                None
-            }
-        }
+        self.complete_with_summarizers(
+            "tool output summary",
+            deadline,
+            |model| AnthropicRequest {
+                context_limit: None,
+                messages: vec![AnthropicMessage::user_text(prompt.clone())],
+                max_tokens: 1024,
+                temperature: nanna_llm::sampling_temperature_for_model(&model, 0.2),
+                model,
+                system: Some("You are a tool output summarizer. Output ONLY the summarized content, no preamble or explanation. Preserve key information density.".to_string()),
+                tools: None,
+                stream: None,
+                thinking: None,
+                cache_control: None,
+            },
+            // The summary REPLACES the output in context, so a degenerate
+            // one (empty, "...", a bare title) is a failed model, not an
+            // answer: the next model gets its turn, and the preview cut
+            // after the last at least keeps a real prefix of the data.
+            |answer| {
+                let text = joined_text(answer);
+                crate::context::plausible_summary(&text, content.len()).then_some(text)
+            },
+        )
+        .await
     }
 
     async fn store_tool_results(&self, tool_results: Vec<ContentBlock>) {
@@ -8538,7 +8659,9 @@ impl Agent {
             // Window-scaled: a demoted window shrinks the reserve with it
             // (window/4, floored at the derived per-step minimum) instead of
             // letting a half-window claim dominate the floor.
-            let info = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "");
+            let info = self
+                .llm
+                .model_info_from_cache_or_unknown(&self.config.model);
             let reserve = info.effective_output_budget(window_scaled_output_reserve(
                 info.context_window,
                 self.config.max_tokens as usize,
@@ -8629,7 +8752,9 @@ impl Agent {
             msgs
         };
 
-        let model_info = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "");
+        let model_info = self
+            .llm
+            .model_info_from_cache_or_unknown(&self.config.model);
         // Paired with configure_for_model_with_output at run start: the
         // context's hard input limit reserved this budget (plus the Claude
         // thinking budget), so input + output can't over-commit THIS model's
@@ -8874,10 +8999,26 @@ impl Agent {
     /// Uses a quick LLM call to identify noteworthy information that should be
     /// remembered long-term. Returns a list of extracted memory strings.
     ///
+    /// The summarization models are asked first, in the order Settings lists
+    /// them, then the chat model — all of it within one call's worth of the
+    /// transport's silence tolerance ([`nanna_llm::STREAM_READ_TIMEOUT_SECS`]),
+    /// because extraction runs inline. Running out of time extracts nothing
+    /// this time, and is logged, not an error.
+    ///
     /// # Errors
     ///
-    /// Returns `AgentError::Llm` if the extraction LLM call fails.
+    /// Returns `AgentError::Llm` if the chat model's call fails after every
+    /// listed model has.
     pub async fn extract_memories(&self) -> Result<Vec<ExtractedMemory>, AgentError> {
+        self.extract_memories_within(MEMORY_EXTRACTION_DEADLINE).await
+    }
+
+    /// [`Self::extract_memories`], with every model call finished within
+    /// `budget` of the first one starting.
+    async fn extract_memories_within(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<Vec<ExtractedMemory>, AgentError> {
         let ctx = self.context.read().await;
 
         // Skip if no conversation yet
@@ -8905,36 +9046,14 @@ impl Agent {
 
         // Create extraction request (conversation fenced as untrusted data).
         let extraction_prompt = build_extraction_prompt(&conversation_text);
-
-        // Use the first usable summarization model (cheaper than main model)
-        let (client, model_name) = if self.config.summarization_priority.is_empty() {
-            ((*self.llm).clone(), self.config.model.clone())
-        } else {
-            let mut found = None;
-            for model_spec in &self.config.summarization_priority {
-                match self.create_client_for_model(model_spec) {
-                    Ok(pair) => {
-                        found = Some(pair);
-                        break;
-                    }
-                    Err(e) => {
-                        debug!("Skipping summarization model {}: {}", model_spec, e);
-                    }
-                }
-            }
-            found.unwrap_or_else(|| ((*self.llm).clone(), self.config.model.clone()))
-        };
-
-        info!(model = %model_name, "Running memory extraction");
-
-        let request = AnthropicRequest {
+        let request_for = |model: String| AnthropicRequest {
             context_limit: None,
-            messages: vec![AnthropicMessage::user_text(extraction_prompt)],
+            messages: vec![AnthropicMessage::user_text(extraction_prompt.clone())],
             max_tokens: 1024,
             // Lower temperature for more consistent extraction — where the
             // resolved model still has a temperature to set.
-            temperature: nanna_llm::sampling_temperature_for_model(&model_name, 0.3),
-            model: model_name,
+            temperature: nanna_llm::sampling_temperature_for_model(&model, 0.3),
+            model,
             system: Some("You are a memory extraction system. Output only valid JSON.".to_string()),
             tools: None,
             stream: None,
@@ -8942,47 +9061,96 @@ impl Agent {
             cache_control: None, // Short one-shot requests don't benefit from caching
         };
 
-        let response = client.complete_anthropic(&request).await?;
-
-        // Parse the response
-        let mut memories = Vec::new();
-        for block in &response.content {
-            if let ContentBlock::Text { text } = block {
-                let trimmed = text.trim();
-
-                // Strip markdown code fences if present (LLMs often wrap JSON in ```json ... ```)
-                let json_str = if trimmed.starts_with("```") {
-                    let without_opening = trimmed
-                        .strip_prefix("```json")
-                        .or_else(|| trimmed.strip_prefix("```"))
-                        .unwrap_or(trimmed);
-                    without_opening
-                        .strip_suffix("```")
-                        .unwrap_or(without_opening)
-                        .trim()
-                } else {
-                    trimmed
-                };
-
-                if let Some(parsed) = nanna_llm::heal_json_as::<Vec<ExtractedMemoryRaw>>(json_str) {
-                    memories.extend(filter_extracted_memories(parsed));
-                } else {
-                    // This branch is reached precisely when the model wrote prose
-                    // instead of JSON, so the preview is arbitrary model-written
-                    // text: `.min(200)` clamps the length but not the boundary, and
-                    // a raw slice there panics on the first em-dash the model emits.
-                    let end = truncate_boundary(json_str, 200);
-                    warn!(
-                        "Memory extraction JSON parse failed after healing — raw response: {}",
-                        &json_str[..end]
-                    );
-                }
-            }
-        }
+        // The summarization models first, in the order Settings lists them
+        // (cheaper than the main model); a model whose call fails or whose
+        // answer is not the JSON asked for hands over to the next.
+        info!(
+            models = ?self.config.summarization_priority,
+            "Running memory extraction"
+        );
+        let deadline = tokio::time::Instant::now() + budget;
+        let memories = if let Some(memories) = self
+            .complete_with_summarizers(
+                "memory extraction",
+                deadline,
+                &request_for,
+                parse_extracted_memories,
+            )
+            .await
+        {
+            memories
+        } else if tokio::time::Instant::now() >= deadline {
+            warn!(
+                model = %self.config.model,
+                "Memory extraction ran out of time before the chat model could be asked; \
+                 nothing is extracted this time"
+            );
+            Vec::new()
+        } else {
+            // Extraction is not truncation: with no summarization model
+            // listed, or none answering, the chat model does the job, as it
+            // always has for an empty list — in the time the list left.
+            info!(model = %self.config.model, "Running memory extraction on the chat model");
+            let request = request_for(self.config.model.clone());
+            let call = self.llm.complete_anthropic(&request);
+            let Ok(response) = tokio::time::timeout_at(deadline, call).await else {
+                warn!(
+                    model = %self.config.model,
+                    "Memory extraction on the chat model ran out of time; nothing is extracted \
+                     this time"
+                );
+                return Ok(Vec::new());
+            };
+            parse_extracted_memories(&response?.content).unwrap_or_default()
+        };
 
         info!("Extracted {} memories from conversation", memories.len());
         Ok(memories)
     }
+}
+
+/// The memories in an extraction answer, or `None` when no text block of it
+/// parses as the JSON array asked for — prose instead of JSON is a failed
+/// answer, not an empty one. An array with nothing worth keeping is a real
+/// answer and comes back as `Some(empty)`.
+fn parse_extracted_memories(content: &[ContentBlock]) -> Option<Vec<ExtractedMemory>> {
+    let mut memories: Option<Vec<ExtractedMemory>> = None;
+    for block in content {
+        if let ContentBlock::Text { text } = block {
+            let trimmed = text.trim();
+
+            // Strip markdown code fences if present (LLMs often wrap JSON in ```json ... ```)
+            let json_str = if trimmed.starts_with("```") {
+                let without_opening = trimmed
+                    .strip_prefix("```json")
+                    .or_else(|| trimmed.strip_prefix("```"))
+                    .unwrap_or(trimmed);
+                without_opening
+                    .strip_suffix("```")
+                    .unwrap_or(without_opening)
+                    .trim()
+            } else {
+                trimmed
+            };
+
+            if let Some(parsed) = nanna_llm::heal_json_as::<Vec<ExtractedMemoryRaw>>(json_str) {
+                memories
+                    .get_or_insert_with(Vec::new)
+                    .extend(filter_extracted_memories(parsed));
+            } else {
+                // This branch is reached precisely when the model wrote prose
+                // instead of JSON, so the preview is arbitrary model-written
+                // text: `.min(200)` clamps the length but not the boundary, and
+                // a raw slice there panics on the first em-dash the model emits.
+                let end = truncate_boundary(json_str, 200);
+                warn!(
+                    "Memory extraction JSON parse failed after healing — raw response: {}",
+                    &json_str[..end]
+                );
+            }
+        }
+    }
+    memories
 }
 
 /// Filter raw extraction results before storing: drop empty/whitespace-only
@@ -11768,14 +11936,14 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_below_floor_demotion_fails_the_step_loudly() {
         let model = "test-below-floor-model:9b";
-        // Walk the latch to a 4096 floor exactly as VRAM pressure with that
-        // caller-supplied clamp would.
-        while nanna_llm::LlmClient::demote_context(model, Some(4_096)).is_some() {}
-        assert_eq!(nanna_llm::LlmClient::effective_num_ctx(model), Some(4_096));
-
-        let tools = Arc::new(ToolRegistry::new());
         // Never contacted: the floor check fires before the first request.
         let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        // Walk the latch to a 4096 floor exactly as VRAM pressure with that
+        // caller-supplied clamp would.
+        while llm.demote_context(model, Some(4_096)).is_some() {}
+        assert_eq!(llm.effective_num_ctx(model), Some(4_096));
+
+        let tools = Arc::new(ToolRegistry::new());
         let config = AgentConfig {
             model: model.to_string(),
             ..AgentConfig::default()
@@ -11817,6 +11985,43 @@ mod repeat_failure_breaker_tests {
         );
     }
 
+    /// The agent budgets from the window of the server its own client sends
+    /// to. The same model walked down to 4096 on another server (a summarizer
+    /// on a second Ollama, or the server chat used before a Settings change)
+    /// must not stop this step at the floor, shrink its budgets, or cut its
+    /// prompt for a window its requests do not carry.
+    #[tokio::test]
+    async fn a_window_walked_down_on_another_server_does_not_stop_this_agent() {
+        let model = "test-other-server-floor-model:9b";
+        let elsewhere = LlmClient::ollama("https://gpubox.example/ollama");
+        while elsewhere.demote_context(model, Some(4_096)).is_some() {}
+        assert_eq!(elsewhere.effective_num_ctx(model), Some(4_096));
+
+        let tools = Arc::new(ToolRegistry::new());
+        // Connection refused instantly: the run must get past the floor check
+        // and die at the LLM.
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let config = AgentConfig {
+            model: model.to_string(),
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(config, llm, tools);
+        {
+            // Past the other server's 4096, well inside this server's window.
+            let mut ctx = agent.context.write().await;
+            ctx.system_prompt = "system directive ".repeat(1_500);
+        }
+
+        let err = agent
+            .run("do the thing", RunOptions::default())
+            .await
+            .expect_err("the LLM at port 9 must refuse the connection");
+        assert!(
+            !matches!(err, AgentError::ContextBelowFloor { .. }),
+            "another server's window stopped this agent: {err}"
+        );
+    }
+
     /// After a demotion to 4096, a step prompt assembled by the REAL request
     /// builder fits the new window: input estimate under the re-derived hard
     /// limit, and the request's `max_tokens` claims only the remainder. The
@@ -11825,10 +12030,10 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_step_prompt_assembled_after_demotion_fits_the_new_window() {
         let model = "test-post-demotion-fit-model:9b";
-        while nanna_llm::LlmClient::demote_context(model, Some(4_096)).is_some() {}
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        while llm.demote_context(model, Some(4_096)).is_some() {}
 
         let tools = Arc::new(ToolRegistry::new());
-        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
         let config = AgentConfig {
             model: model.to_string(),
             ..AgentConfig::default()
@@ -11847,7 +12052,7 @@ mod repeat_failure_breaker_tests {
 
             // The fresh-step path: budgets configured from the latch-clamped
             // info, then the no-LLM ladder tail brings history under them.
-            let live_info = nanna_llm::model_info_from_cache_or_unknown(model, "");
+            let live_info = agent.llm.model_info_from_cache_or_unknown(model);
             assert_eq!(
                 live_info.context_window, 4_096,
                 "model info must serve the demoted window, not the provider claim"
@@ -12087,16 +12292,16 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_pressure_tier_step_fits_an_8192_window_where_the_full_catalog_did_not() {
         let model = "test-pressure-tier-model:9b";
-        // Walk the latch to 8192 exactly as repeated VRAM demotions clamped
-        // at an 8192 floor would land it.
-        while nanna_llm::LlmClient::demote_context(model, Some(8_192)).is_some() {}
-        assert_eq!(nanna_llm::LlmClient::effective_num_ctx(model), Some(8_192));
-
-        let tools = Arc::new(ToolRegistry::new());
-        let fat_names = fat_catalog(&tools).await;
         // Connection refused instantly — the run must get PAST the floor
         // check and die at the LLM, proving the step was allowed to proceed.
         let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        // Walk the latch to 8192 exactly as repeated VRAM demotions clamped
+        // at an 8192 floor would land it.
+        while llm.demote_context(model, Some(8_192)).is_some() {}
+        assert_eq!(llm.effective_num_ctx(model), Some(8_192));
+
+        let tools = Arc::new(ToolRegistry::new());
+        let fat_names = fat_catalog(&tools).await;
         let config = AgentConfig {
             model: model.to_string(),
             ..AgentConfig::default()
@@ -12162,15 +12367,15 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_full_window_keeps_the_full_catalog_and_stays_silent() {
         let model = "test-full-window-catalog-model:9b";
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
         assert!(
-            nanna_llm::LlmClient::effective_num_ctx(model).is_none(),
+            llm.effective_num_ctx(model).is_none(),
             "this model must be unlatched — the floor path is scoped to \
              latch-governed models"
         );
 
         let tools = Arc::new(ToolRegistry::new());
         let fat_names = fat_catalog(&tools).await;
-        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
         let config = AgentConfig {
             model: model.to_string(),
             ..AgentConfig::default()
@@ -15165,5 +15370,612 @@ mod prompt_cache_control_tests {
     fn other_providers_never_get_a_marker() {
         assert!(prompt_cache_control("qwen3.5:9b", CacheTtl::OneHour).is_none());
         assert!(prompt_cache_control("gpt-5", CacheTtl::FiveMinutes).is_none());
+    }
+}
+
+/// The owner's rule for summaries: the Settings list, in order, with
+/// fallbacks. Every summarizing consumer resolves each entry through the
+/// agent's resolver, passes over a model that cannot answer for the next one,
+/// and falls back (cut to fit, or the chat model for memory extraction) only
+/// when no listed model answers.
+///
+/// Each test lists two models: the first one's server refuses every request,
+/// the second answers. Chat itself is pointed at a refusing server, so an
+/// answer can only have come from the listed model that was supposed to give
+/// it.
+#[cfg(test)]
+mod summarizer_walk_tests {
+    use super::*;
+    use crate::summarizer::test_server::{REFUSING, spawn_answering, spawn_silent, stub_clients};
+
+    const FIRST: &str = "ollama/nanna-test-first-refuses:1b";
+    const SECOND: &str = "ollama/nanna-test-second-answers:1b";
+    const SECOND_BARE: &str = "nanna-test-second-answers:1b";
+
+    /// A plausible stand-in summary: long enough in absolute terms (64 chars)
+    /// and against every source below (0.1% of it).
+    const SUMMARY: &str = "SECOND-MODEL SUMMARY: the user asked for a parser fix; the agent \
+                           edited parser.rs and every test passed.";
+
+    /// Scores for eight sentences, one per line: keep the first and fifth.
+    const SCORES: &str = "9\n1\n1\n1\n9\n1\n1\n1";
+
+    fn agent_with(summarizers: crate::SummarizerClients) -> Agent {
+        let config = AgentConfig {
+            summarization_priority: vec![FIRST.to_string(), SECOND.to_string()],
+            ..AgentConfig::default()
+        };
+        Agent::new(
+            config,
+            Arc::new(LlmClient::ollama(REFUSING)),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_summarizer_clients(summarizers)
+    }
+
+    /// FIRST refuses, SECOND is served at `second_url`.
+    fn agent_with_two_summarizers(second_url: &str) -> Agent {
+        agent_with(stub_clients(&[(FIRST, REFUSING), (SECOND, second_url)]))
+    }
+
+    /// One line of prose `sentences` sentences long: never line-structured,
+    /// so compression always asks a model.
+    fn prose(sentences: usize) -> String {
+        let mut text = String::new();
+        for i in 0..sentences {
+            let _ = write!(
+                text,
+                "Sentence number {i} records one distinct fact about the build that just ran. "
+            );
+        }
+        text
+    }
+
+    /// A context over its hard limit by about half again.
+    fn over_the_limit_context() -> AgentContext {
+        let mut ctx = AgentContext::new("s");
+        for i in 0..30 {
+            ctx.messages.push(AnthropicMessage::user_text(format!(
+                "turn {i}: {}",
+                "word ".repeat(80)
+            )));
+        }
+        ctx.hard_limit = 2_000;
+        assert!(ctx.exceeds_hard_limit(), "the fixture must need the ladder");
+        ctx
+    }
+
+    fn models_seen(seen: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        seen.lock().expect("record lock").clone()
+    }
+
+    /// The deadline a real compaction hands its summary walk.
+    fn compaction_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + TOOL_OUTPUT_COMPACTION_DEADLINE
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_context_ladder_summarizes_on_the_next_model() {
+        let (url, seen) = spawn_answering(SUMMARY).await;
+        let agent = agent_with_two_summarizers(&url);
+        let mut ctx = over_the_limit_context();
+        let hard_limit = ctx.hard_limit;
+
+        agent.ladder_hard_cap_tier(&mut ctx, hard_limit).await;
+
+        assert!(
+            ctx.consolidated_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains(SUMMARY)),
+            "the second model's summary stands in for the history: {:?}",
+            ctx.consolidated_summary
+        );
+        assert_eq!(
+            ctx.take_pending_loss_notices(),
+            Vec::<String>::new(),
+            "nothing was cut, so nothing is announced as lost"
+        );
+        let models = models_seen(&seen);
+        assert!(!models.is_empty() && models.iter().all(|m| m == SECOND_BARE), "{models:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn older_tool_results_compress_on_the_next_model() {
+        let (url, seen) = spawn_answering(SCORES).await;
+        let agent = agent_with_two_summarizers(&url);
+        let mut ctx = AgentContext::new("s");
+        ctx.messages.push(AnthropicMessage::user_text("the request"));
+        ctx.messages
+            .push(AnthropicMessage::tool_result("t1", prose(8), false));
+        for i in 0..3 {
+            ctx.messages
+                .push(AnthropicMessage::user_text(format!("recent {i}")));
+        }
+
+        assert_eq!(agent.compress_older_context_tool_results(&mut ctx, 2).await, 1);
+        assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_tool_result_is_compacted_by_the_next_model() {
+        let (url, seen) = spawn_answering(SCORES).await;
+        let agent = agent_with_two_summarizers(&url);
+        let content = prose(8);
+
+        let compacted = agent
+            .compact_context_result("exec", content.clone(), 100)
+            .await;
+
+        assert!(!compacted.contains("[PREVIEW CUT"), "{compacted}");
+        assert!(compacted.len() < content.len() / 2, "{compacted}");
+        assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
+    }
+
+    /// The marker a character-level head-and-tail cut leaves
+    /// (`compressor::fallback_compress`): the content was reduced
+    /// mechanically, not by a model's scores.
+    const MECHANICAL_CUT: &str = "[...compressed:";
+
+    /// An answer with no score in it: a model that summarized when it was
+    /// asked to score.
+    const UNSCORED: &str = "Here is a summary: the build ran and every test passed.";
+
+    /// One score per sentence of `prose(sentences)`: every fourth sentence
+    /// (0, 4, 8, …) scores 9 and the rest 1, so a ratio-4 compression keeps
+    /// exactly those.
+    fn scores_keeping_every_fourth(sentences: usize) -> String {
+        (0..sentences)
+            .map(|i| if i % 4 == 0 { "9" } else { "1" })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A context whose one older tool result is `content`, followed by three
+    /// recent turns that a `keep_recent` of 2 protects.
+    fn context_with_older_result(content: String) -> AgentContext {
+        let mut ctx = AgentContext::new("s");
+        ctx.messages.push(AnthropicMessage::user_text("the request"));
+        ctx.messages
+            .push(AnthropicMessage::tool_result("t1", content, false));
+        for i in 0..3 {
+            ctx.messages
+                .push(AnthropicMessage::user_text(format!("recent {i}")));
+        }
+        ctx
+    }
+
+    /// The older tool result of a [`context_with_older_result`] context.
+    fn older_result(ctx: &AgentContext) -> String {
+        match &ctx.messages[1].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+            other => panic!("the fixture's second message is a tool result: {other:?}"),
+        }
+    }
+
+    /// A model that answers without one score per sentence selects nothing,
+    /// so both compression paths move on to the next model. The answer used
+    /// to be taken as success: the walk stopped at a mechanical head-and-tail
+    /// cut, and the next model, which could score, was never asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unscored_answer_hands_the_compression_to_the_next_model() {
+        let (unscored, _) = spawn_answering(UNSCORED).await;
+        let (scorer, seen) = spawn_answering(&scores_keeping_every_fourth(20)).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &unscored), (SECOND, &scorer)]));
+
+        let mut ctx = context_with_older_result(prose(20));
+        assert_eq!(agent.compress_older_context_tool_results(&mut ctx, 2).await, 1);
+        let older = older_result(&ctx);
+        assert!(!older.contains(MECHANICAL_CUT), "{older}");
+        assert!(
+            older.contains("Sentence number 4 ") && !older.contains("Sentence number 5 "),
+            "the second model's selection: {older}"
+        );
+
+        let compacted = agent.compact_context_result("exec", prose(20), 100).await;
+        assert!(!compacted.contains(MECHANICAL_CUT), "{compacted}");
+        assert!(
+            compacted.contains("Sentence number 4 ") && !compacted.contains("Sentence number 5 "),
+            "the second model's selection: {compacted}"
+        );
+
+        assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string(); 2]);
+    }
+
+    /// When no listed model scores, the walk still ends in the mechanical
+    /// reduction it always fell back to — but only after every model has had
+    /// its turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn when_no_model_scores_each_one_is_asked_before_the_mechanical_cut() {
+        let (first, first_seen) = spawn_answering(UNSCORED).await;
+        let (second, second_seen) = spawn_answering(UNSCORED).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &first), (SECOND, &second)]));
+
+        let mut ctx = context_with_older_result(prose(20));
+        assert_eq!(agent.compress_older_context_tool_results(&mut ctx, 2).await, 1);
+        let older = older_result(&ctx);
+        assert!(older.contains(MECHANICAL_CUT), "{older}");
+        let compacted = agent.compact_context_result("exec", prose(20), 100).await;
+        assert!(compacted.contains(MECHANICAL_CUT), "{compacted}");
+
+        assert_eq!(models_seen(&first_seen).len(), 2, "once per compression");
+        assert_eq!(
+            models_seen(&second_seen).len(),
+            2,
+            "the second model is asked before the mechanical cut"
+        );
+    }
+
+    /// One deadline bounds a whole compaction — the compression walk and the
+    /// summary walk after it. A silent first model holds the step to that
+    /// deadline, not to the transport's timeout (once per walk), and the
+    /// output is cut to a preview that says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_deadline_bounds_a_whole_compaction() {
+        let silent = spawn_silent().await;
+        let (scorer, seen) = spawn_answering(&scores_keeping_every_fourth(20)).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &silent), (SECOND, &scorer)]));
+        let started = std::time::Instant::now();
+
+        let compacted = agent
+            .compact_context_result_within(
+                "exec",
+                prose(20),
+                100,
+                std::time::Duration::from_millis(300),
+            )
+            .await;
+
+        assert!(compacted.contains("[PREVIEW CUT"), "{compacted}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the compaction ends at its deadline, not at the transport's"
+        );
+        assert_eq!(
+            models_seen(&seen),
+            Vec::<String>::new(),
+            "no later model is started once the deadline has passed"
+        );
+    }
+
+    /// A proactive compression pass shares one deadline across every older
+    /// result it compresses: a silent model costs the step that deadline
+    /// once, not the transport's timeout per result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_deadline_bounds_a_proactive_compression_pass() {
+        let silent = spawn_silent().await;
+        let (scorer, seen) = spawn_answering(&scores_keeping_every_fourth(20)).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &silent), (SECOND, &scorer)]));
+        let mut ctx = context_with_older_result(prose(20));
+        ctx.messages
+            .insert(2, AnthropicMessage::tool_result("t2", prose(20), false));
+        let started = std::time::Instant::now();
+
+        let compressed = agent
+            .compress_older_context_tool_results_within(
+                &mut ctx,
+                2,
+                std::time::Duration::from_millis(300),
+            )
+            .await;
+
+        assert_eq!(compressed, 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the pass ends at its deadline, not at the transport's"
+        );
+        assert_eq!(models_seen(&seen), Vec::<String>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_output_summary_moves_past_a_refusing_model() {
+        let (url, seen) = spawn_answering(SUMMARY).await;
+        let agent = agent_with_two_summarizers(&url);
+
+        let summary = agent.summarize_tool_output("exec", &prose(40), compaction_deadline()).await;
+
+        assert_eq!(summary.as_deref(), Some(SUMMARY));
+        assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distillation_moves_past_a_refusing_model() {
+        let facts = "user_goal: ship the parser fix\ncurrent_state: tests passing";
+        let (url, seen) = spawn_answering(facts).await;
+        let agent = agent_with_two_summarizers(&url);
+        for i in 0..8 {
+            agent
+                .context
+                .write()
+                .await
+                .messages
+                .push(AnthropicMessage::user_text(format!("turn {i}")));
+        }
+
+        agent.run_progressive_distillation().await;
+
+        assert_eq!(
+            agent.context.read().await.distilled_facts.as_deref(),
+            Some(facts)
+        );
+        assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
+    }
+
+    /// A conversation long enough to be worth extracting from.
+    async fn seed_conversation(agent: &Agent) {
+        let mut ctx = agent.context.write().await;
+        ctx.messages.push(AnthropicMessage::user_text(
+            "I always drink tea in the morning and never coffee; please remember that for later.",
+        ));
+        ctx.messages.push(AnthropicMessage::assistant_text(
+            "Noted: tea in the morning, never coffee. I will keep that in mind.",
+        ));
+    }
+
+    const MEMORIES: &str =
+        r#"[{"content":"The user drinks tea in the morning, never coffee","category":"preference"}]"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_extraction_moves_past_a_refusing_model() {
+        let (url, seen) = spawn_answering(MEMORIES).await;
+        let agent = agent_with_two_summarizers(&url);
+        seed_conversation(&agent).await;
+
+        let memories = agent
+            .extract_memories()
+            .await
+            .expect("the second listed model answers");
+
+        assert_eq!(memories.len(), 1, "{memories:?}");
+        assert_eq!(
+            memories[0].content,
+            "The user drinks tea in the morning, never coffee"
+        );
+        assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
+    }
+
+    /// Extraction is not truncation: when no listed model answers, the chat
+    /// model still does the job, as it always has for an empty list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_extraction_falls_back_to_the_chat_model_after_the_list() {
+        let (chat_url, chat_seen) = spawn_answering(MEMORIES).await;
+        let config = AgentConfig {
+            model: "nanna-test-chat:1b".to_string(),
+            summarization_priority: vec![FIRST.to_string(), SECOND.to_string()],
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(
+            config,
+            Arc::new(LlmClient::ollama(&chat_url)),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_summarizer_clients(stub_clients(&[(FIRST, REFUSING), (SECOND, REFUSING)]));
+        seed_conversation(&agent).await;
+
+        let memories = agent
+            .extract_memories()
+            .await
+            .expect("the chat model answers");
+
+        assert_eq!(memories.len(), 1, "{memories:?}");
+        assert_eq!(models_seen(&chat_seen), vec!["nanna-test-chat:1b".to_string()]);
+    }
+
+    /// Extraction runs inline at the end of every turn, so all of it — each
+    /// listed model and the chat model after them — shares one deadline. A
+    /// model still thinking when it passes ends extraction for this turn:
+    /// nothing later is started with no time left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_deadline_bounds_memory_extraction_and_its_chat_fallback() {
+        let silent = spawn_silent().await;
+        let (second_url, second_seen) = spawn_answering(MEMORIES).await;
+        let (chat_url, chat_seen) = spawn_answering(MEMORIES).await;
+        let config = AgentConfig {
+            model: "nanna-test-chat:1b".to_string(),
+            summarization_priority: vec![FIRST.to_string(), SECOND.to_string()],
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(
+            config,
+            Arc::new(LlmClient::ollama(&chat_url)),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_summarizer_clients(stub_clients(&[(FIRST, &silent), (SECOND, &second_url)]));
+        seed_conversation(&agent).await;
+        let started = std::time::Instant::now();
+
+        let memories = agent
+            .extract_memories_within(std::time::Duration::from_millis(300))
+            .await
+            .expect("running out of time is not an error");
+
+        assert!(memories.is_empty(), "nothing is extracted this time: {memories:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "extraction ends at its deadline, not at the transport's"
+        );
+        assert_eq!(models_seen(&second_seen), Vec::<String>::new());
+        assert_eq!(models_seen(&chat_seen), Vec::<String>::new());
+    }
+
+    /// The chat model after the list gets the time the list's fast failures
+    /// left over, and no more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_chat_fallback_is_held_to_what_the_list_left() {
+        let silent_chat = spawn_silent().await;
+        let config = AgentConfig {
+            model: "nanna-test-chat:1b".to_string(),
+            summarization_priority: vec![FIRST.to_string(), SECOND.to_string()],
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(
+            config,
+            Arc::new(LlmClient::ollama(&silent_chat)),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_summarizer_clients(stub_clients(&[(FIRST, REFUSING), (SECOND, REFUSING)]));
+        seed_conversation(&agent).await;
+        let started = std::time::Instant::now();
+
+        let memories = agent
+            .extract_memories_within(std::time::Duration::from_millis(300))
+            .await
+            .expect("running out of time is not an error");
+
+        assert!(memories.is_empty(), "{memories:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the chat model's call ends at the deadline, not at the transport's"
+        );
+    }
+
+    /// A model that answers with nothing usable has failed as surely as one
+    /// that refused: a degenerate summary would REPLACE the output, and prose
+    /// where JSON was asked for holds no memories.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unusable_answer_hands_over_to_the_next_model() {
+        let (degenerate, _) = spawn_answering("...").await;
+        let (good, seen) = spawn_answering(SUMMARY).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &degenerate), (SECOND, &good)]));
+        assert_eq!(
+            agent.summarize_tool_output("exec", &prose(40), compaction_deadline()).await.as_deref(),
+            Some(SUMMARY)
+        );
+        assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
+
+        let (prose_answer, _) =
+            spawn_answering("Sure! The user seems to like tea, I think.").await;
+        let (json_answer, seen) = spawn_answering(MEMORIES).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &prose_answer), (SECOND, &json_answer)]));
+        seed_conversation(&agent).await;
+        let memories = agent.extract_memories().await.expect("the second model answers");
+        assert_eq!(memories.len(), 1, "{memories:?}");
+        assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
+    }
+
+    /// A spec no provider serves is passed over the same way, before any
+    /// request is made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unresolvable_spec_hands_over_to_the_next_model() {
+        let (url, seen) = spawn_answering(SUMMARY).await;
+        // FIRST has no route: the resolver refuses it outright.
+        let agent = agent_with(stub_clients(&[(SECOND, &url)]));
+        let mut ctx = over_the_limit_context();
+        let hard_limit = ctx.hard_limit;
+
+        agent.ladder_hard_cap_tier(&mut ctx, hard_limit).await;
+
+        assert!(
+            ctx.consolidated_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains(SUMMARY)),
+            "{:?}",
+            ctx.consolidated_summary
+        );
+        let models = models_seen(&seen);
+        assert!(!models.is_empty() && models.iter().all(|m| m == SECOND_BARE), "{models:?}");
+    }
+
+    /// The deadline bounds the whole walk. A model still thinking when it
+    /// passes ends the walk: the next model is not started with no time left,
+    /// so an inline caller's liveness bound does not multiply by the list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_deadline_bounds_the_whole_walk() {
+        let silent = spawn_silent().await;
+        let (url, seen) = spawn_answering(SUMMARY).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &silent), (SECOND, &url)]));
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+
+        let answer = agent
+            .complete_with_summarizers(
+                "test",
+                deadline,
+                |model| AnthropicRequest {
+                    context_limit: None,
+                    messages: vec![AnthropicMessage::user_text("summarize")],
+                    max_tokens: 16,
+                    temperature: None,
+                    model,
+                    system: None,
+                    tools: None,
+                    stream: None,
+                    thinking: None,
+                    cache_control: None,
+                },
+                |content| Some(joined_text(content)),
+            )
+            .await;
+
+        assert_eq!(answer, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the walk ends at its deadline, not at the transport's"
+        );
+        assert_eq!(
+            models_seen(&seen),
+            Vec::<String>::new(),
+            "no later model is started once the deadline has passed"
+        );
+    }
+
+    /// Every listed model failing is the one case that cuts to fit, and it is
+    /// announced; the other consumers take their own no-model paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn when_no_listed_model_answers_each_consumer_falls_back() {
+        let agent = agent_with(stub_clients(&[(FIRST, REFUSING), (SECOND, REFUSING)]));
+
+        let mut ctx = over_the_limit_context();
+        let hard_limit = ctx.hard_limit;
+        agent.ladder_hard_cap_tier(&mut ctx, hard_limit).await;
+        let notices = ctx.take_pending_loss_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("every summarization model failed"),
+            "{}",
+            notices[0]
+        );
+
+        assert_eq!(agent.summarize_tool_output("exec", &prose(40), compaction_deadline()).await, None);
+        let compacted = agent.compact_context_result("exec", prose(8), 100).await;
+        assert!(compacted.contains("[PREVIEW CUT"), "{compacted}");
+
+        seed_conversation(&agent).await;
+        for i in 0..8 {
+            agent
+                .context
+                .write()
+                .await
+                .messages
+                .push(AnthropicMessage::user_text(format!("turn {i}")));
+        }
+        agent.run_progressive_distillation().await;
+        assert_eq!(agent.context.read().await.distilled_facts, None);
+    }
+
+    /// An agent nobody gave a resolver resolves nothing — not a guess at a
+    /// server, which is what the old per-file grammars amounted to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_with_no_resolver_summarizes_nothing_and_says_so() {
+        let config = AgentConfig {
+            summarization_priority: vec![SECOND.to_string()],
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(
+            config,
+            Arc::new(LlmClient::ollama(REFUSING)),
+            Arc::new(ToolRegistry::new()),
+        );
+        assert!(agent.summarizer_clients().is_none());
+
+        let mut ctx = over_the_limit_context();
+        let hard_limit = ctx.hard_limit;
+        agent.ladder_hard_cap_tier(&mut ctx, hard_limit).await;
+        let notices = ctx.take_pending_loss_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("every summarization model failed"),
+            "{}",
+            notices[0]
+        );
     }
 }
