@@ -162,8 +162,10 @@ impl Config {
         self.refill_secrets_replacing_with(running_ollama_host, store, process_env);
     }
 
-    /// [`Self::refill_secrets_replacing`] against a given environment.
-    fn refill_secrets_replacing_with(
+    /// [`Self::refill_secrets_replacing`] against a given environment: the
+    /// one a process loads with, when it is not the process environment (a
+    /// test's daemon control plane).
+    pub fn refill_secrets_replacing_with(
         &mut self,
         running_ollama_host: &str,
         store: &SecureStore,

@@ -97,19 +97,20 @@ impl ControlPlane {
     }
 
     /// Load `path`, and apply it when it parses and differs from what is running.
-    async fn reload_changed_config(&self, path: &Path) {
+    pub(super) async fn reload_changed_config(&self, path: &Path) {
         let owned: PathBuf = path.to_path_buf();
         // Loaded as the replacement for what is running: a token saved with
         // no server recorded stays the running server's instead of following
         // the address the edit names.
         let running_host = self.config.read().await.memory.ollama_host.clone();
         let store = self.credential_store.clone();
+        let env = Arc::clone(&self.environment);
         let loaded = tokio::task::spawn_blocking(move || {
-            Config::load_from_replacing(&owned, &running_host, &store)
+            Config::load_from_replacing_with(&owned, &running_host, &store, &*env)
         })
         .await;
         let loaded = match loaded {
-            Ok(Ok(config)) => config.with_env_overrides(),
+            Ok(Ok(config)) => config.with_env_overrides_from(&*self.environment),
             Ok(Err(e)) => {
                 warn!(
                     "{} changed but does not load ({e}); keeping the running configuration",
@@ -164,6 +165,7 @@ mod tests {
             .expect("set");
         let mut control = ControlPlane::new(Arc::new(crate::session::SessionManager::new()));
         control.credential_store = store;
+        control.environment = Arc::new(|_| None);
         {
             // As the boot load left it: the legacy token, for the configured server.
             let mut config = control.config.write().await;
@@ -196,17 +198,14 @@ mod tests {
     #[tokio::test]
     async fn the_watcher_keeps_a_secret_set_through_config_set() {
         use crate::protocol::{Action, ConfigAction};
-        // The environment's key wins every load, by design; with one set there
-        // is no store read to show.
-        if std::env::var("BRAVE_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
-            return;
-        }
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("config.toml");
         let mut control = ControlPlane::new(Arc::new(crate::session::SessionManager::new()));
         control.config_path = Some(file.clone());
         control.credential_store =
             nanna_config::SecureStore::file_only_at(dir.path().join("store"));
+        // An environment supplying no key: one that did would win every load.
+        control.environment = Arc::new(|_| None);
         let control = Arc::new(control);
 
         let resp = control

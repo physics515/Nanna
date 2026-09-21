@@ -7,17 +7,40 @@
 //! the change brought in first. Filed nowhere, a secret works until the next
 //! load — a restart, or the daemon's config watcher reading the save back —
 //! and is gone.
+//!
+//! **A secret the environment supplies cannot be changed that way at all.**
+//! Every load fills a secret from its environment variable before the store
+//! (and [`Config::with_env_overrides`] replaces some outright), so the next
+//! load takes the environment's value whatever was filed.
+//! [`Config::secrets_the_environment_replaces`] names each such secret a
+//! change brings in, and the variable it comes from, so that the change can
+//! be refused instead of undone seconds after it answered that it was made.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
 use crate::credentials::{CredentialError, SecureStore};
-use crate::{Config, ollama_server_changed, same_ollama_server};
+use crate::{Config, UnboundOllamaToken, ollama_server_changed, same_ollama_server};
 
 /// The dotted path of the Ollama token, which is brought in by a change of
 /// server as well as of value.
 const OLLAMA_TOKEN: &str = "llm.ollama_api_key";
+
+/// What marks an environment variable's name where the probe in
+/// [`Config::env_supplied_secrets`] puts it in place of the variable's value:
+/// a NUL, which no environment variable's value can hold.
+const VARIABLE_MARK: char = '\0';
+
+/// A secret a change brings in that every load takes from an environment
+/// variable instead ([`Config::secrets_the_environment_replaces`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvSuppliedSecret {
+    /// Its dotted path in the config, as `tools.brave_api_key`.
+    pub path: String,
+    /// The variable every load takes it from, as `BRAVE_API_KEY`.
+    pub variable: String,
+}
 
 impl Config {
     /// Whether this config holds a secret `previous` does not: a new one, a
@@ -33,6 +56,78 @@ impl Config {
     pub fn brings_in_secrets(&self, previous: &Self) -> bool {
         self.brought_in_secrets(previous)
             .is_none_or(|brought_in| !brought_in.is_empty())
+    }
+
+    /// Each secret this config brings in over `previous`
+    /// ([`Self::brings_in_secrets`]) that the next load of it, saved, takes
+    /// from the environment `env` instead: a variable there supplies another
+    /// value, and the load reads that variable before the secure store (or,
+    /// for some, overrides whatever it read). A change bringing one in would
+    /// hold until that load and then be undone.
+    ///
+    /// Which variable supplies which secret is read off the load itself
+    /// ([`Self::env_supplied_secrets`]), so a secret or a variable added
+    /// there is covered here with no list of its own. A value the variable
+    /// already holds, blanks around it aside, is kept by the load, and is not
+    /// replaced. Nothing is read from any store.
+    #[must_use]
+    pub fn secrets_the_environment_replaces(
+        &self,
+        previous: &Self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Vec<EnvSuppliedSecret> {
+        let Some(brought_in) = self
+            .brought_in_secrets(previous)
+            .filter(|brought_in| !brought_in.is_empty())
+        else {
+            return Vec::new();
+        };
+        let supplied = self.env_supplied_secrets(&env);
+        brought_in
+            .into_iter()
+            .filter_map(|(path, secret)| {
+                let variable = supplied.get(&path)?;
+                let from_env = env(variable)?;
+                (secret.as_str().map(str::trim) != Some(from_env.trim())).then(|| {
+                    EnvSuppliedSecret {
+                        path,
+                        variable: variable.clone(),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Which variable of `env` the next load of this config, saved, takes
+    /// each secret from, by the secret's dotted path.
+    ///
+    /// A probe of the load itself: the copy a save writes (every secret
+    /// stripped) goes through the load's own filling and overrides, with each
+    /// variable `env` sets answering with its own name, marked, instead of its
+    /// value, and with no store. A secret that comes back holding a name came
+    /// from that variable; one no variable supplies stays unset.
+    fn env_supplied_secrets(
+        &self,
+        env: &impl Fn(&str) -> Option<String>,
+    ) -> BTreeMap<String, String> {
+        let named = |variable: &str| {
+            env(variable)
+                .filter(|value| !value.trim().is_empty())
+                .map(|_| format!("{VARIABLE_MARK}{variable}"))
+        };
+        let mut next_load = self.clone();
+        next_load.strip_secrets_for_disk();
+        next_load.fill_secrets(None, &named, UnboundOllamaToken::Configured);
+        next_load
+            .with_env_overrides_from(named)
+            .held_secrets()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(path, held)| {
+                let variable = held.as_str()?.strip_prefix(VARIABLE_MARK)?;
+                Some((path, variable.to_owned()))
+            })
+            .collect()
     }
 
     /// Each secret this config holds that `previous` does not, by its dotted
@@ -194,6 +289,7 @@ fn is_blank(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::EnvSuppliedSecret;
     use crate::Config;
     use crate::credentials::{SecureStore, keys};
 
@@ -346,6 +442,129 @@ mod tests {
             Some("https://b.example/ollama")
         );
         assert_eq!(config.llm.ollama_api_key.as_deref(), Some(" token "));
+    }
+
+    /// Every secret, each supplied by its variable with another value: the
+    /// probe names each one and its variable, and every name is borne out by
+    /// the load itself — the save, loaded with that environment, holds the
+    /// environment's value there instead of the one set.
+    #[test]
+    fn each_secret_the_environment_supplies_is_named_with_its_variable() {
+        let set = holding_every_secret();
+        let mut previous = set.clone();
+        previous.strip_secrets_for_disk();
+        let env = |variable: &str| Some(format!("from-{variable}"));
+
+        let replaced = set.secrets_the_environment_replaces(&previous, env);
+
+        let named: Vec<(&str, &str)> = replaced
+            .iter()
+            .map(|secret| (secret.path.as_str(), secret.variable.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("channels.telegram.bot_token", "TELEGRAM_BOT_TOKEN"),
+                (
+                    "channels.telegram.webhook_secret",
+                    "TELEGRAM_WEBHOOK_SECRET"
+                ),
+                ("llm.anthropic_oauth_token", "ANTHROPIC_OAUTH_TOKEN"),
+                ("llm.api_key", "ANTHROPIC_API_KEY"),
+                ("llm.github_token", "GITHUB_TOKEN"),
+                ("llm.ollama_api_key", "OLLAMA_API_KEY"),
+                ("llm.openai_api_key", "OPENAI_API_KEY"),
+                ("llm.openrouter_api_key", "OPENROUTER_API_KEY"),
+                ("server.webhook_secret", "NANNA_WEBHOOK_SECRET"),
+                ("tools.brave_api_key", "BRAVE_API_KEY"),
+            ]
+        );
+
+        let (dir, store) = store();
+        let path = dir.path().join("config.toml");
+        set.file_secrets_in(&store).expect("filed");
+        set.save_to(&path).expect("saved");
+        let loaded = Config::load_from_with(&path, &store, env)
+            .expect("loads")
+            .with_env_overrides_from(env);
+        let loaded = loaded.held_secrets().expect("serializes");
+        for EnvSuppliedSecret { path, variable } in &replaced {
+            assert_eq!(
+                loaded.get(path).and_then(serde_json::Value::as_str),
+                Some(format!("from-{variable}").as_str()),
+                "{path}: the load takes it from {variable}"
+            );
+        }
+    }
+
+    /// Only what the load would change is named: a secret the change does not
+    /// bring in, one no variable supplies, one whose variable is blank, and
+    /// one the variable already holds are all kept by the next load.
+    #[test]
+    fn a_secret_the_next_load_keeps_is_not_named() {
+        let previous = Config::default();
+        let mut set = previous.clone();
+        set.tools.brave_api_key = Some("brave".to_string());
+        let named = |set: &Config, env: &dyn Fn(&str) -> Option<String>| {
+            set.secrets_the_environment_replaces(&previous, env)
+        };
+        // An environment setting `name` to `value`, and nothing else.
+        let only = |name: &'static str, value: &'static str| {
+            move |variable: &str| (variable == name).then(|| value.to_string())
+        };
+
+        assert!(named(&set, &no_env).is_empty(), "no variable");
+        assert!(
+            named(&set, &only("GITHUB_TOKEN", "gh")).is_empty(),
+            "another secret's variable"
+        );
+        assert!(
+            named(&set, &only("BRAVE_API_KEY", "  ")).is_empty(),
+            "a blank variable supplies nothing"
+        );
+        assert!(
+            named(&set, &only("BRAVE_API_KEY", " brave\n")).is_empty(),
+            "the value the variable holds"
+        );
+        let brave_from_env = only("BRAVE_API_KEY", "brave-env");
+        assert_eq!(
+            named(&set, &brave_from_env),
+            [EnvSuppliedSecret {
+                path: "tools.brave_api_key".to_string(),
+                variable: "BRAVE_API_KEY".to_string(),
+            }]
+        );
+        assert!(
+            set.secrets_the_environment_replaces(&set, brave_from_env)
+                .is_empty(),
+            "a secret the change does not bring in"
+        );
+    }
+
+    /// The Ollama token is brought in by a move to another server as well as
+    /// by a new value, and `OLLAMA_API_KEY` supplies it to any server.
+    #[test]
+    fn the_ollama_token_for_another_server_is_named_when_the_environment_supplies_one() {
+        let mut previous = Config::default();
+        previous.memory.ollama_host = "https://a.example/ollama".to_string();
+        previous.llm.ollama_api_key = Some("token".to_string());
+        let mut moved = previous.clone();
+        moved.memory.ollama_host = "https://b.example/ollama".to_string();
+
+        let env_token =
+            |variable: &str| (variable == "OLLAMA_API_KEY").then(|| "env-token".to_string());
+        let named: Vec<String> = moved
+            .secrets_the_environment_replaces(&previous, env_token)
+            .into_iter()
+            .map(|secret| secret.variable)
+            .collect();
+        assert_eq!(named, ["OLLAMA_API_KEY"]);
+        assert!(
+            previous
+                .secrets_the_environment_replaces(&previous, env_token)
+                .is_empty(),
+            "the same token for the same server is brought in by nothing"
+        );
     }
 
     #[test]

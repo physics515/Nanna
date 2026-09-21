@@ -43,6 +43,13 @@ mod workspace;
 #[cfg(test)]
 mod tests;
 
+/// Environment variables by name, as the daemon's config loads read them.
+pub(crate) type Environment = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// The process environment: what the daemon's own loads read.
+fn process_environment() -> Environment {
+    Arc::new(|name| std::env::var(name).ok())
+}
 
 /// The control plane provides unified access to all daemon functionality
 pub struct ControlPlane {
@@ -153,6 +160,13 @@ pub struct ControlPlane {
     /// `SecureStore::new()` at each use, so a test can hand the control plane
     /// a store of its own instead of the machine's keyring.
     pub(crate) credential_store: nanna_config::SecureStore,
+    /// The daemon's environment, as every config load it makes reads it (a
+    /// reload, the config watcher) and as a change is checked against: every
+    /// load takes a secret its variable supplies from here, whatever a change
+    /// set. A field, like `credential_store`, so a test hands the control
+    /// plane an environment of its own instead of depending on (or changing)
+    /// the one it runs in.
+    pub(crate) environment: Environment,
 }
 
 impl ControlPlane {
@@ -196,6 +210,7 @@ impl ControlPlane {
             mcp_status: None,
             live_embedding: None,
             credential_store: nanna_config::SecureStore::new(),
+            environment: process_environment(),
         }
     }
 
@@ -263,6 +278,7 @@ impl ControlPlane {
             mcp_status: None,
             live_embedding: None,
             credential_store: nanna_config::SecureStore::new(),
+            environment: process_environment(),
         }
     }
 
@@ -331,6 +347,7 @@ impl ControlPlane {
             mcp_status: None,
             live_embedding: None,
             credential_store: nanna_config::SecureStore::new(),
+            environment: process_environment(),
         }
     }
 

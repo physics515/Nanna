@@ -1,6 +1,6 @@
 //! Config handlers for the [`ControlPlane`].
 
-use super::{json, warn, info, ControlPlane, Config, Event, ConfigAction, Value};
+use super::{Arc, Config, ConfigAction, ControlPlane, Event, Value, info, json, warn};
 
 impl ControlPlane {
     /// Push `[scheduler]` settings onto the **running** scheduler loop.
@@ -159,7 +159,7 @@ impl ControlPlane {
     async fn config_reset(&self) -> Value {
         let mut config = self.config.write().await;
         let previous_ollama_host = config.memory.ollama_host.clone();
-        let mut reset = Config::default().with_env_overrides();
+        let mut reset = Config::default().with_env_overrides_from(&*self.environment);
         if let Err(message) = self.file_brought_in_secrets(&config, &reset).await {
             warn!("config.reset refused: {message}");
             return json!({ "error": "secret_store_failed", "message": message });
@@ -205,7 +205,10 @@ impl ControlPlane {
     async fn config_import(&self, cfg: Config) -> Value {
         let mut config = self.config.write().await;
         let previous_ollama_host = config.memory.ollama_host.clone();
-        let mut imported = cfg.with_env_overrides();
+        let mut imported = match self.import_over(&config, cfg) {
+            Ok(imported) => imported,
+            Err(refusal) => return refusal,
+        };
         if let Err(message) = self.file_brought_in_secrets(&config, &imported).await {
             warn!("config.import refused: {message}");
             return json!({ "error": "secret_store_failed", "message": message });
@@ -256,12 +259,14 @@ impl ControlPlane {
     async fn config_reload(&self) -> Value {
         let running_host = self.config.read().await.memory.ollama_host.clone();
         let store = self.credential_store.clone();
-        let loaded =
-            tokio::task::spawn_blocking(move || Config::load_replacing(&running_host, &store))
-                .await;
+        let env = Arc::clone(&self.environment);
+        let loaded = tokio::task::spawn_blocking(move || {
+            Config::load_replacing_with(&running_host, &store, &*env)
+        })
+        .await;
         match loaded {
             Ok(Ok(new_config)) => {
-                self.apply_loaded_config(new_config.with_env_overrides())
+                self.apply_loaded_config(new_config.with_env_overrides_from(&*self.environment))
                     .await;
                 json!({ "status": "reloaded" })
             }
@@ -311,6 +316,11 @@ impl ControlPlane {
                 );
                 if ollama_moved {
                     new_config.llm.ollama_api_key = None;
+                }
+                if let Err(mut refusal) = self.refuse_env_supplied_secrets(&config, &new_config) {
+                    warn!("config.set {path} refused: {}", refusal["message"]);
+                    refusal["path"] = json!(path);
+                    return refusal;
                 }
                 if let Err(message) = self.file_brought_in_secrets(&config, &new_config).await {
                     warn!("config.set {path} refused: {message}");
@@ -397,10 +407,11 @@ impl ControlPlane {
             return changed;
         }
         let store = self.credential_store.clone();
+        let env = Arc::clone(&self.environment);
         let previous_host = previous_host.to_string();
         let mut resolved = changed.clone();
         let resolved = tokio::task::spawn_blocking(move || {
-            resolved.rebind_ollama_token_if_moved(&previous_host, &store);
+            resolved.rebind_ollama_token_if_moved_with(&previous_host, &store, &*env);
             resolved
         })
         .await;
@@ -421,6 +432,72 @@ impl ControlPlane {
             config.llm.ollama_api_key = Some(token);
         }
         config.clone()
+    }
+
+    /// Refuse a change from `previous` to `changed` that brings in a secret
+    /// the daemon's environment supplies (`Config::secrets_the_environment_replaces`):
+    /// `Err` is the response naming each one and its variable.
+    ///
+    /// Every load fills a secret from its variable before the store, and
+    /// `with_env_overrides` replaces some outright. Made, such a change
+    /// answered `updated`, ran the value set and filed it — and the next load
+    /// (the config watcher reading the daemon's own save back, seconds later,
+    /// or a restart) put the environment's back. Refused, nothing is applied,
+    /// filed or saved, and whoever made it learns which variable to unset.
+    ///
+    /// As [`Self::file_brought_in_secrets`], only for a control plane that
+    /// saves: with no config path nothing it changes outlives it. It reads
+    /// the environment alone, never the store, so it runs under the lock. A
+    /// reset is not checked: it brings in no secret but the environment's own.
+    fn refuse_env_supplied_secrets(
+        &self,
+        previous: &Config,
+        changed: &Config,
+    ) -> Result<(), Value> {
+        if self.config_path.is_none() {
+            return Ok(());
+        }
+        let supplied = changed.secrets_the_environment_replaces(previous, &*self.environment);
+        let Some(first) = supplied.first() else {
+            return Ok(());
+        };
+        let taken = supplied
+            .iter()
+            .map(|secret| format!("{} from {}", secret.path, secret.variable))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let variables = supplied
+            .iter()
+            .map(|secret| secret.variable.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(json!({
+            "error": "env_overrides_secret",
+            "secret": first.path,
+            "variable": first.variable,
+            "message": format!(
+                "every load takes {taken} in the daemon's environment, so the value given here \
+                 would be replaced by the environment's within seconds. To change it here, \
+                 unset {variables} in the daemon's environment and restart the daemon."
+            ),
+        }))
+    }
+
+    /// `imported` as it would run in place of `running`: with the
+    /// environment's overrides, unless it brings in a secret the environment
+    /// supplies ([`Self::refuse_env_supplied_secrets`]; `Err` is the
+    /// response). Checked as given, since the overrides would swap such a
+    /// key for the environment's own unseen.
+    ///
+    /// Takes the import by value, so the async handler never borrows it: a
+    /// borrowed local is kept in the handler's future across every later
+    /// await, and the import is a whole `Config`.
+    fn import_over(&self, running: &Config, imported: Config) -> Result<Config, Value> {
+        if let Err(refusal) = self.refuse_env_supplied_secrets(running, &imported) {
+            warn!("config.import refused: {}", refusal["message"]);
+            return Err(refusal);
+        }
+        Ok(imported.with_env_overrides_from(&*self.environment))
     }
 
     /// File in the secure store the secrets `changed` brings in over
@@ -500,6 +577,7 @@ impl ControlPlane {
         let cleared = cleared.map(str::to_owned);
         let running_ollama_host = previous.memory.ollama_host.clone();
         let store = self.credential_store.clone();
+        let env = Arc::clone(&self.environment);
         let mut settling = changed.clone();
         let settled = tokio::task::spawn_blocking(move || -> Result<Config, String> {
             if let Some(path) = cleared {
@@ -507,7 +585,7 @@ impl ControlPlane {
                     .forget_secret(&path, &store)
                     .map_err(|e| format!("the secure store could not delete {path}: {e}"))?;
             }
-            settling.refill_secrets_replacing(&running_ollama_host, &store);
+            settling.refill_secrets_replacing_with(&running_ollama_host, &store, &*env);
             Ok(settling)
         })
         .await;
