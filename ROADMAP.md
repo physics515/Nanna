@@ -2134,6 +2134,13 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             once, nothing left open). Mutation-checked: without admission the Stop e2e fails;
             without adoption the re-send e2e fails. The scripted planner now titles each task after
             its own request (a constant title made every leftover look re-adopted).
+            - [ ] **`tasks.add` reuse can hand the model a leftover the turn will not run.** The
+                  `todo` tool's idempotent reuse returns an existing open item's id when the model
+                  adds a task with the same title; if that item is a leftover the plan did not
+                  adopt, the turn's `TurnAdmission` does not admit it, so the model is told its
+                  task exists while the harness never schedules it. Fix: have the reuse path adopt
+                  into the live turn's admission (it needs a handle to it, e.g. via
+                  `TurnBaselines`, which `tasks.add` already consults per turn).
             - [ ] **Leftovers that are never re-adopted stay open.** They are shown to the planner
                   each turn as outstanding work (bounded by `open_work_context`), which is the
                   directive's intent — but nothing ever closes one the user has moved on from.
