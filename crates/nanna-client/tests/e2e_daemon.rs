@@ -2003,3 +2003,64 @@ async fn a_repeated_failing_call_ends_bounded_and_reports_the_steps_it_ran() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// The repeat-completion escalation is for runs that ACT: a request re-sent
+/// after a run that called tools, changed nothing, and declared itself done
+/// again is exactly what it exists to call out. A conversational answer
+/// completes with no side effects every time by design — asking the same
+/// question twice, or pressing Regenerate, used to append "⚠️ repeat
+/// completion … If you expected something to exist by now, it does not" to a
+/// plain answer.
+#[tokio::test]
+async fn only_a_run_that_acted_is_told_its_repeat_changed_nothing() {
+    async fn twice(steps: Vec<String>, request: &str) -> String {
+        let ollama = ScriptedOllama::start(steps).await;
+        let host = ollama.base_url.clone();
+        let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+            b.with_model(STUB_MODEL)
+                .with_ollama_host(host)
+                .with_scheduler(false)
+        })
+        .await;
+        let client = daemon.connect_client().await;
+        let session = session_id_of(
+            &client
+                .sessions()
+                .create(Some("repeat".to_string()))
+                .await
+                .expect("sessions.create succeeds"),
+        );
+        converse(&client, &session, request).await;
+        let second = converse(&client, &session, request).await;
+        client.disconnect().await;
+        daemon.stop();
+        second
+    }
+
+    let conversation = twice(
+        vec!["Paris.\nTASK COMPLETE".to_string()],
+        "What is the capital of France?",
+    )
+    .await;
+    assert!(
+        !conversation.contains("repeat completion"),
+        "a repeated question is answered, not warned about: {conversation:?}"
+    );
+
+    // Calls a tool (it acted) but has no side effect — the shape of a
+    // mission re-sent while nothing lands.
+    let mission = twice(
+        vec![
+            r#"CALL echo {"text":"checked"}"#.to_string(),
+            "All done.\nTASK COMPLETE".to_string(),
+            r#"CALL echo {"text":"checked"}"#.to_string(),
+            "All done.\nTASK COMPLETE".to_string(),
+        ],
+        "Make sure the build is done.",
+    )
+    .await;
+    assert!(
+        mission.contains("repeat completion"),
+        "a run that acted and changed nothing is still told so: {mission:?}"
+    );
+}

@@ -768,15 +768,21 @@ impl ChatTurn {
 
         // Prep, then build the runners. `None` = the turn cannot run at
         // all — the reason is already announced in the transcript, and
-        // the release tail below still runs.
-        if let Some(runners) = self.build_runners(sink, &mut turn_stop_kind).await
-            && let Some((stop_kind, exit_cause)) = self.run_mission(runners).await
+        // the release tail below still runs. `acted` is whether the run
+        // ACTED (see `TurnHarness::run_evidence`); a turn that never
+        // reached the harness did not.
+        let acted = if let Some(runners) = self.build_runners(sink, &mut turn_stop_kind).await
+            && let Some((stop_kind, exit_cause, run_evidence)) = self.run_mission(runners).await
         {
             turn_exit_cause = Some(exit_cause);
             turn_stop_kind = stop_kind;
-        }
+            run_evidence
+        } else {
+            false
+        };
 
-        self.finish_turn(&turn_stop_kind, turn_exit_cause.as_deref()).await;
+        self.finish_turn(&turn_stop_kind, turn_exit_cause.as_deref(), acted)
+            .await;
     }
 
     /// Prep the turn and build its runners; `None` when it cannot run (the
@@ -973,7 +979,9 @@ impl ChatTurn {
     /// Plan and run the mission, then let it continue while there is work.
     /// Returns the ledger's stop kind and the turn's exit cause, or `None`
     /// when the plan could not be seeded.
-    async fn run_mission(&self, runners: TurnRunners) -> Option<(String, String)> {
+    /// Runs the mission; `Some((stop_kind, exit_cause, run_evidence))` when
+    /// it reached the harness.
+    async fn run_mission(&self, runners: TurnRunners) -> Option<(String, String, bool)> {
         let TurnRunners {
             step_runner,
             planner,
@@ -1190,7 +1198,9 @@ impl ChatTurn {
             ids.len() > 1 || report.steps_taken > 1 || report.tool_calls > 0;
         let mut budget = RoundBudget::default();
         self.continue_mission(&mut harness, &mut report, &mut budget).await;
-        Some(self.finish_mission(&harness, &report, budget).await)
+        let run_evidence = harness.run_evidence;
+        let (stop_kind, exit_cause) = self.finish_mission(&harness, &report, budget).await;
+        Some((stop_kind, exit_cause, run_evidence))
     }
 
     /// The task source, interjector and harness config every round of this
@@ -2052,7 +2062,7 @@ impl ChatTurn {
 
     /// The release tail every exit crosses: state a repeat completion, demote
     /// in-flight items, persist the reply, and release the registrations.
-    async fn finish_turn(&self, turn_stop_kind: &str, turn_exit_cause: Option<&str>) {
+    async fn finish_turn(&self, turn_stop_kind: &str, turn_exit_cause: Option<&str>, acted: bool) {
         // P22: close the liveness ledger. When this exit is a REPEAT —
         // the same request ending `all_tasks_done` again with zero
         // side-effecting work in between — the repeat is STATED in the
@@ -2063,7 +2073,15 @@ impl ChatTurn {
         // nothing to show for it is the most corrosive shape the product
         // has. This delta runs before the transcript is persisted below,
         // so the escalation is part of the assistant message itself.
-        if let Some(repeats) = self.live.finish_turn(turn_stop_kind, turn_exit_cause) {
+        //
+        // Only for a turn that ACTED. A conversational turn — one step, one
+        // item, no tool calls — completes with no side effects every time by
+        // design, so asking the same question twice, or pressing Regenerate,
+        // used to append "⚠️ repeat completion … nothing was written … If you
+        // expected something to exist by now, it does not" to a plain answer.
+        // The ledger still records the stop either way.
+        let repeat = self.live.finish_turn(turn_stop_kind, turn_exit_cause);
+        if let Some(repeats) = repeat.filter(|_| acted) {
             tracing::warn!(
                 session_id = %self.session_id,
                 repeats,

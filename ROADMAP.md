@@ -2100,6 +2100,18 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             `a_repeated_failing_call_ends_bounded_and_reports_the_steps_it_ran` asserts the two
             counts agree (fails on the old counter). Not changed: the "last said" excerpt in that
             report can quote model-facing harness notes (`[HARNESS NOTE — …]`) verbatim.
+      - [x] *(2026-09-21)* **Regenerate — or asking the same question twice — appended a
+            "⚠️ repeat completion" warning to a plain answer.** The P22 escalation ("this same
+            request has now ended 'all tasks done' 2 times in a row with no side-effecting work … If
+            you expected something to exist by now, it does not") was built for missions re-sent
+            while nothing lands on disk. It fired on any repeat of the request text with zero side
+            effects — and a conversational answer has zero side effects every time by design.
+            Found by probing `chat.regenerate`. Now stated only when the run ACTED
+            (`run_evidence`, the harness's existing "did this run do anything?" signal: tool calls,
+            more than one step, or more than one item); the ledger still records every stop. e2e
+            `only_a_run_that_acted_is_told_its_repeat_changed_nothing` covers both sides — a
+            repeated question gets no warning; a repeated run that called tools and changed nothing
+            still does.
       - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
             behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
             comment says "the next message decides what happens to them" — but the harness simply
