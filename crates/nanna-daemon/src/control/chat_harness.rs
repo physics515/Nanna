@@ -2302,14 +2302,17 @@ impl ChatTurn {
         // Harness plumbing (the TASK COMPLETE claim marker) is stripped
         // from both — it is a verdict signal, not conversation.
         let full_text = self.run_handle.accumulated_text.read().await.clone();
-        let content = strip_harness_markers(&full_text);
-        let timeline = sanitize_timeline(
+        let mut content = strip_harness_markers(&full_text);
+        let mut timeline = sanitize_timeline(
             self.run_handle
                 .timeline
                 .lock()
                 .map(|journal| journal.clone())
                 .unwrap_or_default(),
         );
+        if self.run_handle.cancel.is_cancelled() {
+            mark_stopped(&mut content, &mut timeline);
+        }
         self.sessions
             .add_full_message(
                 &self.session_id,
@@ -2338,6 +2341,38 @@ impl ChatTurn {
             content,
         });
     }
+}
+
+/// The marker the GUI shows on a bubble the user stopped (`stopSession` in
+/// `pages/index.vue`) — the same text, so the two agree.
+const STOPPED_MARKER: &str = "[Stopped by user]";
+
+/// Persist a stopped turn the way the GUI showed it.
+///
+/// The GUI appends `[Stopped by user]` to the live bubble and then lets the
+/// turn's `message_end` replace it, expecting the daemon to have persisted the
+/// same marker. The harness path persisted only what had streamed — so a turn
+/// stopped before any text ended as `""`: the marker vanished from the live
+/// bubble, history kept an empty assistant message, and later turns' context
+/// read nothing where the user had said "stop".
+fn mark_stopped(content: &mut String, timeline: &mut Vec<TimelineItem>) {
+    if content.contains(STOPPED_MARKER) {
+        return;
+    }
+    let appended = if content.trim().is_empty() {
+        STOPPED_MARKER.to_string()
+    } else {
+        format!("\n\n{STOPPED_MARKER}")
+    };
+    content.push_str(&appended);
+    timeline.push(TimelineItem::Text {
+        content: appended,
+        at: chrono::Utc::now().to_rfc3339(),
+    });
+    debug_assert!(
+        content.ends_with(STOPPED_MARKER),
+        "the marker closes the reply"
+    );
 }
 
 /// What a turn that finished with nothing to show says instead of nothing.

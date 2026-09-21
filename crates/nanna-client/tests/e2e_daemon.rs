@@ -1631,6 +1631,9 @@ async fn stop_ends_an_in_flight_turn_and_the_session_carries_on() {
         !stopped.contains("Too late."),
         "the in-flight reply must not land after Stop: {stopped:?}"
     );
+    // Persisted as the GUI showed it: the marker it puts on the live bubble,
+    // not an empty message that erases it.
+    assert_eq!(stopped.trim(), "[Stopped by user]");
 
     // Owner directive: an earlier turn's unfinished work is information
     // for the planner, not an instruction to resume. The stopped request

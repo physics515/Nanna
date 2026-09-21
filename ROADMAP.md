@@ -2008,6 +2008,14 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             completes). Also probed: a model calling a tool it never discovered still gets it run
             (the registry resolves every registered tool) — not a defect, noted so it is not
             re-investigated.
+      - [x] *(2026-09-21)* **A stopped turn is persisted the way the GUI shows it.** The GUI appends
+            `[Stopped by user]` to the live bubble and lets `message_end` replace it, expecting the
+            daemon to persist the same marker (its own comment says so). The harness path persisted
+            only what had streamed, so a turn stopped before any text ended as `""`: the marker
+            vanished, history kept an empty assistant message, and later turns' context read nothing
+            where the user had said stop. `persist_reply` now closes a cancelled turn with the same
+            marker (content and timeline; not streamed, so the live bubble does not double it). The
+            Stop e2e asserts it.
       - [x] *(2026-09-21)* **Stop is covered end to end.** e2e
             `stop_ends_an_in_flight_turn_and_the_session_carries_on`: the scripted model holds its
             first reply for 3 s; Stop lands while it is in flight, the late reply never reaches the
