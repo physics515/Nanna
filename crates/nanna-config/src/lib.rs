@@ -18,6 +18,8 @@ pub use mcp::{MCP_SERVERS_MAX, McpConfig, McpServerEntry, mcp_secret_key};
 /// Which Ollama server an address names — what the bearer token is bound to.
 pub mod ollama;
 pub use ollama::{normalize_ollama_host, ollama_server_changed, same_ollama_server};
+/// `[server].webhook_secret` in the secure store, and out of `config.toml`.
+mod server_secret;
 /// Each provider's API key in its own `[llm]` field and keyring entry, and
 /// the move of keys the old layout filed as Anthropic's.
 mod provider_key;
@@ -423,6 +425,11 @@ pub struct ServerConfig {
     // unchanged (no `#[serde(deny_unknown_fields)]`, so serde ignores the stale
     // key). Covered by `legacy_server_host_key_still_loads`.
     pub port: u16,
+    /// The shared secret `nanna server`'s generic webhook requires; without it
+    /// the endpoint refuses to serve.
+    ///
+    /// Secret: in the secure store, not `config.toml` (`server_secret.rs`).
+    /// From `NANNA_WEBHOOK_SECRET` when the file does not set it.
     pub webhook_secret: Option<String>,
 }
 
@@ -858,6 +865,8 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&content)?;
         info!("Loaded config from {path:?}");
+        // Also before any secret is hydrated: only the file's own is filed.
+        server_secret::adopt(&mut config.server, store);
         provider_key::refile_provider_key(&mut config.llm, store);
         channel_secrets::adopt(&mut config.channels, store);
         Ok((config, content))
@@ -902,6 +911,7 @@ impl Config {
         self.llm.github_token = None;
         self.llm.anthropic_oauth_token = None;
         self.llm.ollama_api_key = None;
+        self.server.webhook_secret = None;
         self.tools.brave_api_key = None;
         channel_secrets::strip(&mut self.channels);
     }
@@ -943,6 +953,7 @@ impl Config {
         put(keys::OPENROUTER_API_KEY, &mut self.llm.openrouter_api_key)?;
         put(keys::GITHUB_TOKEN, &mut self.llm.github_token)?;
         put(keys::BRAVE_API_KEY, &mut self.tools.brave_api_key)?;
+        put(keys::SERVER_WEBHOOK_SECRET, &mut self.server.webhook_secret)?;
         // OAuth token + ollama key share the store under theirs-named keys too.
         if let Some(v) = self.llm.anthropic_oauth_token.take() {
             let trimmed = v.trim();
@@ -1042,6 +1053,11 @@ impl Config {
         fill(&mut self.llm.openrouter_api_key, keys::OPENROUTER_API_KEY, "OPENROUTER_API_KEY");
         fill(&mut self.llm.github_token, keys::GITHUB_TOKEN, "GITHUB_TOKEN");
         fill(&mut self.tools.brave_api_key, keys::BRAVE_API_KEY, "BRAVE_API_KEY");
+        fill(
+            &mut self.server.webhook_secret,
+            keys::SERVER_WEBHOOK_SECRET,
+            server_secret::WEBHOOK_SECRET_ENV,
+        );
         fill(&mut self.llm.anthropic_oauth_token, keys::ANTHROPIC_OAUTH_TOKEN, "ANTHROPIC_OAUTH_TOKEN");
         self.hydrate_ollama_token(store, env, unbound);
         channel_secrets::fill(&mut self.channels, store, env);
@@ -1896,6 +1912,29 @@ webhook_secret = "s3cret"
         let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
         assert_eq!(config.server.port, 4100, "the keys beside it still land");
         assert_eq!(config.server.webhook_secret.as_deref(), Some("s3cret"));
+
+        // The webhook secret beside it is hand-written, the only way it was
+        // ever set. It still takes effect, and as a secret it is filed in the
+        // secure store as the file loads (`server_secret.rs`): the next save
+        // drops it from config.toml and the load after that still has it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, legacy).expect("write");
+        let store = SecureStore::file_only_at(dir.path().join("store"));
+        let no_env = |_: &str| None;
+        let loaded = Config::load_from_with(&path, &store, no_env).expect("legacy config loads");
+        assert_eq!(loaded.server.port, 4100);
+        assert_eq!(loaded.server.webhook_secret.as_deref(), Some("s3cret"));
+        loaded.save_to(&path).expect("save");
+        let saved = std::fs::read_to_string(&path).expect("config.toml");
+        assert!(!saved.contains("s3cret"), "the secret left config.toml: {saved}");
+        let next = Config::load_from_with(&path, &store, no_env).expect("saved config loads");
+        assert_eq!(next.server.port, 4100);
+        assert_eq!(
+            next.server.webhook_secret.as_deref(),
+            Some("s3cret"),
+            "the save lost nothing"
+        );
 
         // And it is gone for good: a config written from today's defaults no
         // longer carries a key that looks like it controls the bind.
