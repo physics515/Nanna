@@ -5689,9 +5689,11 @@ gaps, all fixed same-day:
       making interjection unreachable from the UI; mid-run sends now go straight to the daemon (with
       the old local queue as transport-error fallback). `ThinkingDelta` is also wired for harness steps.
 
-**Open:** interjection still has no live end-to-end pass (the machinery is now reachable; needs a
-mid-run send observed landing at a boundary); `PENDING_MESSAGES_MAX` overflow drops the oldest
-silently — it should announce itself per the summaries-must-announce-themselves rule; Stop is
+**Open:** ~~interjection still has no live end-to-end pass~~ **(done 2026-09-21: e2e
+`a_message_sent_mid_turn_joins_the_running_turn` — acked `interjected`, worked at the next boundary,
+answered in the same reply)**; ~~`PENDING_MESSAGES_MAX` overflow drops the oldest silently~~ **(2026-09-21:
+now a WARN naming the drop; still no user-facing notice — 64 messages between two step boundaries is
+an edge, and the chat.send ack no client reads is the only channel at push time)**; Stop is
 boundary-granular — an in-flight step runs to completion before the run stops *(stale as of 2026-09-21:
 `stop_ends_an_in_flight_turn_and_the_session_carries_on` cancels an in-flight model call in ~0.6 s)*;
 ~~**attachments** are not carried into harness steps~~ **(done 2026-09-21, see below)**.

@@ -4034,9 +4034,17 @@ impl PendingMessages {
     pub async fn push(&self, message: String) -> usize {
         let mut queue = self.inner.write().await;
         if queue.len() >= PENDING_MESSAGES_MAX {
-            queue.remove(0);
+            let dropped = queue.remove(0);
+            // A dropped message is lost user input; it must not go silently
+            // (summaries-must-announce-themselves).
+            tracing::warn!(
+                held = PENDING_MESSAGES_MAX,
+                dropped_chars = dropped.chars().count(),
+                "pending-message queue full — the OLDEST message sent during this run was dropped"
+            );
         }
         queue.push(message);
+        debug_assert!(queue.len() <= PENDING_MESSAGES_MAX, "the queue is bounded");
         queue.len()
     }
 

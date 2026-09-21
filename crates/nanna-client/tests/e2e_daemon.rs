@@ -2270,3 +2270,74 @@ async fn an_attached_image_reaches_the_model_and_an_unreadable_file_is_named() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// Interjection end to end: a message sent while a turn is still working is
+/// admitted into THAT turn at its next step boundary — acknowledged as
+/// interjected, worked, and answered in the same reply — instead of waiting
+/// for the run to end or starting a competing one.
+#[tokio::test]
+async fn a_message_sent_mid_turn_joins_the_running_turn() {
+    let ollama = ScriptedOllama::start(vec![
+        "WAIT 1500 First answer.\nTASK COMPLETE".to_string(),
+        "Answer to the interjection.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("interject".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+    let ack = client
+        .chat()
+        .send(&session, "first question")
+        .await
+        .expect("chat.send is accepted");
+    let turn = ack["message_id"].as_str().unwrap_or_default().to_string();
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        while ollama.chat_bodies.lock().await.len() < 2 {
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the first step is in flight");
+    let joined = client
+        .chat()
+        .send(&session, "also, second question")
+        .await
+        .expect("chat.send is accepted");
+    assert_eq!(joined["status"], "interjected", "{joined}");
+
+    let reply = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::MessageEnd {
+                    message_id,
+                    content,
+                    ..
+                }) if message_id == turn => return content,
+                Ok(_) => {}
+                Err(e) => panic!("the event stream ended before the turn did: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the turn ends");
+    assert!(
+        reply.starts_with("First answer.\n\nAnswer to the interjection."),
+        "both answered, in order, in the one reply: {reply:?}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
