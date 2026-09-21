@@ -355,8 +355,8 @@ whose secret is missing is not started, and `system.status` / the Tools page say
 | `OPENAI_API_KEY` | OpenAI models + embeddings |
 | `OPENROUTER_API_KEY` | OpenRouter models |
 | `BRAVE_API_KEY` | Web search tool |
-| `TELEGRAM_BOT_TOKEN` | Telegram channel |
-| `DISCORD_BOT_TOKEN` | Discord channel |
+| `TELEGRAM_BOT_TOKEN` | Telegram channel's bot token, with `TELEGRAM_WEBHOOK_URL` / `TELEGRAM_WEBHOOK_SECRET`; a `[channels.telegram]` section keeps every setting they don't name (`allowed_users` included) |
+| `DISCORD_BOT_TOKEN` | Discord channel's bot token, with `DISCORD_APPLICATION_ID` / `DISCORD_PUBLIC_KEY` (all three needed when there is no `[channels.discord]` section) |
 | `NANNA_CONFIG_PATH` | Load config from this file instead of the default location above |
 
 **Ports:** Health HTTP `5148` (`/health`, `/status`, and Prometheus `/metrics`) · WebSocket IPC `5149`
