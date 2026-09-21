@@ -6108,6 +6108,33 @@ fn anthropic_to_ollama_request(request: &AnthropicRequest) -> (serde_json::Value
     anthropic_to_wire_request(request, ToolArgsWire::JsonObject)
 }
 
+/// A tool result's text for a wire with no `is_error` flag (OpenAI-shaped,
+/// Ollama): the flag travels as an `Error: ` prefix — unless the content
+/// already announces itself as one. The agent loop writes failed results as
+/// `Error: <message>`, so the unconditional prefix made every failure the
+/// model read say `Error: Error: …`.
+fn wire_tool_result_content(content: &str, is_error: bool) -> String {
+    let announced = content
+        .get(..ERROR_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(ERROR_PREFIX));
+    let text = if is_error && !announced {
+        format!("{ERROR_PREFIX}{content}")
+    } else {
+        content.to_string()
+    };
+    debug_assert!(
+        !is_error
+            || text
+                .get(..ERROR_PREFIX.len())
+                .is_some_and(|h| h.eq_ignore_ascii_case(ERROR_PREFIX)),
+        "an error result always reads as one"
+    );
+    text
+}
+
+/// How an error tool result announces itself on a flagless wire.
+const ERROR_PREFIX: &str = "Error: ";
+
 /// Append the wire messages for an Anthropic user message: its text blocks as
 /// one user message, then each tool result as its own `tool` message.
 fn push_wire_user_messages(messages: &mut Vec<serde_json::Value>, msg: &AnthropicMessage) {
@@ -6122,11 +6149,7 @@ fn push_wire_user_messages(messages: &mut Vec<serde_json::Value>, msg: &Anthropi
                 tool_results.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
-                    "content": if is_error.unwrap_or(false) {
-                        format!("Error: {content}")
-                    } else {
-                        content.clone()
-                    },
+                    "content": wire_tool_result_content(content, is_error.unwrap_or(false)),
                 }));
             }
             _ => {}
@@ -7918,6 +7941,35 @@ mod anthropic_model_contract_tests {
 
         let off = serde_json::to_value(ThinkingConfig::Disabled).expect("serializes");
         assert_eq!(off, serde_json::json!({"type": "disabled"}));
+    }
+}
+
+#[cfg(test)]
+mod wire_tool_result_tests {
+    use super::wire_tool_result_content;
+
+    #[test]
+    fn an_error_result_is_announced_exactly_once() {
+        assert_eq!(wire_tool_result_content("boom", true), "Error: boom");
+        assert_eq!(
+            wire_tool_result_content("Error: Tool not found: x", true),
+            "Error: Tool not found: x",
+            "already announced: no second prefix"
+        );
+        assert_eq!(
+            wire_tool_result_content("error: lower", true),
+            "error: lower"
+        );
+        assert_eq!(
+            wire_tool_result_content("Err", true),
+            "Error: Err",
+            "too short to announce"
+        );
+        assert_eq!(
+            wire_tool_result_content("Error: fine", false),
+            "Error: fine"
+        );
+        assert_eq!(wire_tool_result_content("ok", false), "ok");
     }
 }
 

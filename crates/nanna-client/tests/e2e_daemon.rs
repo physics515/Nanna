@@ -1411,3 +1411,53 @@ async fn a_tool_using_turn_records_each_call_under_its_own_id() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A call to a tool that does not exist is answered with a pointer to
+/// `discover_tools`, and the turn carries on. What the model reads back is
+/// the error stated once: the loop writes failures as `Error: …` and the
+/// Ollama wire used to prefix `Error: ` again.
+#[tokio::test]
+async fn a_call_to_a_missing_tool_is_reported_once_and_the_turn_recovers() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"CALL frobnicate {"x":1}"#.to_string(),
+        "There is no such tool.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("missing tool".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let reply = converse(&client, &session, "Frobnicate it.").await;
+    assert_eq!(reply.trim(), "There is no such tool.");
+
+    let bodies = ollama.chat_bodies.lock().await.clone();
+    let tool_result = bodies
+        .iter()
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .flat_map(|request| request["messages"].as_array().cloned().unwrap_or_default())
+        .find(|message| message["role"] == "tool")
+        .expect("the failed call's result was sent back to the model");
+    let content = tool_result["content"].as_str().unwrap_or_default();
+    assert!(
+        content.starts_with("Error: Tool not found: frobnicate"),
+        "{content:?}"
+    );
+    assert!(
+        !content.contains("Error: Error:"),
+        "stated once: {content:?}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

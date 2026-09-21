@@ -1968,6 +1968,16 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             id) + e2e `a_tool_using_turn_records_each_call_under_its_own_id` (discover → call →
             report, both calls succeed, distinct ids). The two workarounds stay: they are correct
             and cost nothing.
+      - [x] *(2026-09-21)* **Every failed tool result read `Error: Error: …` on Ollama/OpenAI
+            wires.** The agent loop writes a failed result as `Error: <message>`; the OpenAI-shaped
+            wire conversion (shared by Ollama) has no `is_error` flag, so it carried the flag as an
+            unconditional `Error: ` prefix — twice over. Now `wire_tool_result_content` prefixes only
+            content that does not already announce itself. Unit test (both flags, case, too-short
+            content) + e2e `a_call_to_a_missing_tool_is_reported_once_and_the_turn_recovers` (the
+            model reads `Error: Tool not found: frobnicate. Use discover_tools…` once, and the turn
+            completes). Also probed: a model calling a tool it never discovered still gets it run
+            (the registry resolves every registered tool) — not a defect, noted so it is not
+            re-investigated.
             - [ ] **The converging repeat is still streamed.** The user sees the answer twice
                   (paragraph-separated) — down from seven, but the second copy is the signal and
                   cannot be recognized until it has finished streaming. Options: hold back a
