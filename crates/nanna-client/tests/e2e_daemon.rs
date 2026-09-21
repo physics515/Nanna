@@ -2687,3 +2687,41 @@ async fn clearing_a_session_mid_turn_is_refused_until_the_turn_ends() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A blank message is refused, not run. It used to be persisted and planned
+/// as a whole turn — the model answering a request nobody made.
+#[tokio::test]
+async fn a_blank_message_is_refused_and_starts_no_turn() {
+    let ollama = ScriptedOllama::start(vec!["Hello there.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().unwrap(), move |b| {
+        b.with_model(STUB_MODEL).with_ollama_host(host).with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("blank".into()))
+            .await
+            .unwrap(),
+    );
+
+    let refused = client.chat().send(&session, " \n\t ").await.unwrap();
+    assert_eq!(refused["error"], "empty_message", "{refused}");
+    let history = client.sessions().history(&session, None).await.unwrap();
+    assert_eq!(
+        history["messages"].as_array().map_or(0, Vec::len),
+        0,
+        "nothing persisted: {history}"
+    );
+
+    assert_eq!(
+        converse(&client, &session, "hi").await,
+        "Hello there.",
+        "the scripted reply was not spent on the blank message"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

@@ -40,6 +40,16 @@ impl ControlPlane {
             ChatAction::Send { session_id, content, attachments } => {
                 debug!("Chat send from {} to session {}", client_id, session_id);
 
+                // Nothing to answer: a blank message used to be persisted and
+                // run as a whole planned turn, the model guessing at a
+                // request that was never made.
+                if content.trim().is_empty() && attachments.is_empty() {
+                    return json!({
+                        "error": "empty_message",
+                        "message": "The message is empty; there is nothing to answer."
+                    });
+                }
+
                 // Add user message to session — persisting it is the fact the
                 // delivery ack below certifies.
                 let Some(_msg_id) = self.sessions.add_message(&session_id, MessageRole::User, &content).await else {
