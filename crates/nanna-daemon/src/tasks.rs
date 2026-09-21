@@ -1178,6 +1178,94 @@ pub struct TursoTaskSource {
     scope_id: Option<String>,
     actor: String,
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
+    /// Which open items this source may hand out (see [`TurnAdmission`]).
+    /// `None` serves the whole scope — the task-run manager, and a chat turn
+    /// that IS a resume.
+    admission: Option<Arc<TurnAdmission>>,
+}
+
+/// Which open items a chat turn may work.
+///
+/// Owner directive (2026-07-25, quoted at `run_mission`): *"the model should
+/// decide to resume or answer another question by the user … i don't think
+/// we should assume that the user wants to resume."* The planner is shown
+/// outstanding work so it can choose — but the task source used to serve
+/// every open item in the scope, so an item an earlier turn left open (a
+/// question the user then STOPPED) was worked anyway on their next, unrelated
+/// message. Measured: `first` → Stop → `second` answered both.
+///
+/// So a turn admits everything created during it (its seeds, interjections,
+/// replan subtasks, continuation rounds — none of which exist yet when this
+/// is built) and, of the items already open when it began, only those the
+/// planner re-adopted by proposing the same work again ([`same_title`], the
+/// store's one definition of "the same task").
+#[derive(Debug, Default)]
+pub struct TurnAdmission {
+    /// Open when the turn began: id → title.
+    leftovers: HashMap<i64, String>,
+    adopted: std::sync::Mutex<HashSet<i64>>,
+}
+
+impl TurnAdmission {
+    /// Snapshot the scope's open items as this turn's leftovers.
+    ///
+    /// # Errors
+    /// Returns an error if the scope's tasks cannot be listed.
+    pub async fn at_turn_start(
+        storage: &Storage,
+        scope: &str,
+        scope_id: Option<&str>,
+    ) -> Result<Self, String> {
+        let open = storage
+            .tasks()
+            .list(scope, scope_id, false)
+            .await
+            .map_err(|e| e.to_string())?;
+        let leftovers: HashMap<i64, String> =
+            open.into_iter().map(|task| (task.id, task.title)).collect();
+        Ok(Self {
+            leftovers,
+            adopted: std::sync::Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Whether this turn may work task `id`.
+    #[must_use]
+    pub fn admits(&self, id: i64) -> bool {
+        !self.leftovers.contains_key(&id)
+            || self
+                .adopted
+                .lock()
+                .is_ok_and(|adopted| adopted.contains(&id))
+    }
+
+    /// Re-adopt the leftovers the plan proposes again, removing those tasks
+    /// from the plan (they already exist) and returning the adopted ids in
+    /// plan order. A leftover is adopted at most once.
+    pub fn adopt_from(&self, plan: &mut Plan) -> Vec<i64> {
+        let mut ids = Vec::new();
+        plan.tasks.retain(|task| {
+            let matched = self
+                .leftovers
+                .iter()
+                .find(|(id, title)| !ids.contains(*id) && same_title(title, &task.title));
+            match matched {
+                Some((id, _)) => {
+                    ids.push(*id);
+                    false
+                }
+                None => true,
+            }
+        });
+        if let Ok(mut adopted) = self.adopted.lock() {
+            adopted.extend(ids.iter().copied());
+        }
+        debug_assert!(
+            ids.iter().all(|id| self.admits(*id)),
+            "adopted means admitted"
+        );
+        ids
+    }
 }
 
 impl TursoTaskSource {
@@ -1195,7 +1283,15 @@ impl TursoTaskSource {
             scope_id,
             actor,
             event_tx,
+            admission: None,
         }
+    }
+
+    /// Serve only what `admission` admits (see [`TurnAdmission`]).
+    #[must_use]
+    pub fn with_admission(mut self, admission: Option<Arc<TurnAdmission>>) -> Self {
+        self.admission = admission;
+        self
     }
 
     fn emit(&self, task_id: i64, kind: &str, detail: Value) {
@@ -1262,8 +1358,11 @@ impl TaskSource for TursoTaskSource {
         // close them visibly and move on. Bounded: every malformed item is
         // cancelled, strictly shrinking the open set.
         for _ in 0..TASK_NEXT_SKIP_MAX {
+            let admission = self.admission.as_deref();
             let task = repo
-                .next(&self.scope, self.scope_id.as_deref())
+                .next_admitted(&self.scope, self.scope_id.as_deref(), |task| {
+                    admission.is_none_or(|admission| admission.admits(task.id))
+                })
                 .await
                 .map_err(|e| e.to_string())?;
             let Some(task) = task else { return Ok(None) };
@@ -4498,6 +4597,38 @@ mod tests {
     // -----------------------------------------------------------------
     // Plan seeding + queue jumping
     // -----------------------------------------------------------------
+
+    /// A turn admits what it creates, not what it found open — unless the
+    /// plan proposes that work again, which adopts it (once), by the store's
+    /// own title identity.
+    #[test]
+    fn a_turn_admits_its_own_work_and_what_its_plan_readopts() {
+        let admission = TurnAdmission {
+            leftovers: HashMap::from([
+                (1, "Answer: what is the capital of France?".to_string()),
+                (2, "Fix the build".to_string()),
+            ]),
+            adopted: std::sync::Mutex::new(HashSet::new()),
+        };
+        assert!(admission.admits(99), "created during the turn");
+        assert!(!admission.admits(1), "left open by an earlier turn");
+
+        let mut plan = plan_of(&["Answer: What is the capital of France?", "Write the notes"]);
+        let adopted = admission.adopt_from(&mut plan);
+        assert_eq!(adopted, [1], "same work, re-proposed: adopted");
+        assert!(admission.admits(1));
+        assert!(!admission.admits(2), "never re-proposed: stays out");
+        assert_eq!(plan.tasks.len(), 1, "the adopted task is not created again");
+        assert_eq!(plan.tasks[0].title, "Write the notes");
+
+        let mut twice = plan_of(&["Fix the builds", "fix the build"]);
+        assert_eq!(
+            admission.adopt_from(&mut twice),
+            [2],
+            "plural-folded; adopted once"
+        );
+        assert_eq!(twice.tasks.len(), 1, "the second copy is new work");
+    }
 
     fn plan_of(titles: &[&str]) -> Plan {
         Plan {

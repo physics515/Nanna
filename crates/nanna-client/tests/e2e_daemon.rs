@@ -805,7 +805,7 @@ struct ScriptedOllama {
 impl ScriptedOllama {
     async fn start(steps: Vec<String>) -> Self {
         Self::start_with_plan(
-            r#"[{"title":"Answer the question","description":"Reply directly.","acceptance":null}]"#,
+            r#"[{"title":"Answer: {request}","description":"Reply directly.","acceptance":null}]"#,
             steps,
         )
         .await
@@ -823,7 +823,11 @@ impl ScriptedOllama {
         let base_url = format!("http://{}", listener.local_addr().expect("stub address"));
         let chat_bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let seen = std::sync::Arc::clone(&chat_bodies);
-        let plan = scripted_reply(plan);
+        // `{request}` in the planner's script is replaced by the request the
+        // planner was asked about, so each turn's task is titled after its own
+        // message — as a real planner's would be — rather than every turn
+        // proposing the same title.
+        let plan = plan.to_string();
         // `WAIT <ms> <script>` delays that reply — a step still in flight.
         let steps: std::sync::Arc<Vec<(u64, String)>> = std::sync::Arc::new(
             steps
@@ -867,11 +871,14 @@ impl ScriptedOllama {
                         return;
                     }
                     let (delay_ms, line) = if body.contains(PLANNER_PROMPT_OPENING) {
-                        (0, plan.as_str())
+                        (
+                            0,
+                            scripted_reply(&plan.replace("{request}", &planned_request(&body))),
+                        )
                     } else {
                         let index = step_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let (delay_ms, line) = &steps[index.min(steps.len() - 1)];
-                        (*delay_ms, line.as_str())
+                        (*delay_ms, line.clone())
                     };
                     seen.lock().await.push(body);
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -913,6 +920,27 @@ fn scripted_reply(script: &str) -> String {
         "eval_count": 8,
     })
     .to_string()
+}
+
+/// The request a planner prompt asks about (the text between `== REQUEST ==`
+/// and `JSON array:`), JSON-escaped for splicing into a scripted plan.
+fn planned_request(body: &str) -> String {
+    let prompt = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|request| {
+            request["messages"].as_array()?.last()?["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let request = prompt
+        .split("== REQUEST ==")
+        .nth(1)
+        .and_then(|rest| rest.split("JSON array:").next())
+        .unwrap_or_default()
+        .trim();
+    let quoted = serde_json::to_string(request).unwrap_or_default();
+    quoted.trim_matches('"').to_string()
 }
 
 /// Read one HTTP/1.1 request; returns (request line, body).
@@ -1577,10 +1605,16 @@ async fn stop_ends_an_in_flight_turn_and_the_session_carries_on() {
         "the in-flight reply must not land after Stop: {stopped:?}"
     );
 
+    // Owner directive: an earlier turn's unfinished work is information
+    // for the planner, not an instruction to resume. The stopped request
+    // must not be worked on the user's next, unrelated message — it used to
+    // be, and this reply read "Second answer.\n\nSecond answer.\n\n_2 steps ·
+    // 2 items completed_".
     let next = converse(&client, &session, "second").await;
-    assert!(
-        next.contains("Second answer."),
-        "the session takes the next message: {next:?}"
+    assert_eq!(
+        next.trim(),
+        "Second answer.",
+        "the next message is answered, and only it"
     );
 
     client.disconnect().await;
@@ -2063,4 +2097,95 @@ async fn only_a_run_that_acted_is_told_its_repeat_changed_nothing() {
         mission.contains("repeat completion"),
         "a run that acted and changed nothing is still told so: {mission:?}"
     );
+}
+
+/// Open tasks in a session's scope.
+async fn open_tasks(client: &Client, session: &str) -> Vec<serde_json::Value> {
+    let listed = client
+        .request(nanna_client::Action::Task(nanna_client::TaskAction::List {
+            scope: Some("session".to_string()),
+            session_id: Some(session.to_string()),
+            include_closed: Some(false),
+        }))
+        .await
+        .expect("tasks.list answers");
+    listed["tasks"]
+        .as_array()
+        .or_else(|| listed.as_array())
+        .cloned()
+        .unwrap_or_else(|| panic!("a task list: {listed}"))
+}
+
+/// Re-sending a request whose turn was stopped ADOPTS the item the stopped
+/// turn left open — the planner proposed the same work again — instead of
+/// creating a duplicate beside it: the work runs once and nothing is left
+/// open. (A different next message leaves it open and unworked: see
+/// `stop_ends_an_in_flight_turn_and_the_session_carries_on`.)
+#[tokio::test]
+async fn re_sending_a_stopped_request_adopts_its_open_item() {
+    let ollama = ScriptedOllama::start(vec![
+        "WAIT 3000 Too late.\nTASK COMPLETE".to_string(),
+        "Resumed answer.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("adopt".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+    let ack = client
+        .chat()
+        .send(&session, "What is the capital of France?")
+        .await
+        .expect("chat.send is accepted");
+    let first = ack["message_id"].as_str().unwrap_or_default().to_string();
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        while ollama.chat_bodies.lock().await.len() < 2 {
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the first step reaches the model");
+    client
+        .chat()
+        .cancel(&session)
+        .await
+        .expect("chat.cancel answers");
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            if let Ok(nanna_client::Event::MessageEnd { message_id, .. }) = events.recv().await
+                && message_id == first
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the stopped turn ends");
+    assert_eq!(
+        open_tasks(&client, &session).await.len(),
+        1,
+        "the stopped request's item is left open"
+    );
+
+    let reply = converse(&client, &session, "What is the capital of France?").await;
+    assert_eq!(reply.trim(), "Resumed answer.", "worked once");
+    assert!(
+        open_tasks(&client, &session).await.is_empty(),
+        "the adopted item was closed, not duplicated and left behind"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
 }

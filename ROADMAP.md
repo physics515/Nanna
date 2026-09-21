@@ -2112,22 +2112,33 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             `only_a_run_that_acted_is_told_its_repeat_changed_nothing` covers both sides — a
             repeated question gets no warning; a repeated run that called tools and changed nothing
             still does.
-      - [ ] **A stopped request is worked anyway on the user's next message — against the
-            owner directive already written into `run_mission`.** Found by the probe behind the Stop
-            test: `first` → Stop → `second` came back as
+      - [x] **A stopped request was worked anyway on the user's next message — against the
+            owner directive already written into `run_mission`.** *(2026-09-21, fixed the same
+            run.)* Found by the probe behind the Stop test: `first` → Stop → `second` came back as
             `Second answer.\n\nSecond answer.\n\n_2 steps · 2 items completed_`. The directive
             (2026-07-25, quoted in `chat_harness.rs::run_mission`): *"the model should decide to
             resume or answer another question by the user … i don't think we should assume that the
-            user wants to resume."* It is implemented on the **input** side — the planner is shown
-            outstanding work via `open_work_context` — but not on the **execution** side: the turn's
-            `TursoTaskSource` serves every open item in the scope, so a leftover runs whether or not
-            the planner chose it (`finish_turn`'s "the next message decides" comment describes the
-            intent, not the behaviour). The fix belongs in the task source: admit items created
-            during this turn (seeded, interjected, replan subtasks, continuation rounds) plus any the
-            planner explicitly re-adopts, and keep the park-resume path (a turn started by the park
-            waiter IS a resume) admitting its own leftovers. Not taken in the run that found it: it
-            touches the P22/P23 continuation semantics, which deserve their own increment with a
-            mission-shaped e2e beside the conversational one.
+            user wants to resume."* It was implemented on the **input** side (the planner is shown
+            outstanding work) but not the **execution** side: the turn's `TursoTaskSource` served
+            every open item in the scope. Now a turn carries a `TurnAdmission`: it admits everything
+            created during it (seeds, interjections, replan subtasks, continuation rounds) and, of
+            the items open when it began, only those its plan **re-adopts** by proposing the same
+            work again (`same_title`, the store's one definition, the conservative one `tasks.add`
+            uses) — an adopted item joins the turn instead of being duplicated. A turn started by
+            the park waiter is a resume and keeps the whole scope; a store error falls back to the
+            old whole-scope behaviour rather than failing the turn. Store side:
+            `TaskRepository::next_admitted` filters only the final choice, so ordering and the
+            open-children rule are unchanged (an inadmissible child still holds its parent back).
+            Tests: storage unit, `TurnAdmission` unit, the Stop e2e now asserts the next reply is
+            exactly its own answer, and `re_sending_a_stopped_request_adopts_its_open_item` (worked
+            once, nothing left open). Mutation-checked: without admission the Stop e2e fails;
+            without adoption the re-send e2e fails. The scripted planner now titles each task after
+            its own request (a constant title made every leftover look re-adopted).
+            - [ ] **Leftovers that are never re-adopted stay open.** They are shown to the planner
+                  each turn as outstanding work (bounded by `open_work_context`), which is the
+                  directive's intent — but nothing ever closes one the user has moved on from.
+                  Decide whether a leftover not re-adopted within N turns should be closed as
+                  superseded, and by what evidence N is chosen.
             - [ ] **The converging repeat is still streamed.** The user sees the answer twice
                   (paragraph-separated) — down from seven, but the second copy is the signal and
                   cannot be recognized until it has finished streaming. Options: hold back a

@@ -979,6 +979,63 @@ impl ChatTurn {
     /// Plan and run the mission, then let it continue while there is work.
     /// Returns the ledger's stop kind and the turn's exit cause, or `None`
     /// when the plan could not be seeded.
+    /// Snapshot the tasks already closed at turn start and publish that
+    /// boundary to every in-run item-creation path (see the comments inside).
+    async fn open_turn_baseline(&self) -> std::collections::HashSet<i64> {
+        // The turn-start boundary for continuation dedup: tasks
+        // already closed NOW belong to history, and only titles
+        // closed AFTER this snapshot count as work this turn did
+        // (see `seed_continuation`). On a store error the baseline
+        // degrades to empty, which OVER-filters — continuation rounds
+        // then dedup against all of history and the mission ends
+        // early rather than treadmilling.
+        let closed_before_turn =
+            closed_task_ids(&self.storage, &self.scope, self.scope_id.as_deref())
+                .await
+                .unwrap_or_default();
+
+        // Publish the boundary so EVERY in-run item-creation path
+        // shares it, not just the continuation planner below. The
+        // harness's replan step decomposes a stalled item by telling
+        // the model to add subtasks through the todo tool, which
+        // lands in `tasks.add` — a path this snapshot used not to
+        // reach, so an abandoned title came straight back (#2059 →
+        // #2060, observed live 2026-08-02). Dropped again on the exit
+        // tail that releases the run claim.
+        if let Some(ref baselines) = self.turn_baselines {
+            baselines
+                .open_turn(
+                    &self.scope,
+                    self.scope_id.as_deref(),
+                    closed_before_turn.clone(),
+                )
+                .await;
+        }
+        closed_before_turn
+    }
+
+    /// Which open items this turn may work: its own, plus leftovers the
+    /// planner re-adopts (see [`crate::tasks::TurnAdmission`]). A turn started
+    /// by the park waiter IS a resume, so it keeps the whole scope (`None`).
+    /// On a store error the admission is skipped — the old whole-scope
+    /// behaviour — rather than failing the turn.
+    async fn turn_admission(&self) -> Option<Arc<crate::tasks::TurnAdmission>> {
+        if self.resumed_from_park > 0 {
+            return None;
+        }
+        crate::tasks::TurnAdmission::at_turn_start(
+            &self.storage,
+            &self.scope,
+            self.scope_id.as_deref(),
+        )
+        .await
+        .inspect_err(|message| {
+            tracing::warn!(%message, "could not snapshot leftovers — admitting the whole scope");
+        })
+        .ok()
+        .map(Arc::new)
+    }
+
     /// Runs the mission; `Some((stop_kind, exit_cause, run_evidence))` when
     /// it reached the harness.
     async fn run_mission(&self, runners: TurnRunners) -> Option<(String, String, bool)> {
@@ -1060,32 +1117,17 @@ impl ChatTurn {
             Some(joined).filter(|c| !c.is_empty())
         };
 
-        // The turn-start boundary for continuation dedup: tasks
-        // already closed NOW belong to history, and only titles
-        // closed AFTER this snapshot count as work this turn did
-        // (see `seed_continuation`). On a store error the baseline
-        // degrades to empty, which OVER-filters — continuation rounds
-        // then dedup against all of history and the mission ends
-        // early rather than treadmilling.
-        let closed_before_turn = closed_task_ids(&self.storage, &self.scope, self.scope_id.as_deref())
-            .await
-            .unwrap_or_default();
+        let closed_before_turn = self.open_turn_baseline().await;
+        let admission = self.turn_admission().await;
 
-        // Publish the boundary so EVERY in-run item-creation path
-        // shares it, not just the continuation planner below. The
-        // harness's replan step decomposes a stalled item by telling
-        // the model to add subtasks through the todo tool, which
-        // lands in `tasks.add` — a path this snapshot used not to
-        // reach, so an abandoned title came straight back (#2059 →
-        // #2060, observed live 2026-08-02). Dropped again on the exit
-        // tail that releases the run claim.
-        if let Some(ref baselines) = self.turn_baselines {
-            baselines
-                .open_turn(&self.scope, self.scope_id.as_deref(), closed_before_turn.clone())
-                .await;
-        }
-
-        let seeded = self.plan_and_seed(&planner, context.as_deref(), &conflicts).await;
+        let seeded = self
+            .plan_and_seed(
+                &planner,
+                context.as_deref(),
+                &conflicts,
+                admission.as_deref(),
+            )
+            .await;
         let ids = match seeded {
             Err(message) => {
                 tracing::warn!(%message, "could not seed the chat plan");
@@ -1105,6 +1147,7 @@ impl ChatTurn {
         }
 
         let (source, interjector, config) = self.round_io(&planner);
+        let source = source.with_admission(admission);
         let workdir = workspace_root.unwrap_or_else(|| PathBuf::from("."));
 
         let mut report = self
@@ -1198,9 +1241,8 @@ impl ChatTurn {
             ids.len() > 1 || report.steps_taken > 1 || report.tool_calls > 0;
         let mut budget = RoundBudget::default();
         self.continue_mission(&mut harness, &mut report, &mut budget).await;
-        let run_evidence = harness.run_evidence;
         let (stop_kind, exit_cause) = self.finish_mission(&harness, &report, budget).await;
-        Some((stop_kind, exit_cause, run_evidence))
+        Some((stop_kind, exit_cause, harness.run_evidence))
     }
 
     /// The task source, interjector and harness config every round of this
@@ -1240,6 +1282,7 @@ impl ChatTurn {
         planner: &AgentPlanner,
         context: Option<&str>,
         conflicts: &[ClaimConflict],
+        admission: Option<&crate::tasks::TurnAdmission>,
     ) -> Result<Vec<i64>, String> {
         self.live.on_planning();
         let mut plan = planner
@@ -1271,7 +1314,30 @@ impl ChatTurn {
             );
             Ok(Vec::new())
         } else {
-            seed_plan(&self.storage, &self.scope, self.scope_id.as_deref(), &plan, false).await
+            // Work the planner proposed again that is already open is
+            // ADOPTED, not duplicated: the existing item joins this turn.
+            let adopted =
+                admission.map_or_else(Vec::new, |admission| admission.adopt_from(&mut plan));
+            if !adopted.is_empty() {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    adopted = ?adopted,
+                    "the plan re-adopted open work from an earlier turn"
+                );
+            }
+            if plan.tasks.is_empty() {
+                return Ok(adopted);
+            }
+            let mut ids = seed_plan(
+                &self.storage,
+                &self.scope,
+                self.scope_id.as_deref(),
+                &plan,
+                false,
+            )
+            .await?;
+            ids.splice(0..0, adopted);
+            Ok(ids)
         }
     }
 
