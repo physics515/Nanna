@@ -1,15 +1,15 @@
 {
-  "version": "0.3.22",
-  "notes": "Nanna now says what it is doing while it starts, and never hangs on \"Starting\": if the daemon fails you see why, with Restart. Connect to Ollama on another machine or any Ollama-compatible server, with an optional bearer token; summaries follow the models you pick in Settings. Plus MCP servers of every protocol version, in both directions.",
-  "pub_date": "2026-09-21T15:20:39Z",
+  "version": "0.3.24",
+  "notes": "Plain chat, told straight: answers given once, pictures reach the model, any language survives streaming — plus MCP both ways, remote Ollama with a token, and faster recall",
+  "pub_date": "2026-09-21T16:25:46.321Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWhLbkZFVUNJemZUenVtWnRyMklmNDJxdjhrWFpMU2dsaHJ2SWxYeVdPd0hrTkdwTXNyemRrZEVIVVV4WE1mN3licEplbjg0d1lXNEdldUFqVEE0YWdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDA0MDA2CWZpbGU6TmFubmFfMC4zLjIyX3g2NC1zZXR1cC5leGUKWmhVTWs2WkhxanNGMENMQ0tndHFNWDUzbmc3TjlsbHgwcVlGcWJlbzNrL0JHZEd0Q1o1Vno4OXY2U2NtdVc3bm55SFRtNVBVQnNoNUJCVjJJVDg4QlE9PQo=",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.22-beta.31/Nanna_0.3.22_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaW0xR0NnckhTVC94TjZUTWExVHJwait6OE5yRXI2TWR0UExrUG81OXQ4b3N3ek1EcHNCOGFNdUFObk5tS1JVZG5SMG5TRm9UMkVnZ3hxYUdvYVhvNEFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDA3Nzc5CWZpbGU6TmFubmFfMC4zLjI0X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMjQKamE5ODExUVZnNmtiUEpBTEYwNUVYT3o3U0t1bGp2UjlDZnRCVlk0UThnc3ZESUJWTlNXNjFSdnB5T0RHaU9oR2xnMXBRd3ZJUFoyY1JxTk9IRDFaQmc9PQo=",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.24-beta.33/Nanna_0.3.24_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWpzVTdyd3dmLzM2ZHBDR0I5SzhMdFFlRVVhaURsODB5VXNxeTZNUGRrUG5McThBQm1xeDFuaFhUQ3FjNjc1dCtNVEthMWZvdHhLRFZpeC9NQkM4c3dzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDAzMDU2CWZpbGU6TmFubmFfMC4zLjIyX2FtZDY0LkFwcEltYWdlCkxSeU05L1YzQXhDUWg4L3hiS3NqUUozOFJVQVNKS3d6ZE5RVDRCQnFoTi9xUWFzOVZPZWZTRTFhWXRadk1PbmJkZGYza2xEdlRxUEppUmZ3bGNFckFnPT0K",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.22-beta.31/Nanna_0.3.22_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXE1bFdhS3hLeTR3RnhSbXJja0oyT3hCSGVPejYzcjEwT3JBOWs0cTJKYUZWbWxkWjhGYUIzUmlJMEJRWDlIUS9WRDB4MUVyaStobTY4d0pnSWdmdVF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDA2OTI1CWZpbGU6TmFubmFfMC4zLjI0X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjI0CmhXMGIxU2VuM3dhSGpLUW5mQTFpd1lJdGtsZDFRcjE5UDg0S3VETG9tcG8zUmNZRE56cE0rQ1dVdU9Gdlpuazd5eUNHUjBWeEdHQzNwcUhhVHhBQ0R3PT0K",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.24-beta.33/Nanna_0.3.24_amd64.AppImage"
     }
   }
 }
