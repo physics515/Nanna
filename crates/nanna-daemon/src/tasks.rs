@@ -8535,6 +8535,7 @@ mod summarizer_wiring_tests {
             chat_sink: None,
             gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             degradations: None,
+            attachments: Arc::default(),
         }
     }
 
