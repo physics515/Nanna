@@ -137,7 +137,12 @@ impl ControlPlane {
                     json!({ "error": "partial_reset_not_supported", "hint": "Use Reset without path to reset all" })
                 } else {
                     let previous_ollama_host = config.memory.ollama_host.clone();
-                    *config = Config::default().with_env_overrides();
+                    let reset = Config::default().with_env_overrides();
+                    if let Err(message) = self.file_brought_in_secrets(&config, &reset).await {
+                        warn!("config.reset refused: {message}");
+                        return json!({ "error": "secret_store_failed", "message": message });
+                    }
+                    *config = reset;
 
                     // Save to disk
                     if let Some(ref config_path) = self.config_path
@@ -182,7 +187,13 @@ impl ControlPlane {
                     Ok(cfg) => {
                         let mut config = self.config.write().await;
                         let previous_ollama_host = config.memory.ollama_host.clone();
-                        *config = cfg.with_env_overrides();
+                        let imported = cfg.with_env_overrides();
+                        if let Err(message) = self.file_brought_in_secrets(&config, &imported).await
+                        {
+                            warn!("config.import refused: {message}");
+                            return json!({ "error": "secret_store_failed", "message": message });
+                        }
+                        *config = imported;
                         
                         // Save to disk
                         if let Some(ref config_path) = self.config_path
@@ -276,6 +287,10 @@ impl ControlPlane {
                 if ollama_moved {
                     new_config.llm.ollama_api_key = None;
                 }
+                if let Err(message) = self.file_brought_in_secrets(&config, &new_config).await {
+                    warn!("config.set {path} refused: {message}");
+                    return json!({ "error": "secret_store_failed", "message": message, "path": path });
+                }
                 *config = new_config;
 
                 // Save to disk if we have a path
@@ -363,6 +378,41 @@ impl ControlPlane {
             config.llm.ollama_api_key = Some(token);
         }
         config.clone()
+    }
+
+    /// File in the secure store the secrets `changed` brings in over
+    /// `previous` (`Config::brings_in_secrets`), before the save that strips
+    /// them from `config.toml`. Filed nowhere, a secret set, reset or imported
+    /// here worked until the next load — a restart, or the config watcher
+    /// reading the save back seconds later — and was gone.
+    ///
+    /// Only for a control plane that saves: with no config path nothing it
+    /// changes outlives it, secrets included. Called with the config write
+    /// lock held, so filing and commit are one critical section and two
+    /// changes of one secret cannot leave the store holding the one that
+    /// lost. The store is written off the async runtime (a keyring write can
+    /// wait on an unlock prompt), and only for a change that brings a secret
+    /// in — one someone is entering as it happens. A change of anything else
+    /// never touches the store.
+    ///
+    /// An `Err` says the store refused a secret, and the change must be
+    /// refused with it: applied, it would work until the next load and then
+    /// be gone. Secrets filed before the one refused stay filed.
+    async fn file_brought_in_secrets(
+        &self,
+        previous: &Config,
+        changed: &Config,
+    ) -> Result<(), String> {
+        if self.config_path.is_none() || !changed.brings_in_secrets(previous) {
+            return Ok(());
+        }
+        let filing = changed.clone();
+        let store = self.credential_store.clone();
+        match tokio::task::spawn_blocking(move || filing.file_secrets_in(&store)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(format!("the secure store refused a secret: {e}")),
+            Err(e) => Err(format!("filing secrets in the secure store failed: {e}")),
+        }
     }
 }
 
