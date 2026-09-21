@@ -49,13 +49,24 @@ describe('ChatInput', () => {
 })
 
 /**
- * Keys against the REAL Tiptap editor. Ctrl+Enter is ChatInput's send key, and
- * StarterKit's HardBreak binds the same chord (Mod-Enter → setHardBreak).
- * ChatInput handles it (preventDefault, submit, clear the editor); if the editor
- * then ran its own keymaps too, a hard break landed in the freshly cleared
- * composer: blank-looking, not empty, Send enabled.
+ * The Send gate against the REAL Tiptap editor. @tiptap/vue-3 keeps editor
+ * state in a debounced ref: the new state is stored synchronously, but Vue is
+ * only told about it two animation frames later. Anything cached over it (a
+ * `computed(() => editor.isEmpty)`) keeps answering "empty" until those frames
+ * run — so Ctrl+Enter pressed right after typing was silently dropped (the
+ * intermittent critical-path e2e failure), and where frames never run (the
+ * tauri-webdriver window on Linux) Send never enabled at all. Frames are
+ * stubbed to never fire here so the tests can only pass if the gate reads the
+ * editor's live document.
  */
 describe('ChatInput with the real editor', () => {
+  let realRequestAnimationFrame: typeof requestAnimationFrame
+  beforeEach(() => {
+    realRequestAnimationFrame = globalThis.requestAnimationFrame
+    globalThis.requestAnimationFrame = () => 0
+  })
+  afterEach(() => { globalThis.requestAnimationFrame = realRequestAnimationFrame })
+
   const mountWithEditor = async () => {
     const wrapper = mount(ChatInput, {
       props: { modelValue: '' },
@@ -72,16 +83,46 @@ describe('ChatInput with the real editor', () => {
   }
   // What ProseMirror dispatches for typed characters.
   const type = (editor: Editor, text: string) => editor.view.dispatch(editor.view.state.tr.insertText(text))
-  const pressEnter = (editor: Editor, modifiers: KeyboardEventInit = {}) => editor.view.dom.dispatchEvent(
-    new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...modifiers }),
+  const pressCtrlEnter = (editor: Editor) => editor.view.dom.dispatchEvent(
+    new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }),
   )
   const sendButton = (wrapper: VueWrapper) => wrapper.findAll('button').find(button => button.attributes('title') === 'Send')!
+
+  it('submits on Ctrl+Enter pressed immediately after typing', async () => {
+    const { wrapper, editor } = await mountWithEditor()
+    type(editor, 'Hello from e2e')
+    pressCtrlEnter(editor)
+    expect(wrapper.emitted('submit')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  it('enables Send as soon as text is typed and disables it once cleared', async () => {
+    const { wrapper, editor } = await mountWithEditor()
+    expect(sendButton(wrapper).attributes('disabled')).toBeDefined()
+
+    type(editor, 'Hello')
+    await nextTick()
+    expect(sendButton(wrapper).attributes('disabled')).toBeUndefined()
+    await sendButton(wrapper).trigger('click')
+    expect(wrapper.emitted('submit')).toHaveLength(1)
+
+    // submit() clears the editor, which must re-disable Send.
+    await nextTick()
+    expect(editor.isEmpty).toBe(true)
+    expect(sendButton(wrapper).attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  // Ctrl+Enter is also StarterKit's HardBreak chord (Mod-Enter). ChatInput
+  // handles it (preventDefault, submit, clear the editor); if the editor then
+  // ran its own keymaps too, a hard break landed in the freshly cleared
+  // composer: blank-looking, not empty, Send enabled.
   const hasHardBreak = (editor: Editor) => JSON.stringify(editor.getJSON()).includes('"hardBreak"')
 
   it('leaves the composer empty with Send disabled after Ctrl+Enter sends', async () => {
     const { wrapper, editor } = await mountWithEditor()
     type(editor, 'Hello from e2e')
-    pressEnter(editor, { ctrlKey: true })
+    pressCtrlEnter(editor)
     expect(wrapper.emitted('submit')).toHaveLength(1)
 
     await nextTick()
@@ -94,8 +135,15 @@ describe('ChatInput with the real editor', () => {
   it('still lets the editor handle keys ChatInput leaves alone', async () => {
     const { wrapper, editor } = await mountWithEditor()
     type(editor, 'line one')
-    pressEnter(editor, { shiftKey: true })
+    editor.view.dom.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true }))
     expect(hasHardBreak(editor)).toBe(true)
+    expect(wrapper.emitted('submit')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('does not submit an empty editor on Ctrl+Enter', async () => {
+    const { wrapper, editor } = await mountWithEditor()
+    pressCtrlEnter(editor)
     expect(wrapper.emitted('submit')).toBeUndefined()
     wrapper.unmount()
   })

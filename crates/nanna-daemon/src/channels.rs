@@ -93,16 +93,49 @@ impl ChannelManager {
         Arc::clone(&self.status_manager)
     }
 
-    /// Configure channels from config
+    /// Configure channels from config.
+    ///
+    /// A channel whose token is empty — named in `config.toml`, its token in
+    /// neither the secure store nor the environment — is reported as not
+    /// configured and started nowhere: a listener would poll the provider with
+    /// an empty token for as long as the daemon runs.
     pub async fn configure(&self, config: &ChannelsConfig) {
+        let has = |token: &str| !token.trim().is_empty();
         let mut lm = self.listener_manager.write().await;
         let mut router = self.router.write().await;
         let sm = Arc::clone(&self.status_manager);
 
+        let telegram = config.telegram.as_ref().filter(|tg| has(&tg.bot_token));
+        let discord = config.discord.as_ref().filter(|dc| has(&dc.bot_token));
+        let slack = config
+            .slack
+            .as_ref()
+            .filter(|sl| has(&sl.bot_token) && has(&sl.app_token));
+        for (provider, name, named, started) in [
+            (
+                "telegram",
+                "Telegram",
+                config.telegram.is_some(),
+                telegram.is_some(),
+            ),
+            (
+                "discord",
+                "Discord",
+                config.discord.is_some(),
+                discord.is_some(),
+            ),
+            ("slack", "Slack", config.slack.is_some(), slack.is_some()),
+        ] {
+            if named && !started {
+                warn!("{name} is configured without its token; not started");
+                sm.register(provider, name, false, false).await;
+            }
+        }
+
         // Configure Telegram
-        if let Some(tg) = &config.telegram {
-            let configured = !tg.bot_token.is_empty();
-            sm.register("telegram", "Telegram", configured, configured && !tg.use_webhooks).await;
+        if let Some(tg) = telegram {
+            sm.register("telegram", "Telegram", true, !tg.use_webhooks)
+                .await;
 
             if !tg.use_webhooks {
                 let listener = TelegramListener::new(&tg.bot_token)
@@ -124,9 +157,8 @@ impl ChannelManager {
         }
 
         // Configure Discord
-        if let Some(dc) = &config.discord {
-            let configured = !dc.bot_token.is_empty();
-            sm.register("discord", "Discord", configured, configured).await;
+        if let Some(dc) = discord {
+            sm.register("discord", "Discord", true, true).await;
 
             let mut listener = DiscordListener::new(&dc.bot_token)
                 .with_allowed_guilds(dc.allowed_guilds.clone())
@@ -152,9 +184,8 @@ impl ChannelManager {
         }
 
         // Configure Slack
-        if let Some(sl) = &config.slack {
-            let configured = !sl.bot_token.is_empty() && !sl.app_token.is_empty();
-            sm.register("slack", "Slack", configured, configured).await;
+        if let Some(sl) = slack {
+            sm.register("slack", "Slack", true, true).await;
 
             let listener = SlackListener::new(&sl.app_token, &sl.bot_token)
                 .with_allowed_channels(sl.allowed_channels.clone())
@@ -1926,5 +1957,52 @@ mod tests {
         let counted = counters.snapshot();
         assert_eq!(counted.len(), 1);
         assert_eq!(counted[0].1.sent, 2, "both deliveries counted: {counted:?}");
+    }
+
+    /// A channel `config.toml` names whose token is in neither the secure
+    /// store nor the environment loads with an empty one. It is reported as
+    /// not configured, and nothing polls the provider with an empty token.
+    #[tokio::test]
+    async fn a_channel_without_its_token_starts_nothing() {
+        let control = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+        let manager = ChannelManager::new(control);
+
+        manager
+            .configure(&ChannelsConfig {
+                telegram: Some(TelegramConfig {
+                    bot_token: String::new(),
+                    allowed_chats: vec![],
+                    use_webhooks: false,
+                }),
+                discord: Some(DiscordConfig {
+                    bot_token: String::new(),
+                    allowed_guilds: vec![],
+                    intents: None,
+                }),
+                slack: Some(SlackConfig {
+                    app_token: String::new(),
+                    bot_token: String::new(),
+                    allowed_channels: vec![],
+                }),
+            })
+            .await;
+
+        let listeners = manager.listener_manager.read().await;
+        assert!(listeners.list().is_empty(), "{:?}", listeners.list());
+        drop(listeners);
+        let router = manager.router.read().await;
+        let outbound: Vec<&str> = ["telegram", "discord", "slack"]
+            .into_iter()
+            .filter(|provider| router.get(provider).is_some())
+            .collect();
+        drop(router);
+        assert!(outbound.is_empty(), "no outbound: {outbound:?}");
+        for provider in ["telegram", "discord", "slack"] {
+            let status = manager.status_manager.get(provider).await;
+            assert!(
+                status.is_some_and(|status| !status.configured),
+                "{provider}: reported, as not configured"
+            );
+        }
     }
 }
