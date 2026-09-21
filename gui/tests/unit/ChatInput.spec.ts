@@ -113,6 +113,34 @@ describe('ChatInput with the real editor', () => {
     wrapper.unmount()
   })
 
+  // Ctrl+Enter is also StarterKit's HardBreak chord (Mod-Enter). ChatInput
+  // handles it (preventDefault, submit, clear the editor); if the editor then
+  // ran its own keymaps too, a hard break landed in the freshly cleared
+  // composer: blank-looking, not empty, Send enabled.
+  const hasHardBreak = (editor: Editor) => JSON.stringify(editor.getJSON()).includes('"hardBreak"')
+
+  it('leaves the composer empty with Send disabled after Ctrl+Enter sends', async () => {
+    const { wrapper, editor } = await mountWithEditor()
+    type(editor, 'Hello from e2e')
+    pressCtrlEnter(editor)
+    expect(wrapper.emitted('submit')).toHaveLength(1)
+
+    await nextTick()
+    expect(hasHardBreak(editor)).toBe(false)
+    expect(editor.isEmpty).toBe(true)
+    expect(sendButton(wrapper).attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  it('still lets the editor handle keys ChatInput leaves alone', async () => {
+    const { wrapper, editor } = await mountWithEditor()
+    type(editor, 'line one')
+    editor.view.dom.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true }))
+    expect(hasHardBreak(editor)).toBe(true)
+    expect(wrapper.emitted('submit')).toBeUndefined()
+    wrapper.unmount()
+  })
+
   it('does not submit an empty editor on Ctrl+Enter', async () => {
     const { wrapper, editor } = await mountWithEditor()
     pressCtrlEnter(editor)

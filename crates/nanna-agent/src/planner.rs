@@ -303,7 +303,7 @@ fn normalize_task(value: &serde_json::Value) -> Option<PlannedTask> {
         .get("tool_scope")
         .or_else(|| map.get("tools"))
         .and_then(|v| v.as_array())
-        .map(|items| {
+        .map_or_default(|items| {
             items
                 .iter()
                 .filter_map(|t| t.as_str())
@@ -311,8 +311,7 @@ fn normalize_task(value: &serde_json::Value) -> Option<PlannedTask> {
                 .filter(|t| !t.is_empty())
                 .map(String::from)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
 
     Some(PlannedTask {
         title: clamp_bytes(title, PLAN_TITLE_MAX_BYTES),

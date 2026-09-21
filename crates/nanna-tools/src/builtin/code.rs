@@ -488,8 +488,7 @@ impl Tool for ProjectStructureTool {
 
                 let size_str = format_size(size);
                 let line_str = lines
-                    .map(|l| format!(", {l} lines"))
-                    .unwrap_or_default();
+                    .map_or_default(|l| format!(", {l} lines"));
 
                 output.push(format!("{indent}{name} ({size_str}{line_str})"));
             }

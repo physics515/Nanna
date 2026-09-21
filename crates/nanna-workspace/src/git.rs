@@ -305,8 +305,7 @@ pub async fn load_git_context(root: &Path) -> Option<GitContext> {
         &["log", "--oneline", "--no-decorate", "-n", depth.as_str()],
     )
     .await
-    .map(|raw| parse_log(&raw))
-    .unwrap_or_default();
+    .map_or_default(|raw| parse_log(&raw));
 
     let context = GitContext {
         branch,

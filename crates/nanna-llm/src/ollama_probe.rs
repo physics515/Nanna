@@ -127,7 +127,7 @@ fn listed_models(tags: &serde_json::Value) -> Vec<OllamaModel> {
     let models: Vec<OllamaModel> = tags
         .get("models")
         .and_then(serde_json::Value::as_array)
-        .map(|models| {
+        .map_or_default(|models| {
             models
                 .iter()
                 .filter_map(|m| {
@@ -140,8 +140,7 @@ fn listed_models(tags: &serde_json::Value) -> Vec<OllamaModel> {
                 })
                 .take(PROBE_MODELS_MAX)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     debug_assert!(models.len() <= PROBE_MODELS_MAX, "the list is bounded");
     models
 }
@@ -206,7 +205,7 @@ mod tests {
         assert_eq!(listed_models(&serde_json::json!({})), none);
         assert_eq!(listed_models(&serde_json::json!({ "models": "nope" })), none);
         let down = OllamaProbe::Unreachable { reason: "x".to_string() };
-        assert_eq!(down.model_names(), Vec::<&str>::new());
+        assert_eq!(down.model_names(), [] as [&str; 0]);
     }
 
     /// A one-connection HTTP server on a free loopback port that answers its

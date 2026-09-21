@@ -151,8 +151,11 @@ const editor = useEditor({
       // also stop the running turn, as ChatInput's Escape does.
       if (slashMenuKeyDown(view, event)) return true
       emit('keydown', event, view)
-      // Return false — let parent decide via event handler
-      return false
+      // A key the parent handled (preventDefault) is consumed: the editor's own
+      // keymaps must not act on it too. StarterKit binds Mod-Enter to a hard
+      // break, so ChatInput's Ctrl+Enter send would otherwise leave one in the
+      // composer it just cleared. Keys the parent leaves alone fall through.
+      return event.defaultPrevented
     },
   },
   onTransaction: () => { docVersion.value++ },

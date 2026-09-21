@@ -2925,6 +2925,41 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      **(2026-09-20) A constant-factor pass landed, and it is mostly useful for what it rules
+      out.** `cluster_memories` now hoists each memory's L2 norm out of the O(N^2) loop — the
+      cosine kernel re-derived both magnitudes on every pair (three FMAs per element) and now
+      does one dot product against two cached scalars. Bit-identical, asserted as exact `f32`
+      equality across seven widths, with the `pairs` column unchanged at every N. Worth
+      **11-18%** on the sparse arm (16k: 4,206.6 ms -> ~3,730 ms), two runs agreeing.
+      **But it was estimated at 2-3x and delivered 13%, and that gap is the finding**: the
+      kernel is **memory-bandwidth bound, not FMA bound** — each pair streams two 384-float
+      vectors and a wide core absorbs the extra multiply-adds nearly free. So no further
+      arithmetic tuning of this loop is worth scheduling; 35 ns/pair -> 29 ns/pair moves 500k
+      from ~73 min to ~60 min, which is not a fix. **Fewer pairs is the only lever**, which is
+      what this item already proposes — now supported by a measurement instead of an
+      assumption.
+      **(2026-09-20, same run) Then took the other cheap win: prune pairs before the cosine.**
+      `score_or_prune` evaluates the three scalar terms first and skips the embedding entirely
+      when the pair's **ceiling** — its score with a perfect cosine of 1.0 — is already below
+      `cluster_threshold`. Every cheap term is bounded above by 1.0 by construction, so this is
+      an exact upper bound and the skipped pairs are precisely the ones that would have been
+      rejected; `pruning_never_changes_a_cluster` clusters a randomized corpus with and without
+      it and requires identical output. Worth **16-22%** on the new `aged` arm, where it rejects
+      **21.9%** of all pairs before touching an embedding.
+      **Two caveats, both load-bearing.** (1) It does *nothing* on the dense and sparse arms —
+      there every cheap term is 1.0 and the ceiling never falls below threshold. The gain is
+      real only for a store spread across time with varying FSRS state, i.e. the long-lived one.
+      (2) It is still a constant factor on a quadratic: ~60 min -> ~47 min at 500k.
+      **Together the two 2026-09-20 passes are the argument for the index**: they took every
+      cheap win available without one — a third of the arithmetic, a fifth of the pairs — and
+      the wall is still standing.
+      **A fixture correction went with it.** The dense and sparse arms space memories one second
+      apart and leave `time_span_minutes` at its 1440-minute default, and they give every memory
+      `FsrsState::default()`. Production does neither: `with_store_timescale` sets the span from
+      the store's own oldest-to-newest gap, and real memories differ in access count and
+      importance. So those arms hold all three non-semantic terms pinned at 1.0 — the exact
+      degeneracy behind the 2026-09-09 similarity-veto bug — and cannot show any effect that
+      depends on them. The new `aged` arm fixes both.
       **(2026-09-09) Baselined first — `bench/BASELINE.md` Suite 3b — and the two regimes are
       the finding.** Cost is governed by **match density**, not by N. *Dense* (clusters fill, so
       `max_cluster_memories` breaks the inner loop): **N^1.45**, 16k memories in 39 ms. *Sparse*
@@ -2986,6 +3021,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   index earns nothing at today's corpus size. The real trigger is the **O(N^2)
                   clustering in dreaming**, not recall. Source:
                   [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+                  *(2026-09-20 — **the trigger now has a number, from Suite 2c.**)* This item
+                  already said "do not schedule this on recall grounds"; what it lacked was the N
+                  at which it *should* be scheduled. The recall-path measurement supplies both
+                  halves. On latency there is no case at all — the in-RAM exact scan costs 10.89 ms
+                  at 50k and the SQL alternative 98.3 ms, so an index would not be competing with
+                  anything slow. On **residency** it becomes real at ~350k memories (1.43 GiB of
+                  f32 at 768-dim by 500k), roughly **7x** today's ceiling, and there SQL k-NN's
+                  ~2 µs/element extrapolates to ~690 ms per query — i.e. the escape hatch stops
+                  being an escape. So the schedule is: **the O(N^2) dreaming clustering first** (the
+                  trigger this shortlist was always keyed to), and recall-side ANN only if the
+                  corpus approaches ~350k. Shortlist re-checked 2026-09-20, unchanged —
+                  `hnswlib-rs` still decouples the graph from vector storage (the property that
+                  keeps Turso owning the f32 BLOBs), with `usearch` and the shadow-table
+                  `sqlite-vector-rs` as the references beside it.
                   - [ ] *(research 2026-09-07)* **Recall is now measured across the shortlist, and it
                         confirms the "do not schedule on recall grounds" call rather than
                         challenging it.** Published comparisons put `usearch` at 0.987 recall /
@@ -3032,10 +3081,30 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   `0.0658` at index 19 and `0.1542` at index 20) — settle that against `rs-fsrs`
                   source before touching anything. Source:
                   [FSRS algorithm wiki](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
-                  *(ticked 2026-09-18 — resolved by `1dd8c1cb`, which took the item's second option.)*
-                  `FsrsParameters`' doc now says what the table is: FSRS-5 values with six slots
-                  zeroed, of which only `w6..=w12` and `w20` are read, and why adopting FSRS-6's table
-                  for the rest would be cargo-culting (Nanna's stability update is not FSRS's).
+                  *(2026-09-20)* **Decided, and it is the second option — with the missing fact
+                  that makes it the right one: 13 of the 21 weights are not read by anything.**
+                  The item offered "adopt FSRS-6's table with an A/B" or "rename the constant and
+                  its doc to say what the table actually is", and an A/B is meaningless for a
+                  parameter nothing consumes. Measured rather than grepped: new
+                  `only_the_live_weights_change_any_fsrs_output` sets each slot in turn to a probe
+                  value and fingerprints every number `FsrsParameters` can influence — the five
+                  read-only scores plus the stability and difficulty `record_access` produces for
+                  all four ratings. Exactly **`w6..=w12` and `w20`** move anything; `w0..=w5` and
+                  `w13..=w19` move nothing, including the non-zero `w0 = 0.4072` and
+                  `w16 = 2.2035` that make the table look live. So the six zeroed entries were
+                  never the anomaly — they sit in the same dead range as six non-zero ones.
+                  Fixed the honest way: the module heading no longer claims to be "an FSRS-6
+                  implementation" (what is borrowed is FSRS-6's **power-law forgetting curve**,
+                  which is precisely why `w20`'s published constant transfers and the rest do not —
+                  the stability/difficulty updates are Nanna's own, because FSRS schedules graded
+                  study reviews and this schedules decay under incidental recall), and the struct
+                  doc now states the dead set and points at the test. Deliberately **not** deleted:
+                  the slot *numbering* is FSRS's, and renumbering would make every reference to
+                  "w20" ambiguous against the published algorithm.
+                  Verified the guard bites — claiming `w16` is live makes it fail and print both
+                  the live and dead sets. Same class as the "dead fields that look like features"
+                  ledger below: a public, serializable surface that reads as configuration and
+                  configures nothing.
             *(2026-07-24)* **Proven, not just read — `crates/nanna-storage/tests/vector_functions.rs`.**
             A registered SQL function is not a working one, and this decision is too load-bearing to rest
             on a source grep, so 3 tests now assert it end to end through the pinned dependency:
@@ -3069,10 +3138,57 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             the same generator the recall harness uses), persists it to Turso, and asserts for every centroid
             probe that SQL k-NN's nearest neighbour is the **same memory** an independent in-RAM cosine scan
             picks **and** is in the probe's own topic cluster. So exact SQL k-NN is a faithful drop-in for the
-            in-RAM scan on realistic embeddings, not just a hand-built spread. **Still the remaining work:** the
+            in-RAM scan on realistic embeddings, not just a hand-built spread. ~~**Still the remaining work:** the
             *latency/RAM comparison* (wall-clock trade; needs the not-yet-built `nanna-bench` harness, release
             profile), and the **decision to wire it into the live recall path** vs the current `bulk_load`+SIMD
-            scan — only after that measurement does the ANN-crate question reopen.
+            scan — only after that measurement does the ANN-crate question reopen.~~
+            *(2026-09-20)* **MEASURED, and the decision is: keep the in-RAM scan; do NOT wire SQL k-NN into
+            the live recall path.** `nanna-bench` exists now, so the blocker is gone. New criterion body
+            `crates/nanna-bench/benches/recall_path.rs` runs three arms against a **file-backed** Turso
+            database (not `Storage::in_memory()`, which would hand the SQL arm the very residency the
+            comparison is about) at 768-dim, `LIMIT = 10`, fixed seed, quiet host — full table in
+            `bench/BASELINE.md` Suite 2c. Per-query, SQL k-NN is **12.0x / 10.7x / 7.7x slower** at
+            1k / 10k / 50k (541.5 µs vs 44.94 µs · 16.21 ms vs 1.521 ms · 89.54 ms vs 11.64 ms), and the
+            residency that buys the in-RAM arm its speed is cheap: `bulk_load` amortizes after **3 queries
+            at 1k and 2 at 10k and 50k**. There is no N in the practical range where SQL k-NN wins on
+            latency, so its value is only ever the O(1) RAM — it stays a tested, documented escape hatch
+            for a store too large to hold, off the turn's critical path.
+            **The ANN question reopens, and now at a measured N.** Embeddings cost `N x dim x 4` bytes —
+            146 MiB @ 50k, **1.43 GiB @ 500k** at 768-dim — so residency binds around **~350k** under a
+            1 GB embedding budget. SQL k-NN is asymptotically linear at ~1.8 µs/element there, i.e.
+            **~630 ms per query**, which is not a recall path. So at the scale where the in-RAM ceiling
+            actually bites, the answer is an index and not SQL, and the `hnswlib-rs` shortlist above
+            becomes live at roughly **7x** today's ceiling — not before. That is the trigger to schedule
+            it on, alongside the O(N^2) dreaming clustering the shortlist was already keyed to.
+      - [x] *(2026-09-20, found by the bench above)* **Suite 2's `simd_batch` row is not the recall
+            path's latency, and the gap is a real cost the shipped code pays.** `simd_batch/50000`
+            measures 4.08 ms; `ram_scan/50000` — same N, dim, seed and host — measures **11.64 ms**,
+            2.8x more. The difference is the work `VectorStore::search_with_coverage` does around the
+            cosine map: the comparable-width count, and **a full `sort_by` of all N similarities before
+            `truncate(top_k)`**, O(N log N) on top of the O(N) cosine, for a `top_k` that is 10.
+            `remember_scoped` runs a search on **every ingest**, so this is on the write path too.
+            **Fixed the same run:** `VectorStore::rank_top_k` selects with `select_nth_unstable_by`
+            and sorts only the kept prefix. Measured end to end against the literal prior ranking,
+            all arms in one run — **-13.6% / -18.4% / -5.6%** off the *whole* recall path (cosine
+            included) at 1k / 10k / 50k; holding the comparator fixed to isolate the algorithm alone
+            it is -20.4% / -24.4% / -22.7%. The smaller figure is the one to quote: the new
+            comparator is deliberately *more* work per comparison, so crediting the predecessor with
+            it would overstate the win. Two honest caveats are recorded with the table — the 10k row
+            has a ~±5% CI, and the 50k saving does not scale the way an O(N log N) → O(N) change
+            alone predicts (cache behaviour, not comparison count, sets the pace at 400 KB of
+            similarities). Also a correctness fix, tested rather than measured: ties now resolve
+            deterministically by ascending index instead of leaning on sort stability (selection is
+            unstable), and a **NaN similarity now ranks last instead of anywhere**. NaN was
+            reachable — a zero-magnitude embedding of the right width gives cosine `0/0`, which the
+            width check cannot catch — and the old comparator handed it to `partial_cmp`, got
+            `None`, and treated it as `Equal`, which is intransitive and could seat it in the
+            returned results. 4 new tests, one of which pins the new ranking against the old stable
+            sort element-for-element on a deliberately tie-heavy fixture, plus two that drive the
+            **shipped** `VectorStore::search` rather than the ranking function in isolation (an
+            all-ties store must return the same five rows in the same order across repeated calls;
+            a zero-magnitude row must never outrank a real, if weak, match). **The suite was checked
+            against the defect, not just against the fix**: regressing `rank_order` back to the
+            similarity-only comparator makes all five fail, the two end-to-end ones included.
       - [x] *(2026-07-25)* **`MemoryRepository::delete`/`bulk_delete` now destroy the embedding on disk — the
             "today, before any HNSW" half of Ghost Vectors is closed.** Proven, not assumed: the negative
             control test (`raw_delete_leaves_embedding_on_disk`) confirms a plain `DELETE` **does** leave the
@@ -7267,6 +7383,26 @@ keep the phases readable; promote individual items into a phase when they become
       remove the toggle — not guessed at in a nightly run. Precedence note: an `OPENAI_API_KEY`
       exported before launch now wins over a key typed into Settings in the GUI process, as it
       already did in the daemon (`load_secrets_from_store` prefers env).
+- [ ] *(found 2026-09-20, during the nightly smoke run)* **This host cannot embed at all, so no
+      unattended run can verify recall through the real binary — and the three candidates fail for
+      three different reasons.** Checked rather than assumed, from an isolated scratch daemon
+      (`HOME`/`XDG_DATA_HOME`/`NANNA_CONFIG_PATH` redirected, ports 5248/5249):
+      - **OpenAI:** no key. The daemon says so precisely and then says what it means — *"No
+        embedding provider available — memory runs WITHOUT vectors: writes persist and queue for
+        backfill, recall is unavailable"*. That message is doing its job; the gap is the host, not
+        the code.
+      - **Local Ollama:** not installed (`command -v ollama` empty, nothing on `localhost:11434`).
+      - **The remote Ollama IS reachable and has exactly one model, which cannot embed.**
+        `https://mummu.basicautomation.io/ollama/api/tags` answers 200 anonymously and lists a
+        single entry, `qwen3.8-27b-ud-q4ks` (15.4 GB, qwen35). `POST /api/embed` against it returns
+        **`{"error":"embeddings are not supported by the mummu-serve shim"}`** — a shim limitation,
+        not a model one, and worth knowing before someone adds an embedding model there and expects
+        it to serve.
+      Consequence for every future run: a memory/recall change can be verified by unit tests, by
+      the Suite 2c criterion body, and by a daemon boot — but **not** by a live recall turn, and no
+      run should imply otherwise. Cheapest fixes, in order: teach `mummu-serve` the `/api/embed`
+      route (it is Mummu's, and Mummu already ships a MiniLM-class CPU embedder — file it there),
+      or pull a small embedding model onto a local Ollama once one is installed.
 - [ ] *(found 2026-09-17)* **The AppImage does not bundle on this Arch host — two host-tool causes,
       neither in our code.** `pnpm tauri build` produced `nanna-gui` and `Nanna_0.3.21_amd64.deb`, then
       `failed to run linuxdeploy`. Run by hand: (1) linuxdeploy's bundled `strip` rejects Arch's system
@@ -7588,6 +7724,31 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-09-20 sweep)* `cargo update` → 8 compatible bumps (`cc 1.4.7`, `find-msvc-tools 0.1.13`,
+     `generator 0.8.10`, `rand 0.10.3`, `tauri 2.11.6`, `tauri-plugin-updater 2.12.0`,
+     `unicode-id-start 1.5.0`). `cargo upgrade --incompatible` offered **nothing** — 79 non-local
+     packages already sit at their latest req, and for the first time in three sweeps neither
+     downgrade trap (`criterion 0.8 → "0.7"`, `lopdf 0.45 → "0.42"`) was reported at all, so those
+     rows are a registry artifact that comes and goes rather than a standing offer. Both pin-backs
+     were needed again and the `malachite` one arrived at a **third** version: `cargo update` pulled
+     in `malachite-bigint 0.12.0` beside the pinned 0.9.2 (0.10.0 on 2026-08-25, 0.11.0 on
+     2026-09-14), so the disambiguated spec is version-specific every run —
+     `cargo update -p malachite-bigint@<whatever-it-added> --precise 0.9.2`. Read the version out of
+     `cargo update`'s own "Adding" lines rather than assuming last run's number. `libc` walked to
+     0.2.189 as always and was pinned back to 0.2.186. Sweep order `update → upgrade → pin-backs →
+     verify` held.
+     GUI: only two real rows, both applied — `@tauri-apps/cli 2.11.4 → 2.11.5` and
+     `@tauri-apps/plugin-updater 2.11.0 → 2.12.0` (the latter in lockstep with the Rust
+     `tauri-plugin-updater 2.12.0` the same sweep produced). TypeScript 7 still blocked and the
+     cheap gate still answers it without a migration attempt: npm `typescript` latest is **still
+     7.0.2** and `vue-tsc` **still 3.3.11**, byte-identical to the state that failed on 2026-08-27.
+     Verified green: 2167 Rust tests (80 binaries, 0 failures), clippy 0 errors, 282 vitest,
+     `vue-tsc --noEmit` clean, `pnpm build` clean, and — the gate that matters for `malachite`, which
+     is release-only — `cargo build --release -p nanna-daemon` green in **8m14s**.
+   - *(2026-09-20)* **`rustpython` re-checked on crates.io: still nothing after 0.5.0 (2026-03-31)** —
+     just under six months, queried from `/api/v1/crates/rustpython-vm/versions` (next_page null,
+     0.5.0 is the newest of seven). Both holds it forces — `malachite-bigint =0.9.2` and the
+     `libc <= 0.2.186` ceiling — stay, and both are enforced by `dep_version_unification.rs`.
    - *(2026-09-13 sweep)* `cargo update` → 29 compatible bumps (`jiff 0.2.37`, `reqwest 0.13.5`,
      `tantivy 0.26.2`, `uuid 1.26.1`, `zerocopy 0.8.57`, `cc 1.4.6`, `bitflags 2.13.2`,
      `console 0.16.6`, `encoding_rs 0.8.41`, `multiversion 0.9`, `smallvec 1.16.1`, `toml 1.1.6`, …)
@@ -7617,6 +7778,20 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      Vulkan is the backend `wgpu` already picks, so a CubeCL-Vulkan Mummu would land on a path Nanna
      has bench numbers for. File the actual port in Mummu.
      Source: [tracel-ai/burn](https://github.com/tracel-ai/burn).
+   - *(2026-09-20 re-check)* `turso` is **still** `0.8.0-pre.11` — now **nine days** unchanged
+     (published 2026-09-11), still no stable 0.8.0, still no changelog past 0.7.0. The exact
+     `=0.7.2` pin holds; never a pre-release on an exact pin.
+     **And the "no dense ANN" fact is now confirmed by the vendor, not just by our source grep.**
+     Turso's own post [*Indexing sparse vectors with Turso*](https://turso.tech/blog/indexing-sparse-vectors-with-turso)
+     describes what their indexing work actually shipped: a **sparse** inverted index
+     (`toy_vector_sparse_ivf`, Weighted Jaccard, with adaptive length filtering and frequency-based
+     component selection) as of 0.3.0 — while **dense** vectors got *"SIMD acceleration, allowing
+     for faster exact search"* and **no ANN index at all**. That is exactly the split the
+     2026-07-24 note inferred from reading `index_method/`, so the roadmap's load-bearing claim is
+     now corroborated by the people who wrote the engine. Two consequences worth stating: waiting
+     for a Turso release to supply dense ANN is waiting for something nobody has announced, and
+     Turso's dense answer (SIMD exact search) is the *same* answer Nanna already runs in RAM —
+     which is consistent with Suite 2c finding SQL k-NN 9-14x slower rather than faster.
    - *(2026-09-14 re-check)* `turso` is **still** `0.8.0-pre.11` — unchanged since 2026-09-11, no new
      pre-release in three days, still no changelog past 0.7.0. The exact `=0.7.2` pin holds; nothing
      to re-evaluate until 0.8.0 goes stable. `fsrs 6.6.2`, `boa_engine 0.22.0` and `tantivy 0.26.2`
@@ -7702,6 +7877,25 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            remembered pin would have missed. Re-checked both retirement conditions: rustpython-
            {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
            GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [x] *(2026-09-20)* **Toolchain pin moved `nightly-2026-09-08` → `nightly-2026-09-20`**
+           (rustc `feaadeeac`, cargo `495c385d0`). Release-built `-p nanna-daemon` green from a
+           cold, isolated target dir in **9m06s** — no tokio ICE, no `turso_core` depth overflow —
+           and the full gate re-run under the new channel: **2173 tests, 0 failures, clippy 11
+           warnings / 0 errors**. The mirrored `toolchain:` inputs in `budget-gate.yml`,
+           `test-compile.yml` (4 sites) and `release-check.yml` moved with it.
+           **What the move actually cost, and what it was not:** the newer clippy first reported
+           **58** warnings against the old channel's 21. That looked like a regression and was not
+           — it is one newly-pedantic lint, `clippy::map_unwrap_or`, firing on
+           `map(f).unwrap_or_default()` at 22 sites across 19 files. Taking the machine-applicable
+           `map_or_default` rewrites cleared it and left **11 warnings on both channels**, i.e. the
+           cleanup also improved the old pin by 10. Two of clippy's auto-fixes were reverted by
+           hand: its suggestion for `assert!(x.is_empty())` is
+           `assert_eq!(x, [] as [std::string::String; 0])`, which reads worse than what it
+           replaces. Both rewrites were verified to compile on the **old** channel too, so the
+           style commit does not depend on the pin move landing.
+           The caveat from the previous pin still holds verbatim: the channel does not control
+           cargo's build-script output layout, so it neither caused nor fixes anything about the
+           Tauri GUI build on Linux.
      - [x] *(2026-09-09)* **Toolchain pin moved `nightly-2026-08-27` → `nightly-2026-09-08`**
            (rustc `cea272fa3`). Both candidates release-built `-p nanna-daemon` green from cold
            target dirs — `nightly-2026-08-29` in 8m37s, `nightly-2026-09-08` in 8m33s — with no
@@ -8494,9 +8688,36 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  Stated tradeoffs in the issue: dependency count 153 → 276, Turso is WAL-only
                  (`PRAGMA wal_checkpoint(TRUNCATE)` folds the WAL for shipping), and no
                  URI/immutable read-only mode.
+                 *(re-checked 2026-09-20 — **it has moved from "In Progress" to reviewable code**,
+                 which is the first time this watch has had something concrete to point at.)*
+                 #1608 is still open, but its timeline now carries the work rather than the intent,
+                 all by the same assignee (**jwric**), all verified through the GitHub API rather
+                 than a search snippet:
+                 - **[cubecl#1643 "Refactor/async turso storage"](https://github.com/tracel-ai/cubecl/pull/1643)
+                   — OPEN**, created 2026-09-14, last updated **2026-09-18**. Switches the SQLite
+                   backend from `rusqlite` to `turso` and unifies the store API across web and
+                   native. Note precisely what it does and does not claim: the description says the
+                   *backend* changes, **not** that `rusqlite` leaves `cubecl-environment`'s manifest.
+                   Nanna's guard fails on the **lockfile**, so "the backend now uses turso" is not
+                   yet the same as "the dependency is gone" — re-check the resolved lockfile, not
+                   the PR title, before declaring this unblocked.
+                 - **[cubecl#1645 "refactor(bundle): drop the SQLite bundle format"](https://github.com/tracel-ai/cubecl/pull/1645)
+                   — closed**, removing `BundleFormat`/`SqliteBundle` and with them the journal-mode
+                   and attach complexity the WAL-only tradeoff created.
+                 - **The precedent landed**: [burn#5546](https://github.com/tracel-ai/burn/pull/5546),
+                   **merged 2026-09-09**, replaced `rusqlite` + `r2d2_sqlite` + `serde_rusqlite`
+                   with Turso in `burn-dataset` and took its dependency count **153 → 44**. That is
+                   the "a similar migration was completed in the burn project" line in #1608, now
+                   with a number attached.
+                 - The root issue is **[cubecl#1488](https://github.com/tracel-ai/cubecl/issues/1488)**:
+                   `cubecl-environment`'s unconditional SQLite cache forces `libsqlite3-sys` on
+                   every consumer. Worth having the issue number too — #1608 is the remedy, #1488 is
+                   the defect, and a future run may find one closed without the other.
                  **So: watch #1608 before spending the owner's decision on the two options below.**
                  Re-check it at the top of each run — this is now the cheapest thing standing
-                 between P12 and its first real consumer.
+                 between P12 and its first real consumer. The concrete check is one command once
+                 #1643 merges: add `mummu` and see whether `no_banned_database_crates_in_lockfile`
+                 still fails.
            - [ ] ~~Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
                  clear.~~ **Superseded by #1608 above** — removing the C engine beats gating it.
            - [ ] Narrow `dep_guard`'s ban to Nanna's *own* storage path, explicitly permitting a

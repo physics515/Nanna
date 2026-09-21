@@ -128,6 +128,92 @@ win no matter how good the index is.
 The sparse regime is also the realistic one for a long-lived store: what survives
 consolidation is precisely the memories that did *not* merge into anything.
 
+### 2026-09-20 — norm hoisting: 11-18% off the pass, and a useful negative result
+
+`cluster_memories` now computes each memory's L2 norm **once** and gives the pair loop a
+single dot product against two cached scalars, instead of calling `cosine_similarity_f32`,
+which re-derives both magnitudes on every pair (it accumulates three FMAs per element:
+`a·b`, `a·a`, `b·b`). Bit-identical results — the two SIMD kernels walk the same chunks in
+the same order, so this is an identity, not a tolerance, and
+`norm_hoisting_is_bit_identical_to_the_cosine_kernel` asserts exact `f32` equality across
+seven widths. The `pairs` column is unchanged at every N, which is the other half of the
+proof that nothing about the clustering decision moved.
+
+Same host, same fixture, same seed; two independent runs after the change, both agreeing:
+
+| N (sparse) | wall_ms before | wall_ms after (2 runs) | delta |
+| --- | --- | --- | --- |
+| 1,000 | 14.2 | 12.2 / 11.2 | **-17.6%** |
+| 2,000 | 54.2 | 47.1 / 47.8 | **-12.5%** |
+| 4,000 | 224.2 | 194.3 / 193.9 | **-13.4%** |
+| 8,000 | 916.8 | 794.6 / 788.4 | **-13.7%** |
+| 16,000 | 4,206.6 | 3,756.4 / 3,703.3 | **-11.3%** |
+
+Dense arm moves too but less and noisily (226.9 → 203.2 / 206.1 at 16k, ~-10%); it has far
+fewer pairs, so read the sparse arm.
+
+**The negative result is the more useful half, and it contradicts the estimate that
+motivated the change.** Removing two thirds of the FMAs was expected to be worth roughly
+2-3x. It is worth 13%. The cosine kernel here is **memory-bandwidth bound, not
+FMA bound** — each pair streams two 384-float vectors (~3 KB) and a wide out-of-order core
+absorbs the extra multiply-adds nearly for free. So: **do not chase arithmetic in this
+loop.** Vectorising harder, fusing, or hand-tuning the kernel will buy single-digit
+percentages against a quadratic, and the ceiling is not moved by any of it.
+
+Concretely, the extrapolation barely improves — 35 ns/pair → 29 ns/pair means **500k goes
+from ~73 min to ~60 min**. A dream cycle still cannot take an hour. The only lever that
+changes the shape is **comparing fewer pairs**, which is exactly what the indexed-clustering
+item proposes and exactly what this measurement now supports with a number rather than an
+assumption.
+
+### 2026-09-20 — an `aged` arm, because the other two run at a timescale production never uses
+
+The dense and sparse arms space memories one second apart while leaving
+`time_span_minutes` at its 1440-minute default, so `age_proximity` never leaves the top of
+its range. `MemoryService::with_store_timescale` does not do that: it sets the span to the
+store's own oldest-to-newest gap, which is what makes a mature store discriminate at week
+scale rather than minute scale. The two arms also use `FsrsState::default()` for every
+memory, which pins `access_count` at 0 and `importance` at 1.0 — so `recall_affinity` and
+`importance_proximity` are identically 1.0 *by construction*, the exact degeneracy the
+2026-09-09 similarity-veto bug turned on.
+
+The new **aged** arm keeps the sparse vectors and fixes both: 90 days of spread, the
+production timescale rule, and FSRS state that varies. Same N, same vectors, same `pairs`.
+
+### 2026-09-20 — pruning pairs before the cosine: 16-22%, and it is lossless by construction
+
+`score_or_prune` computes the three scalar terms first and skips the cosine when the pair's
+**ceiling** — the score it would get with a perfect cosine of 1.0 — is already below
+`cluster_threshold`. Each cheap term is bounded above by 1.0 by construction, so the ceiling
+is a true upper bound and the skipped pairs are exactly the pairs that would have been
+rejected. Not a heuristic and not a tolerance: `pruning_never_changes_a_cluster` clusters a
+randomized corpus with and without it and requires identical output, plus exact `f32`
+equality on every pair that is *not* pruned.
+
+On the aged arm it rejects **21.9% of all pairs** before touching an embedding. A/B on the
+identical corpus through the identical code path (the prune disabled with a `black_box`
+false so nothing else changes), **two samples each**:
+
+| N (aged) | no prune | with prune | delta |
+| --- | --- | --- | --- |
+| 1,000 | 12.7 / 13.7 | 11.4 / 10.4 | **-17.4%** |
+| 2,000 | 48.6 / 54.6 | 43.4 / 43.4 | **-15.9%** |
+| 4,000 | 198.3 / 211.5 | 174.2 / 171.4 | **-15.7%** |
+| 8,000 | 783.4 / 866.4 | 704.0 / 676.5 | **-16.3%** |
+| 16,000 | 4,111.7 / 3,865.5 | 3,291.2 / 2,943.0 | **-21.9%** |
+
+**How much it saves is data-dependent, and the honest version of that is: it does nothing
+on the dense and sparse arms.** There every cheap term sits at 1.0, the ceiling never falls
+below the threshold, and the prune cannot fire — which is why the aged arm had to exist
+before this could be measured at all. A store written in one sitting gets nothing; a
+long-lived store, which the roadmap calls the realistic case, gets a fifth of its pairs back.
+
+**It does not change the conclusion above.** 21.9% fewer pairs is a constant factor on a
+quadratic: 500k goes from ~60 min to roughly ~47 min. Still not a dream cycle. The two
+2026-09-20 passes together are the argument for the index — they took every cheap win
+available without one (a third of the arithmetic, a fifth of the pairs) and the wall is
+still there.
+
 > **Two earlier readings of this table were wrong, and both for the same reason — the
 > configuration underneath moved.** The first (pre-fix `cluster_threshold` 0.45) showed
 > `pairs` growing *linearly*, because the non-semantic floor (0.50) sat above the threshold
@@ -679,6 +765,102 @@ Budget: the tool-result row is **zero at any chunk count**, which is a structura
 measurement — the test asserts it at 1, 8 and 64 chunks. The ordinary-fact row is a floor, not a
 ceiling: it must not drop to 0, or the deferral has silently swallowed the paths that should still
 dedup inline.
+
+### Suite 2c — the recall path: SQL exact k-NN, and how the top-k is ranked
+
+Instrument: `nanna-bench` criterion body `benches/recall_path.rs`. Run with
+`cargo bench -p nanna-bench --bench recall_path`.
+
+**Why this row exists.** P13's "indexed clustering" item sequenced the ANN-crate question behind
+one measurement: exact SQL k-NN (`MemoryRepository::search_by_embedding_sql`, O(1) RAM, reads
+rows from Turso per query) against the shipped in-RAM scan (`VectorStore::search_with_coverage`,
+O(N x dim) resident, pure compute per query). Correctness was already proven — `vector_knn.rs`
+pins the ranking against an independent cosine scan, `sql_knn_retention.rs` repeats it on the
+retention corpus — so the only open question was the trade.
+
+Five arms. `bulk_load` is there because comparing the two query paths alone would credit the
+in-RAM arm with a residency it never paid for; the two `ram_scan_*` controls are there because the
+measurement turned up a second, separate finding about how that arm ranks its candidates.
+
+Measurement *(2026-09-20, release/bench profile, AMD Ryzen 9 7950X3D / AVX-512, Arch Linux,
+nightly-2026-09-08, 768-dim, fixed seed `0x0A_11A_B01`, `LIMIT = 10`, **file-backed** Turso
+database in a scratch dir — not `Storage::in_memory()`, which would hand the SQL arm the very
+residency the comparison is about; quiet host, 20 samples, criterion mean with its 95% CI.
+**All rows from one run**, so they are directly comparable)*:
+
+| Arm | N=1,000 | N=10,000 | N=50,000 |
+| --- | --- | --- | --- |
+| `sql_knn` | **551.1 µs** [545.0, 559.6] | **16.57 ms** [16.47, 16.68] | **98.34 ms** [97.63, 99.06] |
+| `ram_scan` *(shipped)* | **39.85 µs** [39.69, 40.00] | **1.441 ms** [1.411, 1.483] | **10.89 ms** [10.84, 10.94] |
+| `ram_scan_prior_code` *(control B)* | 46.12 µs [45.90, 46.30] | 1.767 ms [1.670, 1.857] | 11.53 ms [11.48, 11.58] |
+| `ram_scan_sort_same_cmp` *(control A)* | 50.06 µs [49.68, 50.40] | 1.908 ms [1.891, 1.925] | 14.09 ms [13.83, 14.27] |
+| `bulk_load` *(one-time)* | 1.203 ms [1.197, 1.207] | 26.32 ms [26.06, 26.72] | 141.6 ms [140.8, 142.5] |
+
+#### Finding 1 — keep the in-RAM scan as the live recall path. Do not wire SQL k-NN into it.
+
+SQL k-NN is **13.8x / 11.5x / 9.0x** slower per query at 1k / 10k / 50k, and the residency that
+buys the in-RAM arm its speed is not expensive enough to change the answer: `bulk_load` amortizes
+after **3 queries at 1k and 2 at 10k and 50k** (load / per-query saving: 1.203/0.511 = 2.4,
+26.32/15.13 = 1.7, 141.6/87.45 = 1.6). A daemon serving more than a handful of recalls per boot is
+strictly better off resident. This closes the item's "decision to wire it into the live recall
+path" with a measurement rather than a preference.
+
+**What SQL k-NN is still for, stated precisely.** Its value was never latency — it is the O(1) RAM
+property, and the number that decides when that matters is residency, not milliseconds. Embeddings
+alone cost `N x dim x 4` bytes: **2.9 MiB @ 1k, 29.3 MiB @ 10k, 146 MiB @ 50k, 1.43 GiB @ 500k,
+2.86 GiB @ 1M** (768-dim; `MemoryEntry` content and metadata sit on top). So it stays what it is —
+a tested, documented escape hatch for a store too large to hold, off the turn's critical path.
+
+**And that is what re-opens the ANN question, at a measured N rather than a feeling.** Per-element
+SQL cost is 551 ns @ 1k, 1.66 µs @ 10k, 1.97 µs @ 50k — rising then flattening, i.e. asymptotically
+linear at ~2 µs/element once the fixed and cache-locality terms wash out. At the N where residency
+actually becomes the binding constraint (~350k at 768-dim under a 1 GB embedding budget), SQL k-NN
+would cost **~690 ms per query**, which is not a recall path. So at the scale where the in-RAM
+ceiling bites, the answer is an index and not SQL — the roadmap's `hnswlib-rs` shortlist becomes
+live at roughly **7x** today's ~50k ceiling, not before.
+
+#### Finding 2 — the recall path was ranking all N to keep ten, and Suite 2 could not see it
+
+`simd_batch/50000` (Suite 2) measures **4.08 ms**; `ram_scan_prior_code/50000` — the same N, dim,
+seed and host, running what the daemon actually did — measures **11.53 ms**, **2.8x** more. The
+difference is the work `search_with_coverage` does around the cosine map and `simd_batch` omits:
+the comparable-width count, and a full `sort_by` of all N similarities before `truncate(top_k)`,
+O(N log N) on top of the O(N) cosine for a `top_k` of 10. `remember_scoped` searches on **every
+ingest**, so it was on the write path too. Suite 2's row remains a valid SIMD-kernel gate; it is
+simply not the recall path's latency, and the two must not be read as the same number.
+
+Replaced by `select_nth_unstable_by` + sorting only the kept prefix. The two controls separate the
+two things that changed, which is why both are kept:
+
+| vs. | N=1,000 | N=10,000 | N=50,000 | isolates |
+| --- | --- | --- | --- | --- |
+| **control B** `ram_scan_prior_code` | **-13.6%** | **-18.4%** | **-5.6%** | the whole change, end to end |
+| **control A** `ram_scan_sort_same_cmp` | -20.4% | -24.4% | -22.7% | selection vs sorting alone |
+
+**Control B is the number to quote.** Control A holds the comparator fixed, so it shows the
+algorithmic win cleanly — but the shipped comparator is *more* work per comparison than the one it
+replaced (two finiteness checks and an index tiebreak, needed to make the order total once
+selection is unstable). Quoting A alone would bill the predecessor for a cost it never paid. The
+honest end-to-end delta against what actually ran is the B row: **5.6-18.4% off the entire recall
+path**, cosine included.
+
+Two caveats, both stated rather than smoothed over. The 10k B row has a visibly wider CI
+([1.670, 1.857] ms, ~±5%) than its neighbours, so -18.4% there is the least certain of the three.
+And the 50k gain is the smallest despite the largest N: the absolute saving only doubles (0.33 ms →
+0.65 ms) for 5x the N, which an O(N log N) → O(N) change alone does not explain — at 50k the
+similarity vector is ~400 KB and cache behaviour, not comparison count, is setting the pace. The
+win is real and reproducible at every size; its *shape* is not purely algorithmic.
+
+The change is also a correctness fix, and that part is not measured but tested
+(`crates/nanna-memory/src/lib.rs` tests): ties now resolve deterministically by ascending index
+rather than relying on sort stability, and a NaN similarity — reachable from a zero-magnitude
+embedding of the right width, which the width check cannot catch — now ranks last instead of being
+handed to `partial_cmp`, reported as `None`, treated as `Equal`, and potentially landing in the
+returned results off an intransitive comparator.
+
+Budget: none added. This suite answers design questions rather than gating a regression — the
+`ram_scan` arm is budgeted through Suite 2's `simd_batch` ceilings, and a budget on `sql_knn` would
+gate a path deliberately kept off the critical path.
 
 ---
 
