@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument as _, debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::numeric::{f32_to_usize, millis_u64, usize_to_f32};
@@ -944,6 +944,18 @@ struct LlmResult {
     /// Error tool results from malformed JSON parsing failures.
     /// These need to be sent back to the model so it knows the call failed.
     error_tool_results: Vec<ContentBlock>,
+}
+
+/// Bytes a tool call returned, for its span: the content plus the error
+/// text, since a refusal (a breaker notice, a failed call) carries its
+/// message in `error` and would otherwise report as empty.
+fn tool_output_bytes(result: &ToolResult) -> usize {
+    let error_bytes = result.error.as_ref().map_or(0, String::len);
+    debug_assert!(
+        result.content.len().checked_add(error_bytes).is_some(),
+        "two in-memory strings cannot overflow usize together"
+    );
+    result.content.len() + error_bytes
 }
 
 /// Detect a literal tool-call loop: the newest tool call repeated an earlier
@@ -4462,7 +4474,11 @@ impl Agent {
         message: &str,
         options: RunOptions,
     ) -> Result<AgentResponse, AgentError> {
-        let (mut state, mut limits) = self.prepare_run(message, &options).await;
+        let run_span = crate::spans::run_span(&self.config.model);
+        let (mut state, mut limits) = self
+            .prepare_run(message, &options)
+            .instrument(run_span.clone())
+            .await;
 
         // Agent loop
         loop {
@@ -4472,18 +4488,38 @@ impl Agent {
             // walks that whole nesting — deep enough, through the streaming
             // LLM call, to exceed the compiler's recursion limit. Boxing
             // proves it once, here, from a shallow start.
+            //
+            // `begin_iteration` increments the count first thing, so the
+            // iteration this future runs is the next one.
+            let iteration_span = crate::spans::iteration_span(&run_span, state.iterations + 1);
+            // The span wraps the BOXED future, not the inner one: wrapping
+            // first would put `Instrumented` inside the coercion and send the
+            // `Send` proof back down the deep nesting the box exists to cut.
             let iteration: std::pin::Pin<
                 Box<dyn std::future::Future<Output = Pass> + Send + '_>,
             > = Box::pin(self.run_iteration(&mut state, &options, &mut limits));
-            match iteration.await {
+            match iteration.instrument(iteration_span).await {
                 ControlFlow::Continue(()) | ControlFlow::Break(RunExit::Next) => {}
                 ControlFlow::Break(RunExit::Respond { truncated }) => {
+                    let outcome = if truncated {
+                        "responded_truncated"
+                    } else {
+                        "responded"
+                    };
+                    state.record_on_span(&run_span, outcome);
                     return Ok(state.into_response(truncated));
                 }
                 ControlFlow::Break(RunExit::Cancelled) => {
-                    return self.finish_cancelled(state, &options).await;
+                    state.record_on_span(&run_span, "cancelled");
+                    return self
+                        .finish_cancelled(state, &options)
+                        .instrument(run_span)
+                        .await;
                 }
-                ControlFlow::Break(RunExit::Fail(error)) => return Err(error),
+                ControlFlow::Break(RunExit::Fail(error)) => {
+                    state.record_on_span(&run_span, "failed");
+                    return Err(error);
+                }
             }
         }
     }
@@ -4525,19 +4561,13 @@ impl Agent {
             }
 
         let (result, llm_latency, escalated) = self
-            .call_with_escalation(
+            .llm_exchange(
                 &mut request,
                 state,
                 options,
                 routed_model.is_some(),
                 complexity,
             )
-            .await;
-        let result = self
-            .heal_unserved_tool_rejection(&mut request, result, state, options)
-            .await;
-        let result = self
-            .retry_after_context_overflow(&mut request, result, state, options)
             .await;
         let mut result = Self::settle_llm_result(state, result)?;
         self.record_llm_call(
@@ -4620,6 +4650,49 @@ impl Agent {
         .await?;
         self.after_tool_round(state, options).await;
         ControlFlow::Continue(())
+    }
+
+    /// One iteration's whole LLM exchange — the call with its escalation
+    /// retry, then both heals — under one `llm_call` span that records how
+    /// it settled. The heals are further requests for the same turn, so
+    /// they belong to the same span rather than to spans of their own.
+    async fn llm_exchange(
+        &self,
+        request: &mut AnthropicRequest,
+        state: &mut RunState,
+        options: &RunOptions,
+        routed: bool,
+        complexity: Option<TaskComplexity>,
+    ) -> (Result<LlmResult, AgentError>, std::time::Duration, bool) {
+        let llm_span = crate::spans::llm_call_span(&request.model);
+        let requested_model = request.model.clone();
+        let (result, llm_latency, escalated) = self
+            .call_with_escalation(request, state, options, routed, complexity)
+            .instrument(llm_span.clone())
+            .await;
+        let result = self
+            .heal_unserved_tool_rejection(request, result, state, options)
+            .instrument(llm_span.clone())
+            .await;
+        let result = self
+            .retry_after_context_overflow(request, result, state, options)
+            .instrument(llm_span.clone())
+            .await;
+        crate::spans::record_llm_outcome(
+            &llm_span,
+            &crate::spans::LlmCallOutcome {
+                requested_model: &requested_model,
+                model: &request.model,
+                latency_ms: millis_u64(llm_latency),
+                escalated,
+                tokens: result
+                    .as_ref()
+                    .ok()
+                    .map(|r| (r.input_tokens, r.output_tokens)),
+                tool_calls: result.as_ref().map_or(0, |r| r.tool_uses.len()),
+            },
+        );
+        (result, llm_latency, escalated)
     }
 
     /// Size the context for the model, seed the run state, and add the
@@ -6931,14 +7004,25 @@ impl Agent {
 
     async fn store_assistant_response(&self, content_blocks: &[ContentBlock]) {
         let mut ctx = self.context.write().await;
-        let stripped = Self::strip_write_content_from_blocks(content_blocks);
+        let argument_bound =
+            context_share_chars(self.config.context_result_threshold, ctx.hard_limit);
+        let stripped = Self::strip_write_content_from_blocks(content_blocks, argument_bound);
         ctx.messages.push(AnthropicMessage::assistant(stripped));
     }
 
-    /// Strip large content from `write_file/write` `tool_use` blocks before storing in context.
+    /// Strip large arguments from `tool_use` blocks before storing them in
+    /// context.
     ///
-    /// The LLM already generated the content, so keeping it in stored context is pure waste.
-    /// Replaces the `content` field with a size placeholder.
+    /// The LLM already generated the arguments, so keeping bulk copies in
+    /// stored context is pure waste. A write tool's `content` is always
+    /// replaced; any other argument is replaced once its serialized size
+    /// exceeds `argument_bound_chars` — the same share of the input budget a
+    /// single tool RESULT may take ([`context_share_chars`]). Before, only
+    /// write tools were stripped: a 185 KB argument to any other tool (an
+    /// `exec` heredoc, `python` code, `remember` content) sat in the stored
+    /// turn, pushed the context past its hard limit, and the hard cap then
+    /// dropped the model's own tool call — measured 56k estimated tokens
+    /// against a 1.6k-token actual request.
     ///
     /// The placeholder is deliberately OUTCOME-NEUTRAL. This runs while the
     /// call is still only a request — the tool has not executed — so it cannot
@@ -6948,31 +7032,25 @@ impl Agent {
     /// disk" immediately beside a tool result reading "WRITE HELD — nothing
     /// was written". The result is the record of what happened; this is only
     /// the record of what was asked for, and it now says so.
-    fn strip_write_content_from_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
-        blocks.iter().map(|block| {
-            match block {
-                ContentBlock::ToolUse { id, name, input } if is_write_tool(name) => {
-                    let mut input = input.clone();
-                    if let Some(obj) = input.as_object_mut()
-                        && let Some(content_val) = obj.get("content") {
-                            let size = content_val.as_str().map_or_else(
-                                || content_val.to_string().len(),
-                                str::len,
-                            );
-                            obj.insert(
-                                "content".to_string(),
-                                Value::String(format!("[content omitted here ONLY because your context window is limited — {size} bytes were sent to this tool; the tool result below is the authoritative record of what happened on disk]")),
-                            );
-                        }
-                    ContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input,
-                    }
-                }
+    fn strip_write_content_from_blocks(
+        blocks: &[ContentBlock],
+        argument_bound_chars: usize,
+    ) -> Vec<ContentBlock> {
+        debug_assert!(
+            argument_bound_chars > 0,
+            "the bound is a share of a real budget"
+        );
+        blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolUse { id, name, input } => ContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: strip_large_arguments(name, input, argument_bound_chars),
+                },
                 _ => block.clone(),
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     async fn execute_tools(
@@ -7151,11 +7229,9 @@ impl Agent {
         // and one tool result should not claim more of the input than that.
         // A quarter of N tokens is N chars at the ~4 chars/token this
         // codebase estimates with.
-        let threshold = if self.config.context_result_threshold == 0 {
-            let input_budget_tokens = { self.context.read().await.hard_limit };
-            (input_budget_tokens / 4) * CHARS_PER_TOKEN_ESTIMATE
-        } else {
-            self.config.context_result_threshold
+        let threshold = {
+            let hard_limit = self.context.read().await.hard_limit;
+            context_share_chars(self.config.context_result_threshold, hard_limit)
         };
 
         // Memory gets EVERYTHING. `output_target` decides only what CONTEXT
@@ -7187,6 +7263,17 @@ impl Agent {
         )
         .await;
 
+        // No memory sink (memory disabled, or a caller that wires none): a
+        // memory-targeted result has nowhere to be stored, so there is no
+        // handle to stub it to. It used to fall through to the whole result
+        // verbatim — a 185 KB `echo` entered context uncut, and the hard cap
+        // then evicted it together with the call that made it. Without memory
+        // the context path's own bounded compaction is the only honest option.
+        let output_target = if options.on_memory.is_none() {
+            OutputTarget::Context
+        } else {
+            output_target
+        };
         let final_content = match output_target {
             OutputTarget::Context => {
                 self.compact_context_result(&name, result_content, threshold)
@@ -7360,6 +7447,8 @@ impl Agent {
                 let call = call.clone();
                 let breaker_notice = breaker_notice.clone();
                 let tools = Arc::clone(&self.tools);
+                let span = crate::spans::tool_call_span(&name, &call.id);
+                let outcome_span = span.clone();
                 async move {
                     // Short-circuited by one of the sibling breakers: the
                     // structured notice is RETURNED instantly (never thrown);
@@ -7380,6 +7469,13 @@ impl Agent {
                             // verbatim, never stubbed behind a memory handle.
                             output_target: OutputTarget::Context,
                         };
+                        crate::spans::record_tool_outcome(
+                            &outcome_span,
+                            0,
+                            tool_output_bytes(&response.result),
+                            false,
+                            true,
+                        );
                         return (response, 0u64);
                     }
                     let start = std::time::Instant::now();
@@ -7387,8 +7483,16 @@ impl Agent {
                     let response = tools.execute(call).await;
                     let duration_ms =
                         u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    crate::spans::record_tool_outcome(
+                        &outcome_span,
+                        duration_ms,
+                        tool_output_bytes(&response.result),
+                        response.result.success,
+                        false,
+                    );
                     (response, duration_ms)
                 }
+                .instrument(span)
             })
             .collect();
 
@@ -9632,6 +9736,17 @@ impl RunState {
         }
     }
 
+    /// Record how the run ended on its `agent_run` span.
+    fn record_on_span(&self, span: &tracing::Span, outcome: &'static str) {
+        crate::spans::record_run_outcome(
+            span,
+            self.iterations,
+            u64::from(self.input_tokens),
+            u64::from(self.output_tokens),
+            outcome,
+        );
+    }
+
     fn into_response(mut self, truncated: bool) -> AgentResponse {
         // Close the last block on the way out. Reasoning blocks are otherwise
         // only finalized when a round calls a tool, so on any run whose final
@@ -9858,6 +9973,53 @@ const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
 /// Check if a tool name is a write-type tool whose content should be stripped from context.
 /// `file_buffer` appends carry 20-40-line chunks that live in the on-disk
 /// buffer after the call — keeping them in context doubles their cost.
+/// The share of the input budget, in chars, one tool payload may occupy in
+/// context: a quarter of `hard_limit` tokens at the codebase's chars-per-token
+/// estimate, unless `configured_chars` (non-zero) overrides it. Shared by tool
+/// RESULTS and tool-call ARGUMENTS, so neither can crowd out the other.
+fn context_share_chars(configured_chars: usize, hard_limit_tokens: usize) -> usize {
+    let chars = if configured_chars == 0 {
+        (hard_limit_tokens / 4) * CHARS_PER_TOKEN_ESTIMATE
+    } else {
+        configured_chars
+    };
+    // A zero budget would stub every argument; a real window never gives one.
+    chars.max(1)
+}
+
+/// `input` with every oversized top-level argument replaced by an
+/// outcome-neutral placeholder (see `strip_write_content_from_blocks`).
+fn strip_large_arguments(name: &str, input: &Value, bound_chars: usize) -> Value {
+    let mut input = input.clone();
+    let Some(object) = input.as_object_mut() else {
+        return input;
+    };
+    let write_tool = is_write_tool(name);
+    for (field, value) in object.iter_mut() {
+        let size = value
+            .as_str()
+            .map_or_else(|| value.to_string().len(), str::len);
+        let always = write_tool && field == "content";
+        if !always && size <= bound_chars {
+            continue;
+        }
+        *value = Value::String(if always {
+            format!(
+                "[content omitted here ONLY because your context window is limited — {size} \
+                 bytes were sent to this tool; the tool result below is the authoritative \
+                 record of what happened on disk]"
+            )
+        } else {
+            format!(
+                "[argument omitted here ONLY because your context window is limited — {size} \
+                 bytes were sent to this tool as `{field}`; the tool result below is the \
+                 authoritative record of what happened]"
+            )
+        });
+    }
+    input
+}
+
 fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
@@ -10201,7 +10363,7 @@ mod tests {
             input: serde_json::json!({ "file_path": "./x", "content": "hello" }),
         }];
 
-        let stripped = Agent::strip_write_content_from_blocks(&blocks);
+        let stripped = Agent::strip_write_content_from_blocks(&blocks, 10_000);
         let ContentBlock::ToolUse { input, .. } = &stripped[0] else {
             panic!("the block must stay a tool_use");
         };
@@ -10219,6 +10381,50 @@ mod tests {
             !placeholder.contains("intact on disk"),
             "and it must not send the model to read bytes that may never have              landed: {placeholder}"
         );
+    }
+
+    /// Any tool's argument over the bound is stripped from the stored turn,
+    /// not only a write tool's content — and one under it is kept verbatim,
+    /// because a short argument is the model's record of what it asked for.
+    #[test]
+    fn an_oversized_argument_of_any_tool_is_stripped_and_a_small_one_kept() {
+        let big = "x".repeat(5_000);
+        let blocks = vec![ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({ "command": big, "timeout": 30 }),
+        }];
+        let stripped = Agent::strip_write_content_from_blocks(&blocks, 4_000);
+        let ContentBlock::ToolUse { input, .. } = &stripped[0] else {
+            panic!("the block must stay a tool_use");
+        };
+        let placeholder = input["command"].as_str().expect("command is replaced");
+        assert!(
+            placeholder.contains("5000 bytes were sent to this tool as `command`"),
+            "{placeholder}"
+        );
+        assert!(
+            !placeholder.contains("succeeded"),
+            "outcome-neutral: {placeholder}"
+        );
+        assert_eq!(input["timeout"], 30, "a small argument is kept verbatim");
+
+        let kept = Agent::strip_write_content_from_blocks(&blocks, 6_000);
+        let ContentBlock::ToolUse { input, .. } = &kept[0] else {
+            panic!("the block must stay a tool_use");
+        };
+        assert_eq!(
+            input["command"].as_str().map(str::len),
+            Some(5_000),
+            "under the bound: untouched"
+        );
+    }
+
+    #[test]
+    fn the_context_share_is_a_quarter_of_the_input_budget_unless_configured() {
+        assert_eq!(context_share_chars(0, 12_288), 12_288);
+        assert_eq!(context_share_chars(2_000, 12_288), 2_000);
+        assert_eq!(context_share_chars(0, 0), 1, "never zero");
     }
 
     #[test]

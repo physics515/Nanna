@@ -1,0 +1,66 @@
+name: Dependency audit
+
+# Known-vulnerability gate over both lockfiles (P0.3: Dependabot shipped
+# 2026-07-24; the audit half stayed open until 2026-09-21).
+#
+# What fails the job, and why only that:
+# - Rust: a RustSec *vulnerability* in Cargo.lock. `cargo audit` reports
+#   `unmaintained` and `unsound` advisories as warnings and exits 0 on them;
+#   on 2026-09-21 there were 16 such warnings and 0 vulnerabilities, and none
+#   of the 16 is fixable from this tree (they sit under rustpython, turso's
+#   exact pin, and the Tauri/GTK stack). Failing on them would make the job
+#   permanently red and therefore ignored. They stay visible in the log.
+# - npm: an advisory of `high` or `critical` severity in the GUI's production
+#   dependencies. On 2026-09-21 the only findings were 4 low/moderate
+#   DOMPurify advisories, all inside `monaco-editor`'s *vendored* copy
+#   (esm/vs/base/browser/dompurify/) — a pnpm override would silence the
+#   audit without changing any code that runs, so there is none.
+#
+# Triggered by the files that can change the answer, plus weekly: an advisory
+# can be published against a lockfile nobody touched.
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+      - 'gui/pnpm-lock.yaml'
+      - '.github/workflows/audit.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'Cargo.lock'
+      - 'gui/pnpm-lock.yaml'
+      - '.github/workflows/audit.yml'
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: RustSec (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Reads Cargo.lock only — no toolchain or build needed.
+      - run: cargo audit
+
+  npm-audit:
+    name: npm advisories (pnpm audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      # Reads pnpm-lock.yaml only — verified to need no install.
+      - run: pnpm audit --prod --audit-level=high

@@ -1703,6 +1703,66 @@ pub fn steps_repeat(previous: &[StepToolCall], current: &[StepToolCall]) -> bool
     !current.is_empty() && previous == current
 }
 
+/// Fingerprint of a step's answer when the step is a pure answer: no tool
+/// calls, not a degenerate (narration) loop, and some text. `None` otherwise.
+///
+/// Whitespace is collapsed so a re-flowed copy of the same answer matches;
+/// anything else — a changed word, different casing — does not. Exact on
+/// purpose: this feeds [`answer_converged`], which completes an item, and a
+/// false match there ends a turn early while a missed one only costs a step.
+#[must_use]
+pub fn tool_free_answer_fingerprint(outcome: &StepOutcome) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    if !outcome.tool_calls.is_empty() || outcome.degenerate_loop {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut words = 0_usize;
+    for word in outcome.text.split_whitespace() {
+        word.hash(&mut hasher);
+        words += 1;
+    }
+    debug_assert!(
+        words > 0 || outcome.text.trim().is_empty(),
+        "non-blank text always has a word"
+    );
+    (words > 0).then(|| hasher.finish())
+}
+
+/// The first clause of an abandonment reason: how many steps ran on the item
+/// (replans included, counted where the run counts its steps), and what the
+/// no-progress budget charged.
+///
+/// The budget is a charge counter, not a step counter: a step that repeats
+/// the previous one is charged twice, a step with fresh evidence resets it,
+/// and replans are not charged at all. Reporting the charge as "N fruitless
+/// steps" told the user a turn that ran 6 steps had run 8.
+#[must_use]
+pub fn abandonment_headline(steps_run: usize, fruitless_charges: usize, replans: usize) -> String {
+    debug_assert!(replans <= steps_run, "a replan is a step");
+    debug_assert!(fruitless_charges > 0, "abandonment spends the budget");
+    format!(
+        "abandoned after {steps_run} steps ({replans} of them replans) made no verifiable \
+         progress; {fruitless_charges} no-progress charges spent (a step repeating the last \
+         one is charged twice)"
+    )
+}
+
+/// Did an unchecked item's answer converge — this step, like the one before
+/// it on the same item, answered with no tool calls, and said the same thing?
+///
+/// For an item with no machine check the model's word is the verdict, and it
+/// is asked to say `TASK COMPLETE`. Small models often answer and simply do
+/// not say it; each further step then re-streams the same answer to the user
+/// until the fruitless budget abandons the item — a plain question came back
+/// as its answer seven times plus "could not finish". Repeating an answer
+/// verbatim with nothing new done in between is the model saying it has
+/// nothing to add, which is what `TASK COMPLETE` means.
+#[must_use]
+pub fn answer_converged(previous: Option<u64>, current: Option<u64>) -> bool {
+    current.is_some() && previous == current
+}
+
 // ---------------------------------------------------------------------------
 // The runner
 // ---------------------------------------------------------------------------
@@ -1780,6 +1840,15 @@ struct ItemProgress {
     tokens_spent: u64,
     last_result: Option<String>,
     last_tool_calls: Vec<StepToolCall>,
+    /// [`tool_free_answer_fingerprint`] of this item's previous step — what
+    /// [`answer_converged`] compares against.
+    last_answer_fingerprint: Option<u64>,
+    /// Steps actually run on this item. Reporting only: the abandonment
+    /// reason used to present `steps_without_progress` — a CHARGE counter,
+    /// where a step repeating the last one is charged twice — as a count of
+    /// steps, so a turn that ran 6 steps said "abandoned after 8 fruitless
+    /// steps".
+    steps_run: usize,
     runner_errors: usize,
     /// Consecutive acceptance runs that timed out (reset by any DECIDED
     /// verdict, pass or fail). Reporting and framing only — it sizes the
@@ -2343,18 +2412,16 @@ impl<'a> HarnessRun<'a> {
         hang_timeouts: usize,
     ) -> Phase {
         // Grinding AND replanning failed — close the item and move on.
-        let (dry_replans, escalated_asks, last_result) = self.progress
-            .get(&step.id)
-            .map_or((0, 0, None), |item| {
+        let (dry_replans, escalated_asks, last_result, steps_run) =
+            self.progress.get(&step.id).map_or((0, 0, None, 0), |item| {
                 (
                     item.dry_replans,
                     item.escalated_asks,
                     item.last_result.clone(),
+                    item.steps_run,
                 )
             });
-        let mut reason = format!(
-            "abandoned after {fruitless_steps} fruitless steps and {item_replans} replans"
-        );
+        let mut reason = abandonment_headline(steps_run, fruitless_steps, item_replans);
         // Say what the replan rungs actually returned. The old
         // sentence described the outcome as though decomposition had
         // happened: 84 instrumented firings produced ZERO subtasks,
@@ -2698,8 +2765,10 @@ impl<'a> HarnessRun<'a> {
             cancel: self.cancel.clone(),
         };
 
+        let step_span =
+            crate::spans::harness_step_span(request.step_index, request.item_id, step_kind);
         let step_started = Instant::now();
-        match self.runner.run_step(request).await {
+        match tracing::Instrument::instrument(self.runner.run_step(request), step_span).await {
             Ok(outcome) => {
                 self.consecutive_errors = 0;
                 // One term of the hang re-stake cap: the largest cost
@@ -2760,6 +2829,9 @@ impl<'a> HarnessRun<'a> {
         subtasks_before: Option<usize>,
     ) -> Phase {
         self.steps_taken += 1;
+        // Counted where the run counts, so the item's number and the turn's
+        // `N steps` line can never disagree.
+        self.progress.entry(step.id).or_default().steps_run += 1;
         self.input_tokens += outcome.input_tokens;
         self.output_tokens += outcome.output_tokens;
         // Attribution material for the evidence guard: which paths this
@@ -3254,77 +3326,100 @@ impl<'a> HarnessRun<'a> {
         repeated: bool,
     ) -> Phase {
         let item = self.progress.entry(step.id).or_default();
+        let answer = tool_free_answer_fingerprint(outcome);
+        let converged = answer_converged(item.last_answer_fingerprint, answer);
+        item.last_answer_fingerprint = answer;
         if step_claims_completion(&outcome.text) {
-            let detail = serde_json::json!({
-                "verified": false,
-                "tokens_spent": item.tokens_spent,
-            });
-            match self.source.complete(step.id, detail).await {
-                Ok(()) => {
-                    self.consecutive_errors = 0;
-                    self.items_completed += 1;
-                    self.items_completed_unverified += 1;
-                    let _ = self.source
-                        .log(step.id, "completed_unverified", serde_json::Value::Null)
-                        .await;
-                    self.progress.remove(&step.id);
-                }
-                Err(message) => {
-                    let _ = self.source
-                        .log(
-                            step.id,
-                            "complete_failed",
-                            serde_json::json!({ "error": message }),
-                        )
-                        .await;
-                    self.consecutive_errors += 1;
-                    if self.consecutive_errors >= self.cfg.max_consecutive_errors {
-                        return stop(StopReason::SourceError { message });
-                    }
-                }
-            }
+            return self.complete_unchecked(step, "completed_unverified").await;
+        }
+        if converged {
+            return self.complete_unchecked(step, "completed_converged").await;
+        }
+        let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
+        let degenerate = outcome.degenerate_loop && outcome.tool_calls.is_empty();
+        let steered = degenerate && item.narration_steps < NARRATION_LADDER_STEPS;
+        if fresh_success {
+            // No check exists, but the environment's evidence
+            // still counts: the step did NEW successful work,
+            // so the item is moving even without a claim.
+            item.steps_without_progress = 0;
+        } else if steered {
+            // Zero-tool degenerate loop: steer, count apart,
+            // charge only past the ladder (same routing as
+            // the checked arm above).
+            item.narration_steps += 1;
         } else {
-            let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
-            let degenerate =
-                outcome.degenerate_loop && outcome.tool_calls.is_empty();
-            let steered = degenerate
-                && item.narration_steps < NARRATION_LADDER_STEPS;
-            if fresh_success {
-                // No check exists, but the environment's evidence
-                // still counts: the step did NEW successful work,
-                // so the item is moving even without a claim.
-                item.steps_without_progress = 0;
-            } else if steered {
-                // Zero-tool degenerate loop: steer, count apart,
-                // charge only past the ladder (same routing as
-                // the checked arm above).
-                item.narration_steps += 1;
-            } else {
+            item.steps_without_progress += 1;
+            if repeated {
                 item.steps_without_progress += 1;
-                if repeated {
-                    item.steps_without_progress += 1;
-                }
             }
-            let mut step_result =
-                text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES);
-            if degenerate {
-                if !step_result.is_empty() {
-                    step_result.push_str("\n\n");
-                }
-                step_result
-                    .push_str(&narration_steering_text(item.narration_steps.max(1)));
-                let _ = self.source
+        }
+        let mut step_result = text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES);
+        if degenerate {
+            if !step_result.is_empty() {
+                step_result.push_str("\n\n");
+            }
+            step_result.push_str(&narration_steering_text(item.narration_steps.max(1)));
+            let _ = self
+                .source
+                .log(
+                    step.id,
+                    "narration_step",
+                    serde_json::json!({
+                        "narration_steps": item.narration_steps,
+                        "charged": !steered,
+                    }),
+                )
+                .await;
+        }
+        item.last_result = Some(step_result);
+        ControlFlow::Continue(())
+    }
+
+    /// Close an unchecked item on the model's word — an explicit claim, or an
+    /// answer that converged — logging `event` so the two stay distinguishable.
+    async fn complete_unchecked(&mut self, step: &TaskStep, event: &'static str) -> Phase {
+        debug_assert!(
+            step.acceptance.is_none(),
+            "a checked item is judged by its check"
+        );
+        debug_assert!(
+            event == "completed_unverified" || event == "completed_converged",
+            "an unchecked completion names how the model's word was given"
+        );
+        let tokens_spent = self
+            .progress
+            .get(&step.id)
+            .map_or(0, |item| item.tokens_spent);
+        let detail = serde_json::json!({
+            "verified": false,
+            "tokens_spent": tokens_spent,
+        });
+        match self.source.complete(step.id, detail).await {
+            Ok(()) => {
+                self.consecutive_errors = 0;
+                self.items_completed += 1;
+                self.items_completed_unverified += 1;
+                let _ = self
+                    .source
+                    .log(step.id, event, serde_json::Value::Null)
+                    .await;
+                self.progress.remove(&step.id);
+            }
+            Err(message) => {
+                let _ = self
+                    .source
                     .log(
                         step.id,
-                        "narration_step",
-                        serde_json::json!({
-                            "narration_steps": item.narration_steps,
-                            "charged": !steered,
-                        }),
+                        "complete_failed",
+                        serde_json::json!({ "error": message }),
                     )
                     .await;
+                self.consecutive_errors += 1;
+                if self.consecutive_errors >= self.cfg.max_consecutive_errors {
+                    return stop(StopReason::SourceError { message });
+                }
             }
-            item.last_result = Some(step_result);
         }
         ControlFlow::Continue(())
     }
@@ -5953,6 +6048,139 @@ mod tests {
         assert!(notice.contains("you un-did verified work #0"));
         assert!(notice.contains("more"), "the overflow is announced");
         assert!(notice.contains("Disk is truth"));
+    }
+
+    #[test]
+    fn a_pure_answer_fingerprints_and_anything_else_does_not() {
+        let answer = outcome("Paris is the capital.");
+        let reflowed = outcome("  Paris is\nthe   capital.\n");
+        assert!(tool_free_answer_fingerprint(&answer).is_some());
+        assert_eq!(
+            tool_free_answer_fingerprint(&answer),
+            tool_free_answer_fingerprint(&reflowed),
+            "re-flowed whitespace is the same answer"
+        );
+        assert_ne!(
+            tool_free_answer_fingerprint(&answer),
+            tool_free_answer_fingerprint(&outcome("Paris is the capital city.")),
+            "a changed word is a different answer"
+        );
+        assert_eq!(
+            tool_free_answer_fingerprint(&outcome("  \n ")),
+            None,
+            "blank"
+        );
+        let mut with_tools = outcome("Paris is the capital.");
+        with_tools.tool_calls.push(StepToolCall {
+            name: "web_search".to_string(),
+            input_digest: "i".to_string(),
+            output_digest: "o".to_string(),
+            success: true,
+        });
+        assert_eq!(tool_free_answer_fingerprint(&with_tools), None, "did work");
+        let mut looping = outcome("Paris is the capital.");
+        looping.degenerate_loop = true;
+        assert_eq!(
+            tool_free_answer_fingerprint(&looping),
+            None,
+            "narration loop"
+        );
+
+        assert!(answer_converged(Some(7), Some(7)));
+        assert!(!answer_converged(Some(7), Some(8)));
+        assert!(
+            !answer_converged(None, None),
+            "two non-answers are not agreement"
+        );
+        assert!(!answer_converged(Some(7), None));
+    }
+
+    /// A model that answers but never says `TASK COMPLETE` used to have its
+    /// answer re-run and re-streamed until the fruitless budget abandoned the
+    /// item. The second identical tool-free answer now closes it.
+    #[tokio::test]
+    async fn an_unchecked_item_completes_when_its_answer_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(1, "What is the capital of France?", None))
+            .await;
+        let runner = ScriptedRunner::new(vec![
+            Ok(outcome("Paris is the capital of France.")),
+            Ok(outcome("Paris is the capital\nof France.")),
+        ]);
+        let report = LongHorizonRunner::new(LongHorizonConfig::default())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.stop, StopReason::AllTasksDone, "{report:?}");
+        assert_eq!(report.items_completed, 1);
+        assert_eq!(
+            report.items_completed_unverified, 1,
+            "still the model's word, not a check's"
+        );
+        assert_eq!(report.steps_taken, 2, "two answers, then done: {report:?}");
+        let log = source.log_entries.lock().await;
+        assert!(
+            log.iter().any(|(_, a)| a == "completed_converged"),
+            "{log:?}"
+        );
+        assert!(
+            !log.iter().any(|(_, a)| a == "completed_unverified"),
+            "{log:?}"
+        );
+        drop(log);
+    }
+
+    /// Convergence needs the SAME answer on CONSECUTIVE pure-answer steps: a
+    /// changed answer is still moving, and a step that did work in between
+    /// breaks the chain — its world may have changed what the answer is.
+    #[tokio::test]
+    async fn a_changed_answer_or_work_in_between_is_not_convergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source.push(step(1, "fuzzy item", None)).await;
+        let mut with_tools = outcome("Paris is the capital of France.");
+        with_tools.tool_calls.push(StepToolCall {
+            name: "web_search".to_string(),
+            input_digest: "i".to_string(),
+            output_digest: "o".to_string(),
+            success: true,
+        });
+        let runner = ScriptedRunner::new(vec![
+            Ok(outcome("Lyon, maybe.")),
+            Ok(outcome("Paris is the capital of France.")),
+            Ok(with_tools),
+            Ok(outcome("Paris is the capital of France.")),
+            Ok(outcome("done\nTASK COMPLETE")),
+        ]);
+        let report = LongHorizonRunner::new(LongHorizonConfig::default())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.items_completed, 1);
+        assert_eq!(
+            report.steps_taken, 5,
+            "no step before the claim converged: {report:?}"
+        );
+        let log = source.log_entries.lock().await;
+        assert!(
+            !log.iter().any(|(_, a)| a == "completed_converged"),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|(_, a)| a == "completed_unverified"),
+            "{log:?}"
+        );
+        drop(log);
+    }
+
+    #[test]
+    fn the_abandonment_headline_counts_steps_not_charges() {
+        let headline = abandonment_headline(6, 8, 2);
+        assert!(
+            headline.starts_with("abandoned after 6 steps (2 of them replans)"),
+            "{headline}"
+        );
+        assert!(headline.contains("8 no-progress charges"), "{headline}");
     }
 
     #[tokio::test]

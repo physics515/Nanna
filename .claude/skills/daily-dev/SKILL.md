@@ -142,6 +142,18 @@ cargo build                                                  # release if perf-r
   ```
   (subcommand LAST — global flags precede it). Grep the captured log for the behaviour you added
   and for `panicked`. **Never point a smoke run at the real data dir or the real config.**
+- **Conversation-path verification needs no live model — script one.** *(2026-09-21)*
+  `crates/nanna-client/tests/e2e_daemon.rs` has a `ScriptedOllama`: a loopback server playing a
+  well-behaved model against the REAL daemon, IPC and client (`TestDaemon::start_with(dir, |b|
+  b.with_model(STUB_MODEL).with_ollama_host(host).with_scheduler(false))`). Scripts: plain reply text,
+  `CALL <tool> <json>` for a tool call, `WAIT <ms> <script>` to hold a reply in flight (Stop,
+  interjection), `{goal}` / `{request}` placeholders; `start_with_plan` scripts the planner (a
+  `file_exists`/`command` acceptance makes a mission-shaped turn — open a workspace first so file tools
+  write into a tempdir, never the test cwd or `$HOME`). **Probe first, then pin:** a throwaway test that
+  `eprintln!`s the requests the model received and the persisted history finds defects no unit test sees
+  (the first such run found 15). A stub that answers every prompt the same way tests the fallback
+  ladder, not the conversation — script the planner's JSON and each step's `TASK COMPLETE`. The suite
+  runs in CI (`e2e.yml`) — keep it hermetic (loopback only, no keys, no keyring, no `$HOME` writes).
 - **Fallback only:** `mcp__computer-use__*` — use only for a native OS dialog WebDriver can't reach; it
   needs a live `request_access` approval that does **not** persist across runs, so prefer WebDriver unattended.
 - If the frontend changed, also do one **non-CI dev-serve check**: `pnpm tauri dev` once, confirm it

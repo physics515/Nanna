@@ -20,6 +20,7 @@ pub mod planner;
 pub mod prompts;
 pub mod tool_stats;
 mod registry;
+pub mod spans;
 mod summarizer;
 mod supervisor;
 
@@ -133,9 +134,8 @@ pub enum AgentError {
         "effective context window ({effective_window} tokens) is below the minimum viable \
          window ({floor} tokens = system prompt {system_tokens} + tool definitions \
          {tool_tokens} + step frame {frame_tokens} + output reserve {output_reserve}); \
-         the runner's num_ctx was demoted under GPU memory pressure and no amount of \
-         history compression can fit this step — failing loudly instead of running \
-         silently truncated; free GPU memory (or restart the runner) and resume"
+         {cause}",
+        cause = below_floor_cause(*.effective_window, *.frame_tokens, *.output_reserve)
     )]
     ContextBelowFloor {
         /// The live window the runner will actually honour.
@@ -157,6 +157,31 @@ pub enum AgentError {
     },
 }
 
+/// Why [`AgentError::ContextBelowFloor`] fired, and what the reader can do.
+///
+/// The step frame carries the request itself, which no compression may
+/// shorten. When it alone, with room for a reply, exceeds the window, the
+/// request is too long for this window — restoring GPU memory cannot help,
+/// and blaming it sent a user who pasted a large log chasing a demotion that
+/// never happened. Otherwise the fixed parts together outgrew a window that
+/// was sized, or demoted, below them.
+#[must_use]
+pub const fn below_floor_cause(
+    effective_window: usize,
+    frame_tokens: usize,
+    output_reserve: usize,
+) -> &'static str {
+    if frame_tokens.saturating_add(output_reserve) > effective_window {
+        "the request itself is longer than this window can hold with room for a reply, and \
+         no compression shortens a request — shorten it, split it across messages, or use a \
+         model with a larger context window"
+    } else {
+        "the runner's num_ctx was demoted under GPU memory pressure and no amount of \
+         history compression can fit this step — failing loudly instead of running \
+         silently truncated; free GPU memory (or restart the runner) and resume"
+    }
+}
+
 /// Message content types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -169,5 +194,26 @@ pub enum AgentContent {
 impl AgentContent {
     pub fn text(content: impl Into<String>) -> Self {
         Self::Text { text: content.into() }
+    }
+}
+
+#[cfg(test)]
+mod below_floor_cause_tests {
+    use super::below_floor_cause;
+
+    #[test]
+    fn a_request_longer_than_the_window_is_not_blamed_on_demotion() {
+        let too_long = below_floor_cause(16_384, 77_526, 4_096);
+        assert!(too_long.contains("request itself is longer"), "{too_long}");
+        assert!(!too_long.contains("GPU"), "{too_long}");
+
+        // A small request in a window the fixed parts outgrew: demotion.
+        let demoted = below_floor_cause(4_096, 300, 1_024);
+        assert!(demoted.contains("demoted"), "{demoted}");
+
+        // The boundary: request plus reply room exactly filling the window
+        // still fits them; one token more does not.
+        assert!(below_floor_cause(8_192, 4_096, 4_096).contains("demoted"));
+        assert!(below_floor_cause(8_192, 4_097, 4_096).contains("request itself"));
     }
 }

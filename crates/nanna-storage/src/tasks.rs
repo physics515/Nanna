@@ -262,6 +262,25 @@ impl TaskRepository {
         scope: &str,
         scope_id: Option<&str>,
     ) -> Result<Option<Task>, StorageError> {
+        self.next_admitted(scope, scope_id, |_| true).await
+    }
+
+    /// [`next`](Self::next), restricted to the tasks `admit` accepts.
+    ///
+    /// The ordering and the open-children rule are computed over the WHOLE
+    /// open scope exactly as `next` does — an inadmissible task still blocks
+    /// its parent — and only the final choice is filtered. A chat turn uses
+    /// this to run the work it planned without also running every item an
+    /// earlier turn left open (see the daemon's `TurnAdmission`).
+    ///
+    /// # Errors
+    /// Returns an error if the scope's tasks cannot be listed.
+    pub async fn next_admitted(
+        &self,
+        scope: &str,
+        scope_id: Option<&str>,
+        admit: impl Fn(&Task) -> bool,
+    ) -> Result<Option<Task>, StorageError> {
         let tasks = self.list(scope, scope_id, false).await?;
         let mut open_children: HashSet<i64> = HashSet::new();
         for task in &tasks {
@@ -289,7 +308,7 @@ impl TaskRepository {
         };
         let mut candidates: Vec<&Task> = tasks
             .iter()
-            .filter(|t| !t.blocked && !open_children.contains(&t.id))
+            .filter(|t| !t.blocked && !open_children.contains(&t.id) && admit(t))
             .collect();
         candidates.sort_by(|a, b| {
             let a_progress = i32::from(a.status != "in_progress");
@@ -2656,6 +2675,42 @@ mod tests {
         assert_eq!(
             next.id, child.id,
             "parent has open children and p1 item is blocked; the child is the one actionable item"
+        );
+    }
+
+    /// `next_admitted` filters only the final choice: the order is `next`'s,
+    /// an inadmissible item is skipped for the next admissible one, and an
+    /// inadmissible child still holds its parent back.
+    #[tokio::test]
+    async fn next_admitted_skips_inadmissible_items_but_keeps_the_rules() {
+        let (_s, repo) = repo().await;
+        let mut first = new_task("leftover");
+        first.priority = 1;
+        let leftover = repo.create(first).await.unwrap();
+        let fresh = repo.create(new_task("fresh")).await.unwrap();
+        assert_eq!(
+            repo.next("session", Some("s1")).await.unwrap().unwrap().id,
+            leftover.id,
+            "unfiltered, the higher-priority leftover wins"
+        );
+        let admitted = repo
+            .next_admitted("session", Some("s1"), |t| t.id != leftover.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.id, fresh.id, "filtered, the next admissible item");
+
+        let mut nc = new_task("child of fresh");
+        nc.parent_id = Some(fresh.id);
+        let child = repo.create(nc).await.unwrap();
+        let none = repo
+            .next_admitted("session", Some("s1"), |t| t.id == fresh.id)
+            .await
+            .unwrap();
+        assert!(
+            none.is_none(),
+            "an inadmissible open child ({}) still holds its parent back",
+            child.id
         );
     }
 

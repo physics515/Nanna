@@ -445,6 +445,20 @@ impl ControlPlane {
         session_id: &str,
         content: &str,
     ) -> Result<Option<String>, String> {
+        self.run_chat_turn_with(session_id, content, Vec::new())
+            .await
+    }
+
+    /// [`Self::run_chat_turn`] for a message that carried images, as
+    /// `(base64_data, media_type)` — every step of the turn sends them.
+    /// A message admitted into a run already in flight joins that run's
+    /// plan as text: its images are not carried (logged).
+    pub(crate) async fn run_chat_turn_with(
+        self: &Arc<Self>,
+        session_id: &str,
+        content: &str,
+        attachments: Vec<(String, String)>,
+    ) -> Result<Option<String>, String> {
         let (Some(agent), Some(router), Some(tools), Some(storage), Some(event_tx)) = (
             self.agent.clone(),
             self.router.clone(),
@@ -461,6 +475,7 @@ impl ControlPlane {
         // A live run owns this session: the message joins it at the next step
         // boundary rather than starting a competing run.
         if !registry.try_claim(session_id).await {
+            warn_uncarried_images(session_id, attachments.len());
             let depth = pending.push(content.to_string()).await;
             tracing::info!(
                 session_id,
@@ -521,6 +536,7 @@ impl ControlPlane {
             storage: Some(storage.clone()),
             liveness: Some(live.clone()),
             quiet_item: Arc::new(std::sync::Mutex::new(None)),
+            text_join: Arc::default(),
         };
         // The finalizer needs the sink after the step runner takes ownership;
         // ChatSink is a bundle of shared handles, so a clone IS the same sink.
@@ -588,6 +604,7 @@ impl ControlPlane {
             turn_baselines,
             session_id: session_id.to_string(),
             content: content.to_string(),
+            attachments: Arc::new(attachments),
             message_id: message_id.clone(),
             resumed_from_park,
             scope: "session".to_string(),
@@ -598,7 +615,16 @@ impl ControlPlane {
         // without them.
         let watcher = TurnWatcher::for_turn(&chat_turn);
         let scope_session_id = session_id.to_string();
-        let turn = tokio::spawn(ToolRegistry::with_run_session(scope_session_id, Box::pin(chat_turn.run(sink))));
+        // The root of the turn's span tree (P6): every line the turn logs —
+        // prep, each harness step, each LLM and tool call — names the session
+        // and message it belongs to. Outside `with_run_session` so the span is
+        // entered on every poll of the whole turn.
+        let turn_span =
+            tracing::info_span!("chat_turn", session_id = %session_id, message_id = %message_id);
+        let turn = tokio::spawn(tracing::Instrument::instrument(
+            ToolRegistry::with_run_session(scope_session_id, Box::pin(chat_turn.run(sink))),
+            turn_span,
+        ));
 
         // Death watcher: a turn that dies before its release tail must not
         // leak its registrations. The task above is fire-and-forget, releases
@@ -633,6 +659,18 @@ impl ControlPlane {
     }
 }
 
+/// A message admitted into a run already in flight joins its plan as text;
+/// any images it carried are not carried along. Say so in the log.
+fn warn_uncarried_images(session_id: &str, count: usize) {
+    if count > 0 {
+        tracing::warn!(
+            session_id,
+            count,
+            "images sent into a run already in flight are not carried — only the text joins it"
+        );
+    }
+}
+
 /// One chat turn: the handles its spawned task owns, and its identity.
 struct ChatTurn {
     this: Arc<ControlPlane>,
@@ -658,6 +696,9 @@ struct ChatTurn {
     turn_baselines: Option<Arc<crate::tasks::TurnBaselines>>,
     session_id: String,
     content: String,
+    /// Images the message carried, `(base64_data, media_type)`; every step
+    /// of the turn sends them (see `AgentStepRunner::attachments`).
+    attachments: Arc<Vec<(String, String)>>,
     message_id: String,
     /// Zero for an ordinary turn; carried forward when a park waiter
     /// started this one, so repeated provider outages spend a single
@@ -758,15 +799,21 @@ impl ChatTurn {
 
         // Prep, then build the runners. `None` = the turn cannot run at
         // all — the reason is already announced in the transcript, and
-        // the release tail below still runs.
-        if let Some(runners) = self.build_runners(sink, &mut turn_stop_kind).await
-            && let Some((stop_kind, exit_cause)) = self.run_mission(runners).await
+        // the release tail below still runs. `acted` is whether the run
+        // ACTED (see `TurnHarness::run_evidence`); a turn that never
+        // reached the harness did not.
+        let acted = if let Some(runners) = self.build_runners(sink, &mut turn_stop_kind).await
+            && let Some((stop_kind, exit_cause, run_evidence)) = self.run_mission(runners).await
         {
             turn_exit_cause = Some(exit_cause);
             turn_stop_kind = stop_kind;
-        }
+            run_evidence
+        } else {
+            false
+        };
 
-        self.finish_turn(&turn_stop_kind, turn_exit_cause.as_deref()).await;
+        self.finish_turn(&turn_stop_kind, turn_exit_cause.as_deref(), acted)
+            .await;
     }
 
     /// Prep the turn and build its runners; `None` when it cannot run (the
@@ -865,6 +912,7 @@ impl ChatTurn {
             // Capability transitions reach the model once, in the
             // next tool result (P22 Tier 4).
             degradations: self.this.degradations.clone(),
+            attachments: Arc::clone(&self.attachments),
         };
         // The planner shares the step runner's provider handling
         // but must not stream its JSON into the transcript —
@@ -963,7 +1011,78 @@ impl ChatTurn {
     /// Plan and run the mission, then let it continue while there is work.
     /// Returns the ledger's stop kind and the turn's exit cause, or `None`
     /// when the plan could not be seeded.
-    async fn run_mission(&self, runners: TurnRunners) -> Option<(String, String)> {
+    /// Snapshot the tasks already closed at turn start and publish that
+    /// boundary to every in-run item-creation path (see the comments inside).
+    async fn open_turn_baseline(&self) -> std::collections::HashSet<i64> {
+        // The turn-start boundary for continuation dedup: tasks
+        // already closed NOW belong to history, and only titles
+        // closed AFTER this snapshot count as work this turn did
+        // (see `seed_continuation`). On a store error the baseline
+        // degrades to empty, which OVER-filters — continuation rounds
+        // then dedup against all of history and the mission ends
+        // early rather than treadmilling.
+        let closed_before_turn =
+            closed_task_ids(&self.storage, &self.scope, self.scope_id.as_deref())
+                .await
+                .unwrap_or_default();
+
+        // Publish the boundary so EVERY in-run item-creation path
+        // shares it, not just the continuation planner below. The
+        // harness's replan step decomposes a stalled item by telling
+        // the model to add subtasks through the todo tool, which
+        // lands in `tasks.add` — a path this snapshot used not to
+        // reach, so an abandoned title came straight back (#2059 →
+        // #2060, observed live 2026-08-02). Dropped again on the exit
+        // tail that releases the run claim.
+        if let Some(ref baselines) = self.turn_baselines {
+            baselines
+                .open_turn(
+                    &self.scope,
+                    self.scope_id.as_deref(),
+                    closed_before_turn.clone(),
+                )
+                .await;
+        }
+        closed_before_turn
+    }
+
+    /// Which open items this turn may work: its own, plus leftovers the
+    /// planner re-adopts (see [`crate::tasks::TurnAdmission`]). A turn started
+    /// by the park waiter IS a resume, so it keeps the whole scope (`None`).
+    /// On a store error the admission is skipped — the old whole-scope
+    /// behaviour — rather than failing the turn.
+    async fn turn_admission(&self) -> Option<Arc<crate::tasks::TurnAdmission>> {
+        if self.resumed_from_park > 0 {
+            return None;
+        }
+        let admission = crate::tasks::TurnAdmission::at_turn_start(
+            &self.storage,
+            &self.scope,
+            self.scope_id.as_deref(),
+        )
+        .await
+        .inspect_err(|message| {
+            tracing::warn!(%message, "could not snapshot leftovers — admitting the whole scope");
+        })
+        .ok()
+        .map(Arc::new)?;
+        // Published beside the turn's baseline (and dropped with it), so a
+        // `tasks.add` that reuses an open leftover admits it into this turn.
+        if let Some(ref baselines) = self.turn_baselines {
+            baselines
+                .register_admission(
+                    &self.scope,
+                    self.scope_id.as_deref(),
+                    Arc::clone(&admission),
+                )
+                .await;
+        }
+        Some(admission)
+    }
+
+    /// Runs the mission; `Some((stop_kind, exit_cause, run_evidence))` when
+    /// it reached the harness.
+    async fn run_mission(&self, runners: TurnRunners) -> Option<(String, String, bool)> {
         let TurnRunners {
             step_runner,
             planner,
@@ -1042,32 +1161,17 @@ impl ChatTurn {
             Some(joined).filter(|c| !c.is_empty())
         };
 
-        // The turn-start boundary for continuation dedup: tasks
-        // already closed NOW belong to history, and only titles
-        // closed AFTER this snapshot count as work this turn did
-        // (see `seed_continuation`). On a store error the baseline
-        // degrades to empty, which OVER-filters — continuation rounds
-        // then dedup against all of history and the mission ends
-        // early rather than treadmilling.
-        let closed_before_turn = closed_task_ids(&self.storage, &self.scope, self.scope_id.as_deref())
-            .await
-            .unwrap_or_default();
+        let closed_before_turn = self.open_turn_baseline().await;
+        let admission = self.turn_admission().await;
 
-        // Publish the boundary so EVERY in-run item-creation path
-        // shares it, not just the continuation planner below. The
-        // harness's replan step decomposes a stalled item by telling
-        // the model to add subtasks through the todo tool, which
-        // lands in `tasks.add` — a path this snapshot used not to
-        // reach, so an abandoned title came straight back (#2059 →
-        // #2060, observed live 2026-08-02). Dropped again on the exit
-        // tail that releases the run claim.
-        if let Some(ref baselines) = self.turn_baselines {
-            baselines
-                .open_turn(&self.scope, self.scope_id.as_deref(), closed_before_turn.clone())
-                .await;
-        }
-
-        let seeded = self.plan_and_seed(&planner, context.as_deref(), &conflicts).await;
+        let seeded = self
+            .plan_and_seed(
+                &planner,
+                context.as_deref(),
+                &conflicts,
+                admission.as_deref(),
+            )
+            .await;
         let ids = match seeded {
             Err(message) => {
                 tracing::warn!(%message, "could not seed the chat plan");
@@ -1087,6 +1191,7 @@ impl ChatTurn {
         }
 
         let (source, interjector, config) = self.round_io(&planner);
+        let source = source.with_admission(admission);
         let workdir = workspace_root.unwrap_or_else(|| PathBuf::from("."));
 
         let mut report = self
@@ -1180,7 +1285,8 @@ impl ChatTurn {
             ids.len() > 1 || report.steps_taken > 1 || report.tool_calls > 0;
         let mut budget = RoundBudget::default();
         self.continue_mission(&mut harness, &mut report, &mut budget).await;
-        Some(self.finish_mission(&harness, &report, budget).await)
+        let (stop_kind, exit_cause) = self.finish_mission(&harness, &report, budget).await;
+        Some((stop_kind, exit_cause, harness.run_evidence))
     }
 
     /// The task source, interjector and harness config every round of this
@@ -1220,6 +1326,7 @@ impl ChatTurn {
         planner: &AgentPlanner,
         context: Option<&str>,
         conflicts: &[ClaimConflict],
+        admission: Option<&crate::tasks::TurnAdmission>,
     ) -> Result<Vec<i64>, String> {
         self.live.on_planning();
         let mut plan = planner
@@ -1251,7 +1358,30 @@ impl ChatTurn {
             );
             Ok(Vec::new())
         } else {
-            seed_plan(&self.storage, &self.scope, self.scope_id.as_deref(), &plan, false).await
+            // Work the planner proposed again that is already open is
+            // ADOPTED, not duplicated: the existing item joins this turn.
+            let adopted =
+                admission.map_or_else(Vec::new, |admission| admission.adopt_from(&mut plan));
+            if !adopted.is_empty() {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    adopted = ?adopted,
+                    "the plan re-adopted open work from an earlier turn"
+                );
+            }
+            if plan.tasks.is_empty() {
+                return Ok(adopted);
+            }
+            let mut ids = seed_plan(
+                &self.storage,
+                &self.scope,
+                self.scope_id.as_deref(),
+                &plan,
+                false,
+            )
+            .await?;
+            ids.splice(0..0, adopted);
+            Ok(ids)
         }
     }
 
@@ -1882,6 +2012,11 @@ impl ChatTurn {
             last_probe,
             ..
         } = b;
+        // The steps are over: the summary and notices that follow are the
+        // harness's, not step text (see `StepTextJoin::end_steps`).
+        if let Ok(mut join) = self.final_sink.text_join.lock() {
+            join.end_steps();
+        }
         // ONE cumulative terminal line per user turn, at the
         // single site every exit path crosses. Non-mission
         // turns cross it too (continuations = 0, cause =
@@ -2042,7 +2177,7 @@ impl ChatTurn {
 
     /// The release tail every exit crosses: state a repeat completion, demote
     /// in-flight items, persist the reply, and release the registrations.
-    async fn finish_turn(&self, turn_stop_kind: &str, turn_exit_cause: Option<&str>) {
+    async fn finish_turn(&self, turn_stop_kind: &str, turn_exit_cause: Option<&str>, acted: bool) {
         // P22: close the liveness ledger. When this exit is a REPEAT —
         // the same request ending `all_tasks_done` again with zero
         // side-effecting work in between — the repeat is STATED in the
@@ -2053,7 +2188,15 @@ impl ChatTurn {
         // nothing to show for it is the most corrosive shape the product
         // has. This delta runs before the transcript is persisted below,
         // so the escalation is part of the assistant message itself.
-        if let Some(repeats) = self.live.finish_turn(turn_stop_kind, turn_exit_cause) {
+        //
+        // Only for a turn that ACTED. A conversational turn — one step, one
+        // item, no tool calls — completes with no side effects every time by
+        // design, so asking the same question twice, or pressing Regenerate,
+        // used to append "⚠️ repeat completion … nothing was written … If you
+        // expected something to exist by now, it does not" to a plain answer.
+        // The ledger still records the stop either way.
+        let repeat = self.live.finish_turn(turn_stop_kind, turn_exit_cause);
+        if let Some(repeats) = repeat.filter(|_| acted) {
             tracing::warn!(
                 session_id = %self.session_id,
                 repeats,
@@ -2102,6 +2245,7 @@ impl ChatTurn {
             }
         }
 
+        self.state_a_silent_finish(turn_stop_kind).await;
         self.persist_reply().await;
 
         // The turn's workdir binding is turn-scoped and dies with the turn.
@@ -2127,6 +2271,33 @@ impl ChatTurn {
         }
     }
 
+    /// A turn that finished with nothing to show says so.
+    ///
+    /// A model that replies to a message with the bare `TASK COMPLETE` marker
+    /// closes its item — the claim is honoured — and the marker is then
+    /// stripped from the reply, which leaves a successful turn with no text
+    /// and no tool calls: an empty message the GUI hides, i.e. silence. An
+    /// empty *completion* is already reported (`_could not run: empty
+    /// completion…_`); an empty *claimed* completion gets the same honesty.
+    /// Never on a cancel: an empty stopped turn is exactly what Stop asked
+    /// for.
+    async fn state_a_silent_finish(&self, turn_stop_kind: &str) {
+        if turn_stop_kind != "all_tasks_done" || self.run_handle.cancel.is_cancelled() {
+            return;
+        }
+        let said_nothing = strip_harness_markers(&self.run_handle.accumulated_text.read().await)
+            .trim()
+            .is_empty();
+        let did_nothing = self.run_handle.completed_tool_calls.read().await.is_empty();
+        if said_nothing && did_nothing {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "turn finished with no reply text and no tool calls — stating it"
+            );
+            self.final_sink.delta(SILENT_FINISH_NOTICE);
+        }
+    }
+
     /// Persist the WHOLE run as the assistant message, auto-remember it when
     /// opted in, and close the message stream.
     async fn persist_reply(&self) {
@@ -2135,15 +2306,30 @@ impl ChatTurn {
         // and the timeline journal carries the interleaved record.
         // Harness plumbing (the TASK COMPLETE claim marker) is stripped
         // from both — it is a verdict signal, not conversation.
-        let full_text = self.run_handle.accumulated_text.read().await.clone();
-        let content = strip_harness_markers(&full_text);
-        let timeline = sanitize_timeline(
+        let mut full_text = self.run_handle.accumulated_text.read().await.clone();
+        let repeated = self
+            .final_sink
+            .text_join
+            .lock()
+            .ok()
+            .and_then(|join| join.repeated_last_step());
+        if let Some((ref repeat, ref span)) = repeated {
+            drop_repeated_span(&mut full_text, repeat, span);
+        }
+        let mut content = strip_harness_markers(&full_text);
+        let mut timeline = sanitize_timeline(
             self.run_handle
                 .timeline
                 .lock()
                 .map(|journal| journal.clone())
                 .unwrap_or_default(),
         );
+        if let Some((ref repeat, _)) = repeated {
+            drop_repeat_from_timeline(&mut timeline, repeat);
+        }
+        if self.run_handle.cancel.is_cancelled() {
+            mark_stopped(&mut content, &mut timeline);
+        }
         self.sessions
             .add_full_message(
                 &self.session_id,
@@ -2173,6 +2359,81 @@ impl ChatTurn {
         });
     }
 }
+
+/// Cut the converging repeat — the last step's verbatim copy of the step
+/// before it — out of the reply, at the span `StepTextJoin` recorded.
+///
+/// A model that answers without saying `TASK COMPLETE` closes its item by
+/// repeating the answer (`answer_converged`). The live stream has shown both
+/// copies; the reply the user keeps, and the `message_end` the GUI promotes
+/// the live bubble to, needs one. A no-op unless the span really holds the
+/// repeat (a dropped delta would shift it), and never the reply's only copy.
+fn drop_repeated_span(text: &mut String, repeat: &str, span: &std::ops::Range<usize>) {
+    let Some(slice) = text.get(span.clone()) else {
+        return;
+    };
+    if slice.trim() != repeat.trim() || span.start == 0 {
+        return;
+    }
+    debug_assert!(span.end <= text.len());
+    text.replace_range(span.clone(), "");
+}
+
+/// The timeline twin of [`drop_repeated_span`]: a conversation-shaped turn
+/// merges its steps' text into one entry, so the repeat is that entry's
+/// trailing copy (the run summary is not in the timeline).
+fn drop_repeat_from_timeline(timeline: &mut [TimelineItem], repeat: &str) {
+    let Some(TimelineItem::Text { content, .. }) = timeline
+        .iter_mut()
+        .rev()
+        .find(|item| matches!(item, TimelineItem::Text { .. }))
+    else {
+        return;
+    };
+    let tail = repeat.trim();
+    let body = content.trim_end();
+    if tail.is_empty() || !body.ends_with(tail) || body.len() == tail.len() {
+        return;
+    }
+    let kept = content[..body.len() - tail.len()].trim_end().len();
+    content.truncate(kept);
+}
+
+/// The marker the GUI shows on a bubble the user stopped (`stopSession` in
+/// `pages/index.vue`) — the same text, so the two agree.
+const STOPPED_MARKER: &str = "[Stopped by user]";
+
+/// Persist a stopped turn the way the GUI showed it.
+///
+/// The GUI appends `[Stopped by user]` to the live bubble and then lets the
+/// turn's `message_end` replace it, expecting the daemon to have persisted the
+/// same marker. The harness path persisted only what had streamed — so a turn
+/// stopped before any text ended as `""`: the marker vanished from the live
+/// bubble, history kept an empty assistant message, and later turns' context
+/// read nothing where the user had said "stop".
+fn mark_stopped(content: &mut String, timeline: &mut Vec<TimelineItem>) {
+    if content.contains(STOPPED_MARKER) {
+        return;
+    }
+    let appended = if content.trim().is_empty() {
+        STOPPED_MARKER.to_string()
+    } else {
+        format!("\n\n{STOPPED_MARKER}")
+    };
+    content.push_str(&appended);
+    timeline.push(TimelineItem::Text {
+        content: appended,
+        at: chrono::Utc::now().to_rfc3339(),
+    });
+    debug_assert!(
+        content.ends_with(STOPPED_MARKER),
+        "the marker closes the reply"
+    );
+}
+
+/// What a turn that finished with nothing to show says instead of nothing.
+const SILENT_FINISH_NOTICE: &str = "_finished without a reply: the model marked this done but said nothing and ran \
+     no tools. Ask again, or rephrase if the request was unclear._";
 
 /// The planner shares the step runner's provider handling but must not
 /// stream its JSON into the transcript — planning is not work to show.
@@ -2206,6 +2467,9 @@ fn planner_runner_for(step_runner: &AgentStepRunner) -> AgentStepRunner {
         gpu_fault_count: step_runner.gpu_fault_count.clone(),
         repeat_ledger: Arc::clone(&step_runner.repeat_ledger),
         degradations: step_runner.degradations.clone(),
+        // The planner answers in JSON about the request's text; the images
+        // are for the steps that do the work.
+        attachments: Arc::default(),
     }
 }
 
@@ -2850,7 +3114,9 @@ fn unresolved_evidence(
             let last = item
                 .last_result
                 .as_deref()
-                .map(|r| format!(" — last said: {}", clamp_display(r, 200)))
+                .map(without_model_notices)
+                .filter(|said| !said.is_empty())
+                .map(|said| format!(" — last said: {}", clamp_display(&said, 200)))
                 .unwrap_or_default();
             let _ = write!(
                 out,
@@ -3153,6 +3419,44 @@ pub(crate) async fn established_rows(
     rows
 }
 
+/// Notices the harness writes TO THE MODEL, by their opening bracket. They
+/// ride tool results and step text so the model reads them; a user-facing
+/// report quoting that text verbatim showed the user lines like
+/// `frobnicate FAILED ([HARNESS NOTE — you are mid-task: …] [REPEAT-FAILURE
+/// BREAKER …`.
+const MODEL_FACING_NOTICE_OPENERS: &[&str] = &[
+    "[HARNESS NOTE",
+    "[REPEAT-FAILURE BREAKER",
+    "[ZERO-INFORMATION BREAKER",
+    "[CONTEXT NOTICE",
+];
+
+/// `text` cut before the first model-facing notice (see
+/// [`MODEL_FACING_NOTICE_OPENERS`]), with the cut marked; empty when the
+/// notice was all there was. Notices run to the end of the entry they are
+/// attached to, so everything after the first one is harness text.
+fn without_model_notices(text: &str) -> String {
+    let Some(at) = MODEL_FACING_NOTICE_OPENERS
+        .iter()
+        .filter_map(|opener| text.find(opener))
+        .min()
+    else {
+        return text.to_string();
+    };
+    let kept = text[..at].trim_end().trim_end_matches('(').trim_end();
+    debug_assert!(
+        MODEL_FACING_NOTICE_OPENERS
+            .iter()
+            .all(|o| !kept.contains(o)),
+        "the cut is before every notice"
+    );
+    if kept.is_empty() {
+        String::new()
+    } else {
+        format!("{kept}…")
+    }
+}
+
 /// Clamp a stored string for display, announcing the cut.
 fn clamp_display(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -3166,29 +3470,55 @@ fn clamp_display(text: &str, max: usize) -> String {
 /// self-terminated run CONTINUE the mission instead of restarting it: the
 /// verdicts name the commands that passed and when, i.e. the artifact state
 /// the environment last confirmed.
+///
+/// Verified and unverified completions are rendered under separate headers.
+/// An unverified item closed on the model's own word (`TASK COMPLETE`, or an
+/// answer that converged) with no check run at all, so listing it under
+/// "done-condition PASSING — do not redo or re-assess" told the planner a
+/// check had confirmed something no check ever looked at — and told it not
+/// to revisit exactly the work a follow-up like "that's wrong" is about.
 fn established_work_context(rows: &[EstablishedRow]) -> Option<String> {
+    let (verified, unverified): (Vec<&EstablishedRow>, Vec<&EstablishedRow>) =
+        rows.iter().partition(|row| row.verdict.is_some());
+    debug_assert_eq!(verified.len() + unverified.len(), rows.len());
     if rows.is_empty() {
         return None;
     }
-    let mut out = String::from(
-        "## Verified done in earlier work this session\n\
-         These closed with their done-condition PASSING (the verdict shows what the \
-         environment confirmed, and when). Do not redo or re-assess them — continue \
-         from this state:\n",
-    );
-    for row in rows {
-        let title = &row.title;
-        let when = &row.when;
-        match &row.verdict {
-            Some(v) => {
-                let _ = writeln!(out, "- #{} {title} — verified {when}: {v}", row.id);
-            }
-            // Unverified completions are still state, marked as such.
-            None => {
-                let _ = writeln!(out, "- #{} {title} — closed {when} (unverified)", row.id);
-            }
+    let mut out = String::new();
+    if !verified.is_empty() {
+        out.push_str(
+            "## Verified done in earlier work this session\n\
+             These closed with their done-condition PASSING (the verdict shows what the \
+             environment confirmed, and when). Do not redo or re-assess them — continue \
+             from this state:\n",
+        );
+        for row in &verified {
+            let verdict = row.verdict.as_deref().unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "- #{} {} — verified {}: {verdict}",
+                row.id, row.title, row.when
+            );
         }
     }
+    if !unverified.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(
+            "## Closed earlier on the model's own word (no check ran)\n\
+             Nothing verified these; they are what was said, not what was confirmed. \
+             Build on them, but re-assess one if the request questions it:\n",
+        );
+        for row in &unverified {
+            let _ = writeln!(
+                out,
+                "- #{} {} — closed {} (unverified)",
+                row.id, row.title, row.when
+            );
+        }
+    }
+    debug_assert!(!out.is_empty(), "a non-empty row set always renders");
     Some(out)
 }
 
@@ -3592,6 +3922,7 @@ fn fresh_step_runner(previous: &AgentStepRunner) -> AgentStepRunner {
         workspace_id: previous.workspace_id.clone(),
         gpu_fault_count: previous.gpu_fault_count.clone(),
         degradations: previous.degradations.clone(),
+        attachments: Arc::clone(&previous.attachments),
     }
 }
 
@@ -4582,6 +4913,69 @@ mod tests {
             "the verdict IS the artifact state: {block}"
         );
         assert!(!block.contains("Implement DEL"), "open work stays out: {block}");
+    }
+
+    fn row(id: i64, title: &str, verdict: Option<&str>) -> EstablishedRow {
+        EstablishedRow {
+            id,
+            title: title.to_string(),
+            verdict: verdict.map(str::to_string),
+            when: "2026-09-21T11:10:44Z".to_string(),
+            acceptance: None,
+        }
+    }
+
+    /// An item closed on the model's word was listed under "done-condition
+    /// PASSING — do not redo or re-assess", which no check had confirmed.
+    #[test]
+    fn unverified_completions_are_not_presented_as_passing_checks() {
+        let only_unverified = established_work_context(&[row(1, "Answer the question", None)])
+            .expect("a closed item renders");
+        assert!(!only_unverified.contains("PASSING"), "{only_unverified}");
+        assert!(
+            !only_unverified.contains("Do not redo"),
+            "{only_unverified}"
+        );
+        assert!(
+            only_unverified.contains("no check ran"),
+            "{only_unverified}"
+        );
+        assert!(
+            only_unverified.contains("#1 Answer the question"),
+            "{only_unverified}"
+        );
+
+        let mixed = established_work_context(&[
+            row(2, "Implement SET", Some("`sh test.sh` exited 0")),
+            row(1, "Answer the question", None),
+        ])
+        .expect("closed items render");
+        let passing = mixed.find("PASSING").expect("the verified section is kept");
+        let unchecked = mixed
+            .find("no check ran")
+            .expect("the unverified section is kept");
+        let set = mixed.find("#2 Implement SET").expect("verified row");
+        let answer = mixed
+            .find("#1 Answer the question")
+            .expect("unverified row");
+        assert!(
+            passing < set && set < unchecked && unchecked < answer,
+            "{mixed}"
+        );
+    }
+
+    #[test]
+    fn a_user_facing_excerpt_drops_notices_written_for_the_model() {
+        let step = "[step report synthesized from the tool record — the model emitted no final text]\n\
+                    - frobnicate FAILED ([HARNESS NOTE — you are mid-task: x] [REPEAT-FAILURE BREAKER — stop)";
+        let kept = without_model_notices(step);
+        assert!(kept.ends_with("- frobnicate FAILED…"), "{kept}");
+        assert!(
+            !kept.contains("HARNESS NOTE") && !kept.contains("BREAKER"),
+            "{kept}"
+        );
+        assert_eq!(without_model_notices("[HARNESS NOTE — only this]"), "");
+        assert_eq!(without_model_notices("plain words"), "plain words");
     }
 
     #[test]

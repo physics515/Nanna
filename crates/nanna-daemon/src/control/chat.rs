@@ -40,6 +40,16 @@ impl ControlPlane {
             ChatAction::Send { session_id, content, attachments } => {
                 debug!("Chat send from {} to session {}", client_id, session_id);
 
+                // Nothing to answer: a blank message used to be persisted and
+                // run as a whole planned turn, the model guessing at a
+                // request that was never made.
+                if content.trim().is_empty() && attachments.is_empty() {
+                    return json!({
+                        "error": "empty_message",
+                        "message": "The message is empty; there is nothing to answer."
+                    });
+                }
+
                 // Add user message to session — persisting it is the fact the
                 // delivery ack below certifies.
                 let Some(_msg_id) = self.sessions.add_message(&session_id, MessageRole::User, &content).await else {
@@ -57,15 +67,12 @@ impl ControlPlane {
                     });
                 }
 
-                // Attachments are not carried into harness steps yet (open
-                // P19 item, see ROADMAP) — warn so the gap is visible in the
-                // logs instead of silently dropping user input.
-                if !attachments.is_empty() {
-                    warn!(
-                        count = attachments.len(),
-                        "attachments are not yet supported by long-horizon chat — ignored"
-                    );
-                }
+                // Images ride every step of the turn; anything the model
+                // cannot read is named in the goal so it can say so, instead
+                // of being dropped with only a daemon-log warning (P19).
+                let (images, unreadable) = crate::tasks::split_attachments(&attachments);
+                let goal = unreadable
+                    .map_or_else(|| content.clone(), |note| format!("{content}\n\n{note}"));
 
                 // ── Long-horizon chat (P19): the only path ──
                 // Every turn is a harness run: the message is planned, the
@@ -78,7 +85,7 @@ impl ControlPlane {
                 // memory writes, planning — runs inside the spawned turn
                 // (`prepare_chat_turn`), so this response is a genuine
                 // DELIVERY ack in milliseconds, not a progress report.
-                match self.run_chat_turn(&session_id, &content).await {
+                match self.run_chat_turn_with(&session_id, &goal, images).await {
                     // The run proceeds in a spawned task; ACK immediately so
                     // the IPC request never outlives the client's patience —
                     // a run can last hours, and the transcript is driven by

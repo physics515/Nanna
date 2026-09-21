@@ -1,0 +1,58 @@
+name: E2E conversation
+
+# Runs the end-to-end daemon suite: a real daemon, the real IPC and the real
+# client, with a scripted Ollama on a loopback port standing in for the model.
+#
+# Why this exists (2026-09-21): CI compiled the test suite (`test-compile.yml`,
+# `--no-run`) but ran almost none of it — only three budget-gate subsets — so
+# the conversation path was exercised by nightly runs alone. The suite that
+# landed that night found over a dozen chat-path defects in one run (glued step text,
+# an answer repeated seven times, inline reasoning in replies, UTF-8 chunk
+# splits killing streams, recall claiming nothing exists, …); each is now a
+# test here, and this makes them gate every PR that can break them.
+#
+# Hermetic by construction: loopback only, no API key, no keyring (verified
+# with no D-Bus session and an empty HOME), its own temp data dirs. About 30 s
+# of run time, dominated by one reminder test that waits out the 30 s due-sweep.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/e2e.yml'
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-daemon:
+    name: Daemon end-to-end suite (Linux)
+    runs-on: ubuntu-latest
+    # The dependency graph is the one test-compile's Linux job builds in under
+    # 30 minutes; the suite itself adds well under a minute.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # No pinned channel here: `rustup toolchain install` with no argument
+      # installs what rust-toolchain.toml names, so a pin move can never leave
+      # this job on the old toolchain.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e-daemon
+
+      - name: Run the end-to-end daemon suite
+        run: cargo test -p nanna-client --test e2e_daemon --locked

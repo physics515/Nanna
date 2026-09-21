@@ -940,8 +940,25 @@ fn memory_search_services(
                         .unwrap_or(0),
                 );
                 let workspace = ws.read().await;
-                match mem.recall_scoped(&query, workspace.as_deref()).await {
-                    Ok(results) => {
+                match mem
+                    .recall_scoped_with_coverage(&query, workspace.as_deref())
+                    .await
+                {
+                    // An empty answer from a scan that could not compare
+                    // every stored memory (entries queued for embedding, or
+                    // bound to another model) is not "nothing matched".
+                    Ok((results, coverage)) if results.is_empty() && !coverage.is_complete() => {
+                        keyword_search(
+                            &mem,
+                            &query,
+                            workspace.as_deref(),
+                            limit,
+                            page_chars,
+                            offset,
+                        )
+                        .await
+                    }
+                    Ok((results, _)) => {
                         let items: Vec<Value> = results
                             .into_iter()
                             .take(limit)
@@ -952,6 +969,7 @@ fn memory_search_services(
                                     "id": r.id,
                                     "content": content,
                                     "score": r.score,
+                                    "match": "semantic",
                                     // Always present, never inferred from
                                     // whether `content` "looks" cut off. A
                                     // page that does not announce itself is
@@ -969,12 +987,22 @@ fn memory_search_services(
                         Ok(Value::Array(items))
                     }
                     Err(e) => {
-                        // If embedding is not configured, return empty results
-                        // instead of an error so the agent can continue gracefully
+                        // No embedder answering: the query cannot be embedded,
+                        // so semantic recall cannot run at all. That used to
+                        // answer an empty list — "no memories found" about a
+                        // memory stored seconds earlier. Match words instead.
                         let msg = e.to_string();
                         if msg.contains("embedding") || msg.contains("No embedding function") {
-                            tracing::debug!("Memory search skipped: {}", msg);
-                            Ok(Value::Array(vec![]))
+                            tracing::info!("Memory search falling back to keywords: {}", msg);
+                            keyword_search(
+                                &mem,
+                                &query,
+                                workspace.as_deref(),
+                                limit,
+                                page_chars,
+                                offset,
+                            )
+                            .await
                         } else {
                             Err(msg)
                         }
@@ -985,6 +1013,75 @@ fn memory_search_services(
     );
 
     services
+}
+
+/// `memory.search`'s answer when semantic recall cannot give one: memories
+/// ranked by the query's words ([`crate::keyword_recall`]), in the same
+/// paged shape, each marked `"match": "keyword"`.
+///
+/// Scope follows `recall_scoped`: a workspace sees global memories plus its
+/// own; no workspace sees everything. Nothing found is an error whose text
+/// says semantic search was unavailable — an empty list would read as "no
+/// such memory", which the fallback cannot know.
+async fn keyword_search(
+    mem: &MemoryService,
+    query: &str,
+    workspace: Option<&str>,
+    limit: usize,
+    page_chars: usize,
+    offset: usize,
+) -> Result<serde_json::Value, String> {
+    use serde_json::{Value, json};
+
+    let terms = crate::keyword_recall::query_terms(query);
+    let entries: Vec<_> = mem
+        .list_all()
+        .await
+        .into_iter()
+        .filter(|entry| {
+            workspace.is_none()
+                || entry.workspace_id.is_none()
+                || entry.workspace_id.as_deref() == workspace
+        })
+        .collect();
+    let hits =
+        crate::keyword_recall::rank(&terms, entries.iter().map(|e| e.content.as_str()), limit);
+    if hits.is_empty() {
+        return Err(format!(
+            "semantic memory search is unavailable right now (no embedding provider is \
+             answering), and no stored memory contains the words of \"{query}\" either — \
+             {} memories were searched by keyword",
+            entries.len()
+        ));
+    }
+    let items: Vec<Value> = hits
+        .iter()
+        .filter_map(|hit| entries.get(hit.index).map(|entry| (hit, entry)))
+        .map(|(hit, entry)| {
+            let total = entry.content.chars().count();
+            let start = offset.min(total);
+            let content: String = entry
+                .content
+                .chars()
+                .skip(start)
+                .take(page_chars.max(1))
+                .collect();
+            let returned = content.chars().count();
+            json!({
+                "id": entry.id,
+                "content": content,
+                "score": hit.score,
+                "match": "keyword",
+                "offset": start,
+                "returned": returned,
+                "total": total,
+                "truncated": start + returned < total,
+                "best_chunk": Value::Null,
+            })
+        })
+        .collect();
+    debug_assert_eq!(items.len(), hits.len(), "every hit indexes a listed entry");
+    Ok(Value::Array(items))
 }
 
 /// `memory.delete` and `memory.list`: the unscoped housekeeping pair.
@@ -2338,10 +2435,14 @@ async fn run_scheduled_prompt_yielding(
         // this run cannot see the scheduled session (and vice versa).
         // Boxed: the chat future is ~23KB and would otherwise sit inline in
         // the spawned task's state machine.
-        Box::pin(ToolRegistry::with_run_session(
-            run_session.clone(),
-            run_agent.chat(&run_session, &run_payload, None, &[]),
-        ))
+        let run_span = tracing::info_span!("scheduled_run", session_id = %run_session);
+        tracing::Instrument::instrument(
+            Box::pin(ToolRegistry::with_run_session(
+                run_session.clone(),
+                run_agent.chat(&run_session, &run_payload, None, &[]),
+            )),
+            run_span,
+        )
         .await
     });
 
@@ -6074,6 +6175,44 @@ impl DaemonBuilder {
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.config.agent.model = model.into();
+        self
+    }
+
+    /// Point the chat router's Ollama provider at `host` — the only provider
+    /// a hermetic test can stand up locally, so it is what lets an end-to-end
+    /// test run a real conversation turn against a scripted server.
+    ///
+    /// # Panics
+    ///
+    /// If `host` is not an `http(s)://` URL — a caller passing a bare
+    /// `host:port` is a programmer error the router would otherwise turn into
+    /// a connection failure on the first turn.
+    #[must_use]
+    pub fn with_ollama_host(mut self, host: impl Into<String>) -> Self {
+        let host = host.into();
+        assert!(
+            host.starts_with("http://") || host.starts_with("https://"),
+            "an Ollama host is an http(s) base URL, got {host:?}"
+        );
+        self.config.llm.ollama_host = host;
+        self
+    }
+
+    /// Master switch for the scheduler (`[scheduler] enabled`). Off, no
+    /// heartbeat or cron turn fires — so a test that counts a model's
+    /// requests counts only the ones it caused.
+    #[must_use]
+    pub const fn with_scheduler(mut self, enabled: bool) -> Self {
+        self.config.scheduler.enabled = enabled;
+        self
+    }
+
+    /// The periodic heartbeat turn (`[scheduler] heartbeat_enabled`), under a
+    /// running scheduler. Off, reminders and cron still fire but no heartbeat
+    /// turn competes with the conversation a test is scripting.
+    #[must_use]
+    pub const fn with_heartbeat(mut self, enabled: bool) -> Self {
+        self.config.scheduler.heartbeat_enabled = enabled;
         self
     }
 

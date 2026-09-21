@@ -715,6 +715,7 @@ mod tests {
             target: "test".to_string(),
             message: message.to_string(),
             source,
+            scope: String::new(),
         }
     }
 

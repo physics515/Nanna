@@ -206,6 +206,7 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         // No daemon provider plumbing in the eval — no transitions to report.
         degradations: None,
+        attachments: std::sync::Arc::default(),
     };
     EvalEnv { storage, runner }
 }

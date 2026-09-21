@@ -15,6 +15,7 @@ pub mod circuit_breaker;
 pub mod discord;
 pub mod signal;
 pub mod slack;
+mod sse;
 pub mod telegram;
 pub mod whatsapp;
 

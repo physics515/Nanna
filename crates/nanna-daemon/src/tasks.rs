@@ -577,6 +577,13 @@ fn task_add_service(
                 .iter()
                 .find(|t| t.parent_id == parent_id && same_title(&t.title, &title))
             {
+                // The model asked for this work: if it is an item an earlier
+                // turn left open, the live turn must now admit it, or the
+                // model is told its task exists while nothing schedules it.
+                if let Some(admission) = turn_baselines.admission(&scope, scope_id.as_deref()).await
+                {
+                    admission.adopt_id(existing.id);
+                }
                 return Ok(json!({
                     "task": task_to_json(existing),
                     "deduplicated": true,
@@ -1178,6 +1185,106 @@ pub struct TursoTaskSource {
     scope_id: Option<String>,
     actor: String,
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
+    /// Which open items this source may hand out (see [`TurnAdmission`]).
+    /// `None` serves the whole scope — the task-run manager, and a chat turn
+    /// that IS a resume.
+    admission: Option<Arc<TurnAdmission>>,
+}
+
+/// Which open items a chat turn may work.
+///
+/// Owner directive (2026-07-25, quoted at `run_mission`): *"the model should
+/// decide to resume or answer another question by the user … i don't think
+/// we should assume that the user wants to resume."* The planner is shown
+/// outstanding work so it can choose — but the task source used to serve
+/// every open item in the scope, so an item an earlier turn left open (a
+/// question the user then STOPPED) was worked anyway on their next, unrelated
+/// message. Measured: `first` → Stop → `second` answered both.
+///
+/// So a turn admits everything created during it (its seeds, interjections,
+/// replan subtasks, continuation rounds — none of which exist yet when this
+/// is built) and, of the items already open when it began, only those the
+/// planner re-adopted by proposing the same work again ([`same_title`], the
+/// store's one definition of "the same task").
+#[derive(Debug, Default)]
+pub struct TurnAdmission {
+    /// Open when the turn began: id → title.
+    leftovers: HashMap<i64, String>,
+    adopted: std::sync::Mutex<HashSet<i64>>,
+}
+
+impl TurnAdmission {
+    /// Snapshot the scope's open items as this turn's leftovers.
+    ///
+    /// # Errors
+    /// Returns an error if the scope's tasks cannot be listed.
+    pub async fn at_turn_start(
+        storage: &Storage,
+        scope: &str,
+        scope_id: Option<&str>,
+    ) -> Result<Self, String> {
+        let open = storage
+            .tasks()
+            .list(scope, scope_id, false)
+            .await
+            .map_err(|e| e.to_string())?;
+        let leftovers: HashMap<i64, String> =
+            open.into_iter().map(|task| (task.id, task.title)).collect();
+        Ok(Self {
+            leftovers,
+            adopted: std::sync::Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Whether this turn may work task `id`.
+    #[must_use]
+    pub fn admits(&self, id: i64) -> bool {
+        !self.leftovers.contains_key(&id)
+            || self
+                .adopted
+                .lock()
+                .is_ok_and(|adopted| adopted.contains(&id))
+    }
+
+    /// Admit leftover `id` into this turn — the model asked for that work
+    /// again through `tasks.add`, which reused the open item instead of
+    /// creating a duplicate. A no-op for an id that is not a leftover.
+    pub fn adopt_id(&self, id: i64) {
+        if self.leftovers.contains_key(&id)
+            && let Ok(mut adopted) = self.adopted.lock()
+        {
+            adopted.insert(id);
+        }
+        debug_assert!(self.admits(id), "an adopted or new id is admitted");
+    }
+
+    /// Re-adopt the leftovers the plan proposes again, removing those tasks
+    /// from the plan (they already exist) and returning the adopted ids in
+    /// plan order. A leftover is adopted at most once.
+    pub fn adopt_from(&self, plan: &mut Plan) -> Vec<i64> {
+        let mut ids = Vec::new();
+        plan.tasks.retain(|task| {
+            let matched = self
+                .leftovers
+                .iter()
+                .find(|(id, title)| !ids.contains(*id) && same_title(title, &task.title));
+            match matched {
+                Some((id, _)) => {
+                    ids.push(*id);
+                    false
+                }
+                None => true,
+            }
+        });
+        if let Ok(mut adopted) = self.adopted.lock() {
+            adopted.extend(ids.iter().copied());
+        }
+        debug_assert!(
+            ids.iter().all(|id| self.admits(*id)),
+            "adopted means admitted"
+        );
+        ids
+    }
 }
 
 impl TursoTaskSource {
@@ -1195,7 +1302,15 @@ impl TursoTaskSource {
             scope_id,
             actor,
             event_tx,
+            admission: None,
         }
+    }
+
+    /// Serve only what `admission` admits (see [`TurnAdmission`]).
+    #[must_use]
+    pub fn with_admission(mut self, admission: Option<Arc<TurnAdmission>>) -> Self {
+        self.admission = admission;
+        self
     }
 
     fn emit(&self, task_id: i64, kind: &str, detail: Value) {
@@ -1262,8 +1377,11 @@ impl TaskSource for TursoTaskSource {
         // close them visibly and move on. Bounded: every malformed item is
         // cancelled, strictly shrinking the open set.
         for _ in 0..TASK_NEXT_SKIP_MAX {
+            let admission = self.admission.as_deref();
             let task = repo
-                .next(&self.scope, self.scope_id.as_deref())
+                .next_admitted(&self.scope, self.scope_id.as_deref(), |task| {
+                    admission.is_none_or(|admission| admission.admits(task.id))
+                })
                 .await
                 .map_err(|e| e.to_string())?;
             let Some(task) = task else { return Ok(None) };
@@ -1527,6 +1645,54 @@ pub struct AgentStepRunner {
     /// provider plumbing. Each pending transition reaches the model once, in
     /// the next tool result — see [`nanna_agent::DegradationLedger`].
     pub degradations: Option<Arc<nanna_agent::DegradationLedger>>,
+    /// Images the user attached to the message this run answers, as
+    /// `(base64_data, media_type)`. Sent with EVERY step: each step starts
+    /// from a fresh context, so a later step working on the image would
+    /// otherwise not see it. Empty for runs no message started.
+    pub attachments: Arc<Vec<(String, String)>>,
+}
+
+/// Split a message's attachments into the images a step can send to the
+/// model, `(base64_data, media_type)`, and a note naming the ones it cannot.
+///
+/// The harness path used to warn in the daemon log and DROP every attachment
+/// — an image sent with "what is in this picture?" reached the model as the
+/// bare question. Images (inline base64 of an `image/*` type) now ride each
+/// step; anything else — a PDF, a URL, a text file — is named in the note so
+/// the model can say it could not read it, rather than answering as if
+/// nothing had been attached.
+#[must_use]
+pub fn split_attachments(
+    attachments: &[crate::protocol::Attachment],
+) -> (Vec<(String, String)>, Option<String>) {
+    let mut images = Vec::new();
+    let mut unreadable = Vec::new();
+    for attachment in attachments {
+        let inline =
+            !attachment.data.starts_with("http://") && !attachment.data.starts_with("https://");
+        if attachment.content_type.starts_with("image/") && inline {
+            images.push((attachment.data.clone(), attachment.content_type.clone()));
+        } else {
+            unreadable.push(format!(
+                "{} ({})",
+                attachment.filename, attachment.content_type
+            ));
+        }
+    }
+    debug_assert_eq!(images.len() + unreadable.len(), attachments.len());
+    let note = (!unreadable.is_empty()).then(|| {
+        format!(
+            "[The user attached {} that cannot be read in this chat — only inline images \
+             can: {}. Say so if the request depends on it.]",
+            if unreadable.len() == 1 {
+                "a file"
+            } else {
+                "files"
+            },
+            unreadable.join(", ")
+        )
+    });
+    (images, note)
 }
 
 /// Streams a harness step into a chat session using the *existing* chat event
@@ -1564,6 +1730,109 @@ pub struct ChatSink {
     /// so "working, wedged, or finished" is answerable without log greps.
     /// `None` on paths that have no beat (task-run manager, tests).
     pub liveness: Option<Arc<crate::liveness::SessionLiveness>>,
+    /// Where the reply's text stands, so each harness step's text starts a
+    /// new paragraph instead of running on from the last step's final word.
+    /// Shared (not per-clone) for the same reason as `quiet_item`.
+    pub text_join: Arc<std::sync::Mutex<StepTextJoin>>,
+}
+
+/// How consecutive harness steps' text joins into one reply.
+///
+/// Steps are separate agent runs streaming into the same message. The loop
+/// separates its own iterations (`loop_runner` emits a space between them),
+/// but nothing separated steps, and once the step banner moved out of the
+/// text (run mechanics are not message content) the steps simply abutted:
+/// `…read the file.The file says…`, in the stream AND in the persisted reply.
+#[derive(Debug, Default)]
+pub struct StepTextJoin {
+    /// The last emitted character was whitespace (or nothing was emitted).
+    ends_with_whitespace: bool,
+    /// A step began and has not emitted text yet.
+    step_break_pending: bool,
+    /// The text of the last step that emitted any, and of the current one —
+    /// what [`Self::repeated_last_step`] compares. Bounded by two steps'
+    /// output, which the reply already holds.
+    previous_step_text: String,
+    current_step_text: String,
+    /// The harness has finished its steps: later text (the run summary, stop
+    /// notices) is not step text and must not extend the last step's.
+    steps_ended: bool,
+    /// Bytes emitted into the reply so far, separators included.
+    emitted_bytes: usize,
+    /// Where the current step's text sits in the reply: from the start of
+    /// the separator before it to the end of its last delta.
+    current_step_span: Option<(usize, usize)>,
+}
+
+/// What goes between two steps' text: a paragraph break, since each step is
+/// a separate action, not a continuation of the previous sentence.
+const STEP_TEXT_SEPARATOR: &str = "\n\n";
+
+impl StepTextJoin {
+    /// A step is starting: its first text, if any, opens a new paragraph.
+    fn begin_step(&mut self) {
+        self.step_break_pending = true;
+        // A step that said nothing does not displace the last one that did.
+        if !self.current_step_text.trim().is_empty() {
+            self.previous_step_text = std::mem::take(&mut self.current_step_text);
+        }
+        self.current_step_text.clear();
+        self.current_step_span = None;
+        debug_assert!(self.step_break_pending, "a started step must arm the break");
+    }
+
+    /// No more steps: later text is the harness's summary, not a step's.
+    pub fn end_steps(&mut self) {
+        self.steps_ended = true;
+        debug_assert!(self.steps_ended);
+    }
+
+    /// The last step's text when it repeats the step before it verbatim
+    /// (whitespace-collapsed) — the converging answer of a model that never
+    /// said `TASK COMPLETE` (see `answer_converged` in the harness). The live
+    /// stream has already shown it; the persisted reply keeps one copy.
+    ///
+    /// Returns the repeat's text and its byte span in the reply (separator
+    /// included), so the caller can cut exactly it even when harness text
+    /// (the run summary) follows.
+    #[must_use]
+    pub fn repeated_last_step(&self) -> Option<(String, std::ops::Range<usize>)> {
+        let current: Vec<&str> = self.current_step_text.split_whitespace().collect();
+        let previous: Vec<&str> = self.previous_step_text.split_whitespace().collect();
+        let (start, end) = self.current_step_span?;
+        debug_assert!(start <= end, "a span runs forward");
+        (!current.is_empty() && current == previous)
+            .then(|| (self.current_step_text.clone(), start..end))
+    }
+
+    /// Account for `text` about to be emitted and return the separator that
+    /// must precede it (empty when none is needed).
+    ///
+    /// No separator before the reply's first text, and none when either side
+    /// of the seam already carries whitespace — the model's own `\n` must not
+    /// grow into three.
+    fn separator_before(&mut self, text: &str) -> &'static str {
+        debug_assert!(!text.is_empty(), "empty deltas are dropped before joining");
+        let needs_break = self.step_break_pending
+            && self.emitted_bytes > 0
+            && !self.ends_with_whitespace
+            && !text.starts_with(char::is_whitespace);
+        self.step_break_pending = false;
+        self.ends_with_whitespace = text.ends_with(char::is_whitespace);
+        let separator = if needs_break { STEP_TEXT_SEPARATOR } else { "" };
+        let start = self.emitted_bytes;
+        self.emitted_bytes += separator.len() + text.len();
+        if !self.steps_ended {
+            self.current_step_text.push_str(text);
+            let span_start = self.current_step_span.map_or(start, |(from, _)| from);
+            self.current_step_span = Some((span_start, self.emitted_bytes));
+        }
+        debug_assert!(
+            !self.step_break_pending,
+            "the break is spent by the first text"
+        );
+        separator
+    }
 }
 
 impl ChatSink {
@@ -1571,6 +1840,22 @@ impl ChatSink {
         if text.is_empty() {
             return;
         }
+        let separator = self
+            .text_join
+            .lock()
+            .map_or("", |mut join| join.separator_before(text));
+        if separator.is_empty() {
+            self.emit_delta(text);
+        } else {
+            let mut joined = String::with_capacity(separator.len() + text.len());
+            joined.push_str(separator);
+            joined.push_str(text);
+            self.emit_delta(&joined);
+        }
+    }
+
+    /// Stream `text` and record it in the run's buffers, exactly as given.
+    fn emit_delta(&self, text: &str) {
         if let Some(live) = &self.liveness {
             live.on_stream_delta(text.len());
         }
@@ -1824,6 +2109,11 @@ impl ChatSink {
     /// writes `Task #id: title`); if that line is ever absent the header
     /// degrades to the bare item id rather than failing.
     fn step_header(&self, request: &StepRequest) {
+        // Every step — quiet or announced — is a new action, so its text
+        // starts a new paragraph (see `StepTextJoin`).
+        if let Ok(mut join) = self.text_join.lock() {
+            join.begin_step();
+        }
         // The liveness ledger tracks EVERY step, including banner-free quiet
         // items — a wedge inside a conversation-shaped turn must still be
         // visible to the beat and the `session.liveness` verb.
@@ -3130,6 +3420,7 @@ impl AgentStepRunner {
             // 2026-08-02, session 05775d1d: 22 steps, 79 identical
             // `explore {}` calls, 3 short-circuits).
             repeat_ledger: Some(Arc::clone(&self.repeat_ledger)),
+            attachments: self.attachments.as_ref().clone(),
             initial_active_tools: active,
             tool_activation: nanna_agent::ToolActivation {
                 restrict_to_active_tools: restrict_to_active,
@@ -3599,6 +3890,9 @@ fn scope_key(scope: &str, scope_id: Option<&str>) -> String {
 #[derive(Debug, Default)]
 pub struct TurnBaselines {
     inner: RwLock<HashMap<String, HashSet<i64>>>,
+    /// The live turn's [`TurnAdmission`] per scope, so `tasks.add`'s reuse of
+    /// an open item can admit it into the turn that asked for it.
+    admissions: RwLock<HashMap<String, Arc<TurnAdmission>>>,
 }
 
 impl TurnBaselines {
@@ -3620,7 +3914,36 @@ impl TurnBaselines {
     /// that releases the run claim, so a leaked entry would need the whole
     /// tail to be skipped — and the next turn's `open_turn` replaces it.
     pub async fn close_turn(&self, scope: &str, scope_id: Option<&str>) {
-        self.inner.write().await.remove(&scope_key(scope, scope_id));
+        let key = scope_key(scope, scope_id);
+        self.inner.write().await.remove(&key);
+        self.admissions.write().await.remove(&key);
+    }
+
+    /// Publish the live turn's admission for a scope (replacing a stale one).
+    pub async fn register_admission(
+        &self,
+        scope: &str,
+        scope_id: Option<&str>,
+        admission: Arc<TurnAdmission>,
+    ) {
+        self.admissions
+            .write()
+            .await
+            .insert(scope_key(scope, scope_id), admission);
+    }
+
+    /// The live turn's admission for a scope, or `None` when no turn is live
+    /// or the turn admits the whole scope.
+    pub async fn admission(
+        &self,
+        scope: &str,
+        scope_id: Option<&str>,
+    ) -> Option<Arc<TurnAdmission>> {
+        self.admissions
+            .read()
+            .await
+            .get(&scope_key(scope, scope_id))
+            .cloned()
     }
 
     /// The turn-start baseline for a scope, or `None` when no turn is live.
@@ -3809,9 +4132,17 @@ impl PendingMessages {
     pub async fn push(&self, message: String) -> usize {
         let mut queue = self.inner.write().await;
         if queue.len() >= PENDING_MESSAGES_MAX {
-            queue.remove(0);
+            let dropped = queue.remove(0);
+            // A dropped message is lost user input; it must not go silently
+            // (summaries-must-announce-themselves).
+            tracing::warn!(
+                held = PENDING_MESSAGES_MAX,
+                dropped_chars = dropped.chars().count(),
+                "pending-message queue full — the OLDEST message sent during this run was dropped"
+            );
         }
         queue.push(message);
+        debug_assert!(queue.len() <= PENDING_MESSAGES_MAX, "the queue is bounded");
         queue.len()
     }
 
@@ -4478,6 +4809,38 @@ mod tests {
     // -----------------------------------------------------------------
     // Plan seeding + queue jumping
     // -----------------------------------------------------------------
+
+    /// A turn admits what it creates, not what it found open — unless the
+    /// plan proposes that work again, which adopts it (once), by the store's
+    /// own title identity.
+    #[test]
+    fn a_turn_admits_its_own_work_and_what_its_plan_readopts() {
+        let admission = TurnAdmission {
+            leftovers: HashMap::from([
+                (1, "Answer: what is the capital of France?".to_string()),
+                (2, "Fix the build".to_string()),
+            ]),
+            adopted: std::sync::Mutex::new(HashSet::new()),
+        };
+        assert!(admission.admits(99), "created during the turn");
+        assert!(!admission.admits(1), "left open by an earlier turn");
+
+        let mut plan = plan_of(&["Answer: What is the capital of France?", "Write the notes"]);
+        let adopted = admission.adopt_from(&mut plan);
+        assert_eq!(adopted, [1], "same work, re-proposed: adopted");
+        assert!(admission.admits(1));
+        assert!(!admission.admits(2), "never re-proposed: stays out");
+        assert_eq!(plan.tasks.len(), 1, "the adopted task is not created again");
+        assert_eq!(plan.tasks[0].title, "Write the notes");
+
+        let mut twice = plan_of(&["Fix the builds", "fix the build"]);
+        assert_eq!(
+            admission.adopt_from(&mut twice),
+            [2],
+            "plural-folded; adopted once"
+        );
+        assert_eq!(twice.tasks.len(), 1, "the second copy is new work");
+    }
 
     fn plan_of(titles: &[&str]) -> Plan {
         Plan {
@@ -5271,6 +5634,54 @@ mod tests {
     /// work every step, turning 5 seeded tasks into ~50 — "Write data file
     /// with header and 3 rows" was created ten times — so the plan grew
     /// faster than it was worked. Re-adding an OPEN title reuses that item.
+    /// When `tasks.add` reuses an item an earlier turn left open, the live
+    /// turn admits it — otherwise the model is told "work on it rather than
+    /// planning it again" about an item the harness will never schedule.
+    #[tokio::test]
+    async fn reusing_a_leftover_admits_it_into_the_live_turn() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baselines = Arc::new(TurnBaselines::new());
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            baselines.clone(),
+        );
+        let leftover = add_task(
+            &services,
+            json!({"title": "Write data file", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let leftover_id = leftover["task"]["id"].as_i64().expect("an id");
+
+        // A new turn starts: the item is now a leftover it does not admit.
+        let admission = Arc::new(
+            TurnAdmission::at_turn_start(&storage, "session", Some("s1"))
+                .await
+                .expect("snapshot"),
+        );
+        baselines
+            .register_admission("session", Some("s1"), admission.clone())
+            .await;
+        assert!(!admission.admits(leftover_id));
+
+        let again = add_task(
+            &services,
+            json!({"title": "write data file", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        assert_eq!(again["deduplicated"], json!(true));
+        assert!(
+            admission.admits(leftover_id),
+            "the reused leftover joins the turn that asked for it"
+        );
+
+        baselines.close_turn("session", Some("s1")).await;
+        assert!(
+            baselines.admission("session", Some("s1")).await.is_none(),
+            "the admission is dropped with the turn"
+        );
+    }
+
     #[tokio::test]
     async fn re_adding_an_open_title_reuses_the_existing_task() {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
@@ -6309,6 +6720,7 @@ mod tests {
             storage: None,
             liveness: None,
             quiet_item: Arc::new(std::sync::Mutex::new(None)),
+            text_join: Arc::default(),
         }
     }
 
@@ -6462,6 +6874,112 @@ mod tests {
             }
             other => panic!("expected one Step entry, got: {other:?}"),
         }
+    }
+
+    fn execute_request(item_id: i64, step_index: usize) -> StepRequest {
+        StepRequest {
+            item_title: format!("test item {item_id}"),
+            item_id,
+            step_index,
+            step_kind: nanna_agent::harness::StepKind::Execute,
+            prompt: format!("Task #{item_id}: reply to the user"),
+            tool_scope: Vec::new(),
+            token_budget: None,
+            max_iterations: None,
+            max_wall_clock: None,
+            cancel: None,
+        }
+    }
+
+    /// Consecutive steps are separate actions streaming into one reply, and
+    /// used to abut: `…the file.The file says…` in the stream and in the
+    /// persisted message. Each step's text now opens a new paragraph — for
+    /// quiet (conversation-shaped) items too, which are exactly the ones with
+    /// no banner or journal entry to mark the seam.
+    #[tokio::test]
+    async fn each_step_opens_a_new_paragraph_in_the_reply() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+        *sink.quiet_item.lock().unwrap() = Some(7);
+
+        sink.step_header(&execute_request(7, 0));
+        sink.delta("Let me check");
+        sink.delta(" the file.");
+        sink.step_header(&execute_request(7, 1));
+        sink.delta("It says hello.");
+
+        assert_eq!(
+            run.accumulated_text.read().await.as_str(),
+            "Let me check the file.\n\nIt says hello.",
+            "one break at the step seam, none inside a step, none before the first text"
+        );
+    }
+
+    /// Two steps that say the same thing are the converging repeat: the join
+    /// reports the second copy and exactly where it sits in the reply — even
+    /// with the run summary after it, which is not step text.
+    #[tokio::test]
+    async fn a_repeated_step_is_reported_with_its_span() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+        sink.step_header(&execute_request(1, 0));
+        sink.delta("Paris.");
+        sink.step_header(&execute_request(1, 1));
+        sink.delta("Paris.");
+        sink.text_join.lock().unwrap().end_steps();
+        sink.delta("\n\n_2 steps_");
+
+        let reply = run.accumulated_text.read().await.clone();
+        let (repeat, span) = sink
+            .text_join
+            .lock()
+            .unwrap()
+            .repeated_last_step()
+            .expect("the second step repeats the first");
+        assert_eq!(repeat, "Paris.");
+        assert_eq!(
+            &reply[span], "\n\nParis.",
+            "the separator and the copy, nothing else"
+        );
+
+        let other = chat_sink(external_run_handle());
+        other.step_header(&execute_request(1, 0));
+        other.delta("Paris.");
+        other.step_header(&execute_request(1, 1));
+        other.delta("Lyon.");
+        assert!(
+            other
+                .text_join
+                .lock()
+                .unwrap()
+                .repeated_last_step()
+                .is_none()
+        );
+    }
+
+    /// The break is only added where the seam has no whitespace of its own:
+    /// a model that already ended on a newline, or starts with one, keeps its
+    /// own spacing, and a step that emits nothing leaves no stray break.
+    #[tokio::test]
+    async fn a_step_seam_that_already_has_whitespace_is_left_alone() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+
+        sink.step_header(&execute_request(1, 0));
+        sink.delta("First.\n");
+        sink.step_header(&execute_request(1, 1));
+        sink.delta("Second.");
+        sink.step_header(&execute_request(1, 2));
+        sink.delta("\nThird.");
+        // A step with no text, then one with text: exactly one break.
+        sink.step_header(&execute_request(1, 3));
+        sink.step_header(&execute_request(1, 4));
+        sink.delta("Fourth.");
+
+        assert_eq!(
+            run.accumulated_text.read().await.as_str(),
+            "First.\nSecond.\nThird.\n\nFourth."
+        );
     }
 
     /// Parity with the retired direct chat path: completed tool calls feed
@@ -8017,6 +8535,7 @@ mod summarizer_wiring_tests {
             chat_sink: None,
             gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             degradations: None,
+            attachments: Arc::default(),
         }
     }
 

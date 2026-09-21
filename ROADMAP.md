@@ -496,11 +496,29 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [x] No SECURITY.md or vulnerability disclosure process.
       *(2026-07-24)* **`SECURITY.md` shipped** — supported versions, private disclosure via
       security@nanna.bot / GitHub private advisory, response targets, and scope.
-- [~] No Dependabot / cargo-audit / npm audit automation.
+- [x] No Dependabot / cargo-audit / npm audit automation.
       *(2026-07-24)* **Dependabot on.** `.github/dependabot.yml` covers cargo (workspace root,
       weekly, holds the intentional `turso`/`aegis` pins) and npm (`/gui`, weekly, ignores the
       documented deferred majors: tiptap/vue-router/vue-sonner/marked/typescript). cargo-audit /
       npm-audit CI steps remain open under P0.3.
+      *(2026-09-21)* **Audit gate landed: `.github/workflows/audit.yml`** — `cargo audit` over
+      `Cargo.lock` (fails on a RustSec vulnerability) and `pnpm audit --prod --audit-level=high`
+      over the GUI lockfile, on lockfile changes and weekly (an advisory can land against an
+      untouched lockfile). Both read only the lockfile — no toolchain, no install; verified
+      locally. **State today: 0 Rust vulnerabilities**, 16 warnings (14 unmaintained, 2 unsound),
+      none fixable from this tree; npm: 4 low/moderate. The gate was checked to have eyes: the
+      same pnpm audit at `moderate` exits 1. Thresholds are deliberate: failing on warnings would
+      leave the job permanently red, i.e. ignored.
+      - [ ] **`lru 0.16.4` is unsound (RUSTSEC-2026-0253, use-after-free when a key's `Drop` panics
+            inside `pop()`), patched in ≥ 0.18.2** — reached only via `tantivy 0.26` under turso's
+            exact `=0.7.2` pin, so it moves when turso does. Not reachable in shipped builds: it
+            needs unwinding plus `catch_unwind`, and the release profile is `panic = "abort"`.
+      - [ ] **Monaco vendors DOMPurify 3.4.8** (`monaco-editor/esm/vs/base/browser/dompurify/`) —
+            four advisories up to one moderate XSS (GHSA-vxr8-fq34-vvx9; fixed ≥ 3.4.13, latest
+            3.4.15). `monaco-editor 0.56.0` is the latest release. **A pnpm override would not help**:
+            the package-level `dompurify` it would bump is not the code monaco runs. Re-check on the
+            next monaco release; exposure is monaco's own hover/markdown rendering of local content.
+
 - [ ] No GitHub secret scanning enabled.
       *(2026-07-24)* Dependabot shipped (see above). Secret scanning itself is still a repo-admin
       toggle on GitHub and is not something a PR can flip — left open.
@@ -1721,8 +1739,52 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       and `nanna_channel_send_failures_total{channel}`, counted where a channel message crosses the
       daemon boundary (inbound + immediate replies in `process_message`, turn answers and reminders
       in the reply forwarder); names bounded at 16 then folded into `other`. Only histograms remain.
-- [ ] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
+- [x] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
+      *(2026-09-21)* The daemon had **zero** spans, so two overlapping turns interleaved their
+      lines with nothing to tell them apart. Now `chat_turn{session_id message_id}` (plus
+      `sub_agent` / `scheduled_run` roots) → `harness_step{step item_id kind}` → `agent_run{model}`
+      → `agent_iteration{iteration}` → `llm_call` / `tool_call`, from `nanna-agent::spans`.
+      Outcome fields are declared empty and recorded as each call settles — `llm_call` gets
+      latency, input/output tokens, tool-call count, `ok`/`error` (and `served_model` only when
+      escalation moved it: fmt *appends* a re-recorded field, so re-recording `model` printed it
+      twice); `tool_call` gets duration, output bytes (content + error text, so a breaker refusal
+      does not read as empty), success, short-circuited; `agent_run` gets iterations, tokens, and
+      how it ended. The fmt layers print them once per span via `FmtSpan::CLOSE`, **scoped by a
+      per-layer filter to `nanna*` spans** — the first real-daemon run showed zbus's keyring
+      handshake emitting a burst of INFO span-close lines at boot, which the unit test could not
+      have seen. Cost is per call, never per token. Guarded by `tests/tracing_spans.rs`, which
+      drives the real loop against an Ollama stub and asserts parents, closure, the recorded
+      fields, and that the tool's own log line fires *inside* its span (verified by removing the
+      `.instrument`: the test fails by name). One trap recorded in-code: instrumenting the
+      iteration future before boxing it re-deepened the `Send` proof the box exists to cut
+      (clippy: "overflow evaluating the requirement") — the span wraps the boxed future.
+      Real binary: scratch-isolated daemon + fake Ollama, one IPC chat turn → 14 `llm_call`,
+      4 `tool_call`, 5 `harness_step`, 1 `chat_turn` close lines, 0 foreign, 0 panics.
+      - [ ] *(research 2026-09-21)* **Never make span events reloadable.** `fmt::Layer` keeps
+            per-span busy/idle bookkeeping only while the current span-event config calls for it,
+            so toggling `with_span_events` through a `reload` handle while a turn's spans are live
+            trips a `debug_assert` (tokio-rs/tracing#3529; fixes [#3570](https://github.com/tokio-rs/tracing/pull/3570)
+            / #3616 still open, `tracing-subscriber` latest is 0.3.23). Today the setting is fixed
+            at boot, so this is safe — if a "verbose spans" runtime toggle is ever added, gate it on
+            a released fix or rebuild the subscriber rather than reloading the layer.
+      - [x] **The GUI Logs page still sees none of it.** `nanna-core::LogBufferLayer` implements
+            only `on_event` and keeps the message text, so the span context and every close
+            line reach stdout and the file log but not `system logs`. Carrying it needs a
+            `LookupSpan` bound, per-span field storage in extensions, and a `LogEntry` field the
+            Logs page actually renders — ship both halves together, or it is a dead field.
+            *(2026-09-21, same run — both halves)* `LogEntry.scope` (omitted from the wire when
+            empty; `#[serde(default)]` for older daemons) holds the line's Nanna span chain,
+            outermost first, with each span's fields including ones recorded after it opened;
+            dependency spans are left out (same rule as the fmt layers) and the scope is capped at
+            512 bytes with the cut marked. The Logs page renders it dimmed after the message (full
+            text on hover) and **search matches it — pasting a session id narrows the log to that
+            conversation.** Real daemon over IPC `system logs`: 71 of 348 lines carried a chain,
+            including the scripting engine's own lines inside a tool call. Unit test (own-only,
+            outermost-first, recorded fields, empty scope off the wire), 2 new vitest cases,
+            `vue-tsc` clean, `pnpm build` green, `cargo check -p nanna-gui --tests` green.
+            **GUI rendering not verified on device** — the Linux WebDriver route needs the
+            `e2e-webdriver` feature that is still only in PR #344.
 - [~] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by
       session/day/month/model/tool, surface in GUI.
       *(2026-07-12)* Core shipped in `nanna-agent::cost`: `ModelPricing` (input/output/cache-read/cache-write
@@ -1891,6 +1953,320 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       failing confusingly. It now sets the state itself (the handler still does too; idempotent) and
       `debug_assert`s the postcondition. Remaining for this item: a real conversation turn (needs a live LLM)
       and the **embedded-fallback** path (needs a GUI build).
+      *(2026-09-21)* **A real conversation turn — without a live LLM.** The "needs a live LLM" premise
+      was wrong: every hop between the client and the model's socket is ours, so a scripted Ollama on
+      a loopback port is enough to exercise the whole shipping path. New
+      `a_conversation_turn_round_trips_and_persists_its_reply`: real daemon, real IPC, real client;
+      asserts the user's text reaches the model, `message_end` for that turn's `message_id` is
+      **exactly** the reply, and `sessions.history` holds both sides. Two builder options made it
+      reachable: `with_ollama_host` (the router's provider URL had no builder path) and
+      `with_scheduler(false)` (so a heartbeat turn cannot add requests). **The stub has to play a
+      well-behaved model, and that is a finding:** the first version answered every prompt with the
+      same prose, and the "real turn" came back as the answer **seven times glued together** plus
+      `_could not finish: every planned task was abandoned_` — the planner starved (no JSON), no step
+      ever said `TASK COMPLETE`, and the harness retried then abandoned. Scripted to answer the planner
+      with one null-acceptance task and each step with the reply + `TASK COMPLETE`, the turn is one
+      step and the reply is exact. The glued copies exposed a real defect, taken next (below).
+      Remaining: the **embedded-fallback** path (needs a GUI build).
+      - [x] *(2026-09-21)* **Consecutive harness steps glued their text together.** Every step
+            streams into the same reply; the loop separates its own iterations with a space, but
+            nothing separated *steps*, and once the step banner left the message body (run
+            mechanics are not content) a two-step answer read `Let me recall the answer.Paris is…`
+            — live, and in the persisted reply the model is shown on later turns. `ChatSink` now
+            keeps a `StepTextJoin`: every step (quiet conversation-shaped items included — they are
+            the ones with no banner or journal entry to mark the seam) arms a paragraph break, spent
+            by that step's first text, and only added when neither side of the seam already has
+            whitespace, so a model's own newline never grows into three. 2 unit tests + a new e2e
+            `a_two_step_turn_reads_as_two_paragraphs` through the real daemon; all three fail by name
+            with the separator emptied, and the e2e failure reproduces the defect verbatim.
+      - [x] *(2026-09-21)* **A model that answers but never says `TASK COMPLETE` got its answer
+            seven times, then "could not finish".** For an item with no machine check the model's
+            word is the verdict, and small local models routinely answer and simply do not say the
+            marker. The harness then charged each re-answer as fruitless, re-streaming it every step,
+            until the ladder abandoned the item — reproduced verbatim through the real daemon: seven
+            copies, `_could not finish: every planned task was abandoned_`, a "Dropped" list, and
+            `7 steps · 0 items completed · 1 abandoned`. New rule, `answer_converged`: two
+            **consecutive** steps on an unchecked item that call no tools, are not a narration loop,
+            and give the same answer (whitespace-collapsed, otherwise exact) close the item —
+            logged as its own `completed_converged` event, still counted unverified. Exact on purpose:
+            a false match ends a turn early, a missed one costs one step. A step that did work in
+            between breaks the chain (its world may have changed the answer). 3 harness tests incl.
+            both negatives, + e2e `a_model_that_never_claims_completion_still_finishes_the_turn`
+            (2 steps, no "could not finish"; fails with the full 7-copy transcript when the rule is
+            disabled).
+      - [x] *(2026-09-21)* **A follow-up turn was told an unchecked answer had passed a check.**
+            The turn-start "established work" block the planner reads put every closed item under
+            *"done-condition PASSING … Do not redo or re-assess them"* — including items that closed
+            on the model's own word with no check at all (each line then said `(unverified)`,
+            contradicting its own header). Found by probing a two-turn conversation through the real
+            daemon. That is precisely the item a follow-up like "are you sure?" or "that's wrong" is
+            about, and the planner was instructed not to revisit it. Now two headers:
+            verified rows keep theirs; unverified rows go under *"Closed earlier on the model's own
+            word (no check ran) … re-assess one if the request questions it"*.
+            `artifact_state_block` already filtered to verified rows and is unchanged. Unit test
+            (unverified-only and mixed ordering) + e2e
+            `a_follow_up_turn_is_not_told_an_unchecked_answer_passed_a_check`, which fails when
+            every row is rendered as verified.
+      - [x] *(2026-09-21)* **Inline `<think>` reasoning streamed straight into the reply.** A model
+            served without Ollama's thinking separation (no `think: true` — the request only sets it
+            for qwen3/deepseek-r1/qwq names — or an older Ollama) writes `<think>…</think>` in
+            `content`. The non-streaming path already stripped it (`strip_think_tags`); chat streams,
+            and the stream translator passed it through, so the tags and the whole chain of thought
+            became the reply and were replayed to the model on later turns. New
+            `InlineThinkSplitter` in the Ollama NDJSON translator routes it to thinking events,
+            holding back only a possible partial tag across fragment boundaries (bounded by the tag
+            length, released at the next fragment or at end of stream — including the done-in-buffer
+            and stop-sentinel endings), trimming the separator after a closed block, and keeping an
+            unclosed block out of the reply. Block bookkeeping moved into `emit_thinking` /
+            `emit_text`, which also fixes reasoning that resumes *after* reply text reusing the text
+            block's index. 5 unit tests + e2e `inline_reasoning_stays_out_of_the_reply` (reply is
+            exactly the answer; the reasoning is persisted as a `thinking` timeline entry); with the
+            splitter bypassed the e2e fails with the raw `<think>` text as the reply.
+      - [x] *(2026-09-21)* **A reply of only `TASK COMPLETE` became an empty message.** The claim
+            marker is stripped at persistence, so a model that answered "hi" with the bare marker
+            closed the item and the user got a turn with no text at all (the GUI then hides the
+            empty bubble — silence). An empty *completion* was already reported honestly
+            (`_could not run: empty completion…_`); an empty *claimed* completion now gets the same:
+            `finish_turn` states `_finished without a reply: the model marked this done but said
+            nothing and ran no tools…_` — only for an `all_tasks_done` turn with no text and no
+            tool calls, never on a cancel (an empty stopped turn is what Stop asked for). E2e
+            `a_claimed_completion_with_nothing_said_is_stated_not_silent`; with the call removed
+            the reply is `""`.
+      - [x] *(2026-09-21)* **Ollama tool calls got the same id in every response.** Ollama sends
+            no call ids; the synthesized ones were a per-response counter, so the first call of
+            *every* response was `toolu_00000001` — a tool-using turn persisted `discover_tools` and
+            `echo` under one id, and one step's context carried both. The timeline journal and the
+            GUI had each grown a workaround ("match only OPEN items, ids recur"), but anything
+            replaying that context to a provider requiring unique `tool_use` ids — Anthropic on a
+            mid-step fallback — would be refused. Now `synthesized_tool_use_id`: a process-wide
+            counter, clock-seeded so a restarted daemon does not begin again at ids its persisted
+            timelines already hold; same `toolu_` + hex shape, both synthesis sites (stream and
+            non-stream). Unit test across three translated responses (fails by name with a constant
+            id) + e2e `a_tool_using_turn_records_each_call_under_its_own_id` (discover → call →
+            report, both calls succeed, distinct ids). The two workarounds stay: they are correct
+            and cost nothing.
+      - [x] *(2026-09-21)* **Every failed tool result read `Error: Error: …` on Ollama/OpenAI
+            wires.** The agent loop writes a failed result as `Error: <message>`; the OpenAI-shaped
+            wire conversion (shared by Ollama) has no `is_error` flag, so it carried the flag as an
+            unconditional `Error: ` prefix — twice over. Now `wire_tool_result_content` prefixes only
+            content that does not already announce itself. Unit test (both flags, case, too-short
+            content) + e2e `a_call_to_a_missing_tool_is_reported_once_and_the_turn_recovers` (the
+            model reads `Error: Tool not found: frobnicate. Use discover_tools…` once, and the turn
+            completes). Also probed: a model calling a tool it never discovered still gets it run
+            (the registry resolves every registered tool) — not a defect, noted so it is not
+            re-investigated.
+      - [x] **IPC `session.clear` has no running-turn guard.** *(2026-09-21, fixed the same run:
+            refused with `"error": "busy"` and a way out while a turn runs, exactly as `/new`; e2e
+            `clearing_a_session_mid_turn_is_refused_until_the_turn_ends`.)* The chat apps' `/new` refuses while a
+            turn is running ("Send /stop first, then /new"); the IPC `Clear` the GUI uses clears anyway,
+            so the running turn's reply lands in the freshly-cleared conversation. Mirror `/new`'s
+            guard (or stop the turn, as delete now does) — check what the GUI shows for either answer.
+            *Latent today:* no GUI command invokes `session.clear`; its only production caller is `/new`,
+            which is guarded. It becomes live the moment a "clear chat" button is wired.
+      - [x] *(2026-09-21)* **A request longer than the window blamed GPU memory.** Probed with a
+            300 KB pasted log: every turn failed in 80 ms with "num_ctx was demoted under GPU memory
+            pressure … free GPU memory and resume" — no demotion had happened, and no freed memory
+            shortens a request. `ContextBelowFloor` now names the cause from its own numbers (step
+            frame + reply room over the window ⇒ the request is too long). e2e
+            `a_request_longer_than_the_window_says_so`.
+      - [ ] **A pasted document too large for the window cannot be worked at all.** Named honestly
+            now, but the only remedy is "shorten it". A step frame could carry a bounded excerpt of an
+            oversized request and keep the whole of it readable (as oversized tool results already are),
+            so "summarize this log" works on any model. Owner call: it changes what the model sees of
+            the user's own words.
+      - [x] *(2026-09-21)* **A blank message ran a whole planned turn.** `chat.send` with
+            whitespace-only content and no attachments was persisted and planned, the model guessing
+            at a request nobody made. Refused with `"error": "empty_message"` before anything is
+            stored (channels relay the reason). e2e `a_blank_message_is_refused_and_starts_no_turn`.
+            Also probed, no defect: an unknown session is refused as `session_not_found`;
+            Regenerate after a tool turn replaces the reply cleanly.
+      - [x] *(2026-09-21)* **Deleting a session left its turn running.** Probed: the model kept
+            generating for the deleted conversation (a mission would have kept calling tools, for
+            hours), and its reply was persisted into nothing. `session.delete` and `delete_all` now stop
+            the session's running turn first, through the same path as Stop. e2e
+            `deleting_a_session_stops_its_running_turn` (fails without the call: the late reply streams).
+      - [x] *(2026-09-21)* **A stopped turn is persisted the way the GUI shows it.** The GUI appends
+            `[Stopped by user]` to the live bubble and lets `message_end` replace it, expecting the
+            daemon to persist the same marker (its own comment says so). The harness path persisted
+            only what had streamed, so a turn stopped before any text ended as `""`: the marker
+            vanished, history kept an empty assistant message, and later turns' context read nothing
+            where the user had said stop. `persist_reply` now closes a cancelled turn with the same
+            marker (content and timeline; not streamed, so the live bubble does not double it). The
+            Stop e2e asserts it.
+      - [x] *(2026-09-21)* **Stop is covered end to end.** e2e
+            `stop_ends_an_in_flight_turn_and_the_session_carries_on`: the scripted model holds its
+            first reply for 3 s; Stop lands while it is in flight, the late reply never reaches the
+            transcript, and the next message is answered. (The stub now serves one task per
+            connection with a `WAIT <ms>` script form, so a held reply never blocks other requests.)
+      - [x] *(2026-09-21)* **Any non-ASCII reply could die at a network chunk boundary.** All four
+            provider stream readers (Anthropic SSE, OpenAI, Ollama, OpenAI-compatible) decoded each
+            network chunk as UTF-8 on its own, so the first multibyte character a chunk boundary
+            split — emoji, accents, CJK — failed the stream with `Invalid UTF-8: incomplete utf-8
+            byte sequence`; retries hit the same wall. Reproduced through the real daemon: a 100 KB
+            reply split at byte 32767 came back as `_could not run: … Invalid UTF-8 …_` after
+            **76 s** of retries. New `Utf8StreamDecoder` carries the incomplete tail (≤ 3 bytes)
+            into the next chunk and still rejects genuinely invalid bytes; now 0.27 s and the reply
+            is byte-exact. The MCP legacy-SSE transport had the same decode but **silently dropped**
+            the chunk (`if let Ok(text)` with no else) — and the JSON-RPC response in it, leaving
+            that call waiting; it now buffers bytes and decodes one complete event at a time
+            (`take_sse_event`; the delimiter is ASCII, so a complete event is whole characters).
+            Tests: every split point of a multibyte string (decoder and SSE splitter), invalid
+            bytes still rejected, e2e `a_long_multibyte_reply_survives_chunk_boundaries`.
+            - [x] *(2026-09-21, same class)* **Signal and WhatsApp inbound messages were corrupted, not
+                  dropped:** both listeners decoded each SSE chunk with `from_utf8_lossy`, so a
+                  message whose emoji or accented letter a chunk boundary split reached the agent
+                  as `��`. Both now frame raw bytes first (`listeners::sse::take_event`, shared) and
+                  decode one complete event at a time; tests over every split point. Not
+                  live-verified — no Signal/WhatsApp bridge on this host.
+            - [ ] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
+                  for the same per-chunk decode once #344 merges (it is not on master, so it could
+                  not be fixed here).
+      - [x] *(2026-09-21)* **The e2e suite now gates PRs: `.github/workflows/e2e.yml`.** CI compiled
+            the test suite (`test-compile.yml`, `--no-run`) but ran almost none of it — only three
+            budget-gate subsets — so the conversation path was exercised by nightly runs alone. The new
+            job runs `cargo test -p nanna-client --test e2e_daemon --locked` on Ubuntu for PRs touching
+            Rust, pushes to master, and on demand. Verified hermetic locally with no D-Bus session and an
+            empty HOME (34/34). It reads its toolchain from `rust-toolchain.toml`
+            (`rustup toolchain install`, no argument) instead of duplicating the pin, so a pin move
+            cannot strand it. Not yet run on GitHub — first run is this PR.
+      - [x] *(2026-09-21)* **A mission-shaped turn pinned end to end.** e2e
+            `a_checked_task_is_verified_by_the_environment_and_reported_as_passing`: the plan's task
+            carries `file_exists`, the scripted model writes the file with the real `write_file` inside
+            a workspace (bookkeeping stays in the workspace — no `~/.nanna`), the check verifies it,
+            nothing is left open, and the follow-up turn's planner is told the check *already PASSES,
+            verified by running it* — the verified counterpart of the unverified-label fix above, and
+            the mission-shaped test the turn-admission change was owed.
+      - [x] *(2026-09-21)* **Overlapping turns in two sessions pinned.** e2e
+            `overlapping_turns_in_two_sessions_stay_apart`: both turns in flight at once, each reply
+            answers its own question and lands only in its own history (the shape behind the
+            shared-workdir incident). The stub's step scripts take `{goal}`, filled from the step
+            prompt, so concurrent replies can be told apart.
+      - [x] *(2026-09-21)* **Planner prose fallback pinned end to end.** e2e
+            `a_planner_that_answers_in_prose_still_gets_the_question_answered`: the scripted planner
+            replies in prose instead of JSON (routine for small models); the request becomes the one
+            task and the reply is exactly the answer. The stub's planner reply is now scriptable
+            (`start_with_plan`). Also probed, no defect: a two-task plan streams as two paragraphs
+            (the step-separator fix above) with the multi-item summary line.
+      - [x] *(2026-09-21)* **Reminders pinned end to end, restart included.** e2e
+            `a_reminder_set_in_chat_survives_a_restart_and_is_delivered`: the scripted model calls
+            the real `remind` skill, the daemon is stopped and restarted on the same data dir, and
+            `⏰ Reminder: …` is posted into the conversation (and persisted) — the promise the
+            skill's description makes to the model. ~30 s by necessity (the due sweep's cadence).
+            New builder option `with_heartbeat(false)`: the first probe ran with the scheduler on
+            and the heartbeat turn consumed the scripted `remind` call.
+      - [x] *(2026-09-21)* **`recall` told the model "No memories found" about a memory stored
+            seconds earlier, whenever no embedder was answering.** `remember` handled the degraded
+            state honestly (stored whole, queued for embedding, says so), but `memory.search` turned
+            "cannot embed the query" into an empty list — so on any install without an embedding
+            provider (this dev host included) recall was useless *and* untrue. Now it falls back to
+            a keyword match (`keyword_recall`: terms ≥ 3 chars, stopwords dropped, ≤ 16 terms,
+            ranked by share of terms present; one pass over stored contents, degraded path only),
+            also when a semantic answer is empty from a scan that could not compare every row
+            (entries queued for backfill). Results carry `"match": "keyword"` and the `recall` skill
+            (0.1.1) says they are word matches, not meaning matches; a fallback that finds nothing
+            is an error that says semantic search was unavailable and how many memories were
+            searched by keyword. Unit tests + e2e `recall_without_an_embedder_finds_a_memory_by_keyword`;
+            with the old service the e2e fails with the original `No memories found matching: …`.
+            Workspace scope follows `recall_scoped` (global + own workspace). The testing-effect
+            FSRS strengthening does not apply to keyword hits — deliberately, a word match is weaker
+            evidence of relevance than a semantic one.
+      - [x] *(2026-09-21)* **`ask_user` pinned end to end.** e2e
+            `a_clarifying_question_is_answered_by_the_next_message`: the scripted model asks
+            mid-turn, the question is posted into the conversation, the user's next message is
+            handed to the waiting call (`The user answered: Paris`), the turn finishes with it, and
+            the next turn does not work "Paris" again as a task. Noted, not changed: the answer's
+            `chat.send` ack reads `"status":"interjected"… "admitted to the run in progress"` — true
+            of the mechanism (the reply rides the pending queue the call drains), and no client
+            reads the status today.
+      - [x] *(2026-09-21)* **A huge tool argument evicted the model's own tool call.** Only write
+            tools had their bulk argument stripped from the stored turn; a 185 KB argument to any
+            other tool (here `echo`; in practice an `exec` heredoc, `python` code, `create_tool`
+            source, `remember` content) sat verbatim in the assistant message. Real daemon log:
+            `Tier 3: hard limit exceeded, truncating estimated_tokens=56168 hard_limit=12288`
+            against an actual request of ~1.6k tokens — the hard cap dropped the call and left an
+            orphaned result "whose request was compressed out". Now any argument over the same
+            bound a single tool RESULT gets (`context_share_chars`: a quarter of the input budget,
+            shared by both) is replaced by an outcome-neutral placeholder once the call is stored;
+            the tool still receives the full arguments. **Second, independent defect on the same
+            path:** with memory disabled, a memory-targeted result has no sink and fell through to
+            the whole result verbatim — now it takes the context path's own bounded compaction.
+            Real daemon after the fix: no Tier 3 at all. e2e
+            `a_huge_tool_argument_does_not_evict_the_call_that_made_it` fails when either half is
+            removed; 2 unit tests. The e2e stub now answers `/api/show` like a 32K tool-calling
+            model, so every scripted test sizes context as a real model would.
+      - [x] *(2026-09-21)* **An abandoned item reported its charge counter as a step count.** A
+            model repeating one failing call is stopped by the harness (probed: 36 requests,
+            0.24 s, bounded) — but the report read "abandoned after **8** fruitless steps" in a turn
+            whose own footer said "**6** steps": `steps_without_progress` is a no-progress *charge*
+            (a step repeating the last one is charged twice; replans are not charged), not a step
+            count. Items now count the steps actually run on them, at the same place the run counts
+            its steps, and the reason says both: `abandoned after 6 steps (2 of them replans) made
+            no verifiable progress; 8 no-progress charges spent (…charged twice)`. e2e
+            `a_repeated_failing_call_ends_bounded_and_reports_the_steps_it_ran` asserts the two
+            counts agree (fails on the old counter). *(Same run, follow-up)* The report's "last said"
+            excerpt no longer quotes notices written for the model (`[HARNESS NOTE — …]`, the
+            repeat-failure / zero-information breakers, `[CONTEXT NOTICE…]`): it is cut before the first
+            one and the cut marked (`without_model_notices`); the e2e asserts neither appears.
+      - [x] *(2026-09-21)* **Regenerate — or asking the same question twice — appended a
+            "⚠️ repeat completion" warning to a plain answer.** The P22 escalation ("this same
+            request has now ended 'all tasks done' 2 times in a row with no side-effecting work … If
+            you expected something to exist by now, it does not") was built for missions re-sent
+            while nothing lands on disk. It fired on any repeat of the request text with zero side
+            effects — and a conversational answer has zero side effects every time by design.
+            Found by probing `chat.regenerate`. Now stated only when the run ACTED
+            (`run_evidence`, the harness's existing "did this run do anything?" signal: tool calls,
+            more than one step, or more than one item); the ledger still records every stop. e2e
+            `only_a_run_that_acted_is_told_its_repeat_changed_nothing` covers both sides — a
+            repeated question gets no warning; a repeated run that called tools and changed nothing
+            still does.
+      - [x] **A stopped request was worked anyway on the user's next message — against the
+            owner directive already written into `run_mission`.** *(2026-09-21, fixed the same
+            run.)* Found by the probe behind the Stop test: `first` → Stop → `second` came back as
+            `Second answer.\n\nSecond answer.\n\n_2 steps · 2 items completed_`. The directive
+            (2026-07-25, quoted in `chat_harness.rs::run_mission`): *"the model should decide to
+            resume or answer another question by the user … i don't think we should assume that the
+            user wants to resume."* It was implemented on the **input** side (the planner is shown
+            outstanding work) but not the **execution** side: the turn's `TursoTaskSource` served
+            every open item in the scope. Now a turn carries a `TurnAdmission`: it admits everything
+            created during it (seeds, interjections, replan subtasks, continuation rounds) and, of
+            the items open when it began, only those its plan **re-adopts** by proposing the same
+            work again (`same_title`, the store's one definition, the conservative one `tasks.add`
+            uses) — an adopted item joins the turn instead of being duplicated. A turn started by
+            the park waiter is a resume and keeps the whole scope; a store error falls back to the
+            old whole-scope behaviour rather than failing the turn. Store side:
+            `TaskRepository::next_admitted` filters only the final choice, so ordering and the
+            open-children rule are unchanged (an inadmissible child still holds its parent back).
+            Tests: storage unit, `TurnAdmission` unit, the Stop e2e now asserts the next reply is
+            exactly its own answer, and `re_sending_a_stopped_request_adopts_its_open_item` (worked
+            once, nothing left open). Mutation-checked: without admission the Stop e2e fails;
+            without adoption the re-send e2e fails. The scripted planner now titles each task after
+            its own request (a constant title made every leftover look re-adopted).
+            - [x] **`tasks.add` reuse could hand the model a leftover the turn would not run.**
+                  *(2026-09-21, same run)* The `todo` tool's idempotent reuse returns an existing
+                  open item's id when the model adds a task with the same title; if that item was a
+                  leftover the plan had not adopted, the turn did not admit it — the model was told
+                  "work on it rather than planning it again" about an item nothing scheduled. The
+                  live turn's `TurnAdmission` is now published on `TurnBaselines` beside its
+                  baseline (and dropped with it), and the reuse branch adopts the reused item.
+                  Unit test `reusing_a_leftover_admits_it_into_the_live_turn`.
+            - [ ] **Leftovers that are never re-adopted stay open.** They are shown to the planner
+                  each turn as outstanding work (bounded by `open_work_context`), which is the
+                  directive's intent — but nothing ever closes one the user has moved on from.
+                  Decide whether a leftover not re-adopted within N turns should be closed as
+                  superseded, and by what evidence N is chosen.
+            - [x] **The converging repeat is no longer kept.** *(2026-09-21, same run — the
+                  persisted-only option.)* The live stream still shows the answer twice (the second
+                  copy is the signal and cannot be recognized until it has streamed), but
+                  `StepTextJoin` now records each step's text and its byte span in the reply, and
+                  `persist_reply` cuts a last step that repeats the one before it — from the
+                  persisted content, the timeline, and the `message_end` the GUI replaces its live
+                  bubble with, so the duplicate collapses the moment the turn ends. Step text is
+                  sealed before the run summary (`end_steps`), so a footer after the repeat does not
+                  hide it. The span is validated against the text before the cut (a dropped delta
+                  would shift it), and the reply's only copy is never removed.
+                  - [ ] Holding back step-2+ text of a conversation-shaped item until the step ends
+                        would remove the brief live duplicate too, at the cost of live streaming for
+                        later steps — still an owner call.
 - [x] **Channel conversations were answered with an error — every message, since P22.** *(2026-09-17)*
       `ChannelManager::process_message` (Telegram/Discord/Slack listeners AND the webhook processor)
       read the reply from `chat.send`'s response `content`. Two things had made that impossible:
@@ -5877,12 +6253,28 @@ gaps, all fixed same-day:
       making interjection unreachable from the UI; mid-run sends now go straight to the daemon (with
       the old local queue as transport-error fallback). `ThinkingDelta` is also wired for harness steps.
 
-**Open:** interjection still has no live end-to-end pass (the machinery is now reachable; needs a
-mid-run send observed landing at a boundary); `PENDING_MESSAGES_MAX` overflow drops the oldest
-silently — it should announce itself per the summaries-must-announce-themselves rule; Stop is
-boundary-granular — an in-flight step runs to completion before the run stops; **attachments** are not
-carried into harness steps (the retired direct path passed images through; the harness path warns and
-drops them — needs plumbing into `StepRunner`).
+**Open:** ~~interjection still has no live end-to-end pass~~ **(done 2026-09-21: e2e
+`a_message_sent_mid_turn_joins_the_running_turn` — acked `interjected`, worked at the next boundary,
+answered in the same reply)**; ~~`PENDING_MESSAGES_MAX` overflow drops the oldest silently~~ **(2026-09-21:
+now a WARN naming the drop; still no user-facing notice — 64 messages between two step boundaries is
+an edge, and the chat.send ack no client reads is the only channel at push time)**; Stop is
+boundary-granular — an in-flight step runs to completion before the run stops *(stale as of 2026-09-21:
+`stop_ends_an_in_flight_turn_and_the_session_carries_on` cancels an in-flight model call in ~0.6 s)*;
+~~**attachments** are not carried into harness steps~~ **(done 2026-09-21, see below)**.
+- [x] *(2026-09-21)* **Attachments reach the model again — and the Ollama/OpenAI wires carry images at all.**
+      Two layers were broken. (1) `chat.send` warned in the daemon log and dropped every attachment, so
+      "what is in this picture?" reached the model as the bare question. Images (inline base64,
+      `image/*`) now ride **every step** of the turn (`AgentStepRunner::attachments` — each step starts
+      from a fresh context, so a later step working on the image needs it too; the planner gets none);
+      anything else (a PDF, a URL) is named in the turn's goal — *"The user attached a file that cannot be
+      read in this chat … report.pdf (application/pdf)"* — so the model can say so. (2) Underneath that,
+      the shared OpenAI/Ollama wire conversion had a catch-all that silently discarded `Image` blocks:
+      images had never reached an Ollama or OpenAI-compatible model on this path, only Anthropic's native
+      wire. Now Ollama gets `images: [base64]` (a URL image is named in the text — Ollama takes none) and
+      OpenAI-compatible gets text-then-`image_url` content parts. Unit tests (`split_attachments` via the
+      e2e, three wire tests) + e2e `an_attached_image_reaches_the_model_and_an_unreadable_file_is_named`.
+      Not carried: images on a message admitted into a run already in flight (it joins as text; logged).
+      Not verified against a real vision model — none on this host.
 
 ---
 

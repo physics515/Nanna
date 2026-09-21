@@ -8,10 +8,13 @@
 //! client such as the GUI can capture its own lines without linking the whole
 //! daemon crate.
 
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
 
 /// Which process produced a log line.
 ///
@@ -56,6 +59,14 @@ pub struct LogEntry {
     /// readable against an older daemon that does not send the field.
     #[serde(default)]
     pub source: LogSource,
+    /// The Nanna span chain the line was logged inside, outermost first —
+    /// `chat_turn{session_id=… message_id=…}:harness_step{…}:tool_call{tool=exec …}`.
+    /// Empty for a line logged outside any span. It is what lets a reader
+    /// tell two overlapping conversations' lines apart, and filter one out.
+    /// Omitted from the wire when empty; `#[serde(default)]` keeps entries
+    /// from an older daemon readable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
 }
 
 /// Circular buffer for recent logs (last N entries)
@@ -168,6 +179,42 @@ impl Visit for MessageVisitor {
     }
 }
 
+/// Most bytes of span context kept per line. The chain the agent loop opens
+/// (turn → step → run → iteration → call) with ids renders in ~350 bytes; the
+/// cap bounds the buffer at capacity × this even if a span records a huge
+/// field, and a cut is marked.
+const SCOPE_BYTES_MAX: usize = 512;
+
+/// A span's fields rendered as `key=value key=value`, kept in the span's
+/// extensions so each line renders its chain without re-visiting fields.
+struct SpanFields(String);
+
+/// Renders every field of a span as `key=value`, space-separated.
+struct FieldsVisitor<'a>(&'a mut String);
+
+impl Visit for FieldsVisitor<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = write!(self.0, "{}={value:?}", field.name());
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = write!(self.0, "{}={value}", field.name());
+    }
+}
+
+/// Whether a span belongs in a line's scope: Nanna's own, the same rule the
+/// daemon's console and file layers apply (`own_spans_only`), so a
+/// dependency's internal spans never crowd the context out.
+fn is_own_span(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.target().starts_with("nanna")
+}
+
 /// Tracing layer that captures events into a `LogBuffer`
 pub struct LogBufferLayer {
     buffer: LogBuffer,
@@ -180,8 +227,71 @@ impl LogBufferLayer {
     }
 }
 
-impl<S: tracing::Subscriber> Layer<S> for LogBufferLayer {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+impl LogBufferLayer {
+    /// The event's own-span chain, outermost first, bounded by
+    /// [`SCOPE_BYTES_MAX`].
+    fn scope_of<S>(event: &tracing::Event<'_>, ctx: &Context<'_, S>) -> String
+    where
+        S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        let mut scope = String::new();
+        let Some(spans) = ctx.event_scope(event) else {
+            return scope;
+        };
+        for span in spans.from_root() {
+            if !is_own_span(span.metadata()) {
+                continue;
+            }
+            if !scope.is_empty() {
+                scope.push(':');
+            }
+            scope.push_str(span.name());
+            if let Some(fields) = span.extensions().get::<SpanFields>()
+                && !fields.0.is_empty()
+            {
+                let _ = write!(scope, "{{{}}}", fields.0);
+            }
+            if scope.len() > SCOPE_BYTES_MAX {
+                let cut = scope.floor_char_boundary(SCOPE_BYTES_MAX);
+                scope.truncate(cut);
+                scope.push('…');
+                break;
+            }
+        }
+        debug_assert!(
+            scope.len() <= SCOPE_BYTES_MAX + '…'.len_utf8(),
+            "the scope is bounded"
+        );
+        scope
+    }
+}
+
+impl<S> Layer<S> for LogBufferLayer
+where
+    S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        if !is_own_span(attrs.metadata()) {
+            return;
+        }
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        let mut fields = String::new();
+        attrs.record(&mut FieldsVisitor(&mut fields));
+        span.extensions_mut().insert(SpanFields(fields));
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        if let Some(fields) = span.extensions_mut().get_mut::<SpanFields>() {
+            values.record(&mut FieldsVisitor(&mut fields.0));
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
         let level = metadata.level().as_str().to_lowercase();
         let target = metadata.target().to_string();
@@ -198,6 +308,7 @@ impl<S: tracing::Subscriber> Layer<S> for LogBufferLayer {
             target,
             message: visitor.message,
             source: self.buffer.source(),
+            scope: Self::scope_of(event, &ctx),
         };
 
         self.buffer.push(entry);
@@ -215,6 +326,7 @@ mod tests {
             target: "test".to_string(),
             message: format!("Message {index}"),
             source,
+            scope: String::new(),
         }
     }
 
@@ -282,6 +394,47 @@ mod tests {
 
         assert_eq!(parsed.source, LogSource::Daemon);
         assert_eq!(parsed.message, "m");
+    }
+
+    /// A line logged inside Nanna's spans carries the chain, outermost
+    /// first, with each span's fields — including fields recorded after the
+    /// span opened. Dependency spans are left out; a line outside any span
+    /// has no scope, and the empty scope stays off the wire.
+    #[test]
+    fn lines_carry_their_own_span_chain() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = LogBuffer::new(16, LogSource::Daemon);
+        let subscriber = tracing_subscriber::registry().with(LogBufferLayer::new(buffer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "nanna_test", "outside");
+            let turn = tracing::info_span!(target: "nanna_test", "chat_turn", session_id = "s-1");
+            let _turn = turn.enter();
+            let foreign = tracing::info_span!(target: "hyper", "request", uri = "/x");
+            let _foreign = foreign.enter();
+            let call = tracing::info_span!(
+                target: "nanna_test",
+                "tool_call",
+                tool = "exec",
+                success = tracing::field::Empty
+            );
+            let _call = call.enter();
+            call.record("success", true);
+            tracing::info!(target: "nanna_test", "inside");
+        });
+
+        let entries = buffer.get_all();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].scope, "", "a line outside any span has no scope");
+        assert_eq!(
+            entries[1].scope, "chat_turn{session_id=s-1}:tool_call{tool=exec success=true}",
+            "own spans only, outermost first, recorded fields included"
+        );
+        let wire = serde_json::to_string(&entries[0]).expect("serialize");
+        assert!(
+            !wire.contains("scope"),
+            "empty scope stays off the wire: {wire}"
+        );
     }
 
     #[test]
