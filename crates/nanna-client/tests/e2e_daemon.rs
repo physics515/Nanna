@@ -814,27 +814,55 @@ impl ScriptedOllama {
         let plan = scripted_reply(
             r#"[{"title":"Answer the question","description":"Reply directly.","acceptance":null}]"#,
         );
-        let steps: Vec<String> = steps.iter().map(|text| scripted_reply(text)).collect();
+        // `WAIT <ms> <script>` delays that reply — a step still in flight.
+        let steps: std::sync::Arc<Vec<(u64, String)>> = std::sync::Arc::new(
+            steps
+                .iter()
+                .map(|text| match text.strip_prefix("WAIT ") {
+                    Some(rest) => {
+                        let (ms, script) = rest.split_once(' ').unwrap_or((rest, ""));
+                        (
+                            ms.parse().expect("WAIT takes milliseconds"),
+                            scripted_reply(script),
+                        )
+                    }
+                    None => (0, scripted_reply(text)),
+                })
+                .collect(),
+        );
+        let plan = std::sync::Arc::new(plan);
+        let step_index = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
-            let mut step_index = 0_usize;
+            // One task per connection, so a delayed reply never holds up the
+            // next request (a cancel's follow-up turn, a model probe).
             while let Ok((mut socket, _)) = listener.accept().await {
-                let Some((request_line, body)) = read_http_request(&mut socket).await else {
-                    continue;
-                };
-                if request_line.contains("/api/chat") {
-                    let line = if body.contains(PLANNER_PROMPT_OPENING) {
-                        &plan
+                let (seen, plan, steps, step_index) = (
+                    std::sync::Arc::clone(&seen),
+                    std::sync::Arc::clone(&plan),
+                    std::sync::Arc::clone(&steps),
+                    std::sync::Arc::clone(&step_index),
+                );
+                tokio::spawn(async move {
+                    let Some((request_line, body)) = read_http_request(&mut socket).await else {
+                        return;
+                    };
+                    if !request_line.contains("/api/chat") {
+                        respond(&mut socket, "{}").await;
+                        return;
+                    }
+                    let (delay_ms, line) = if body.contains(PLANNER_PROMPT_OPENING) {
+                        (0, plan.as_str())
                     } else {
-                        step_index += 1;
-                        &steps[(step_index - 1).min(steps.len() - 1)]
+                        let index = step_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let (delay_ms, line) = &steps[index.min(steps.len() - 1)];
+                        (*delay_ms, line.as_str())
                     };
                     seen.lock().await.push(body);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     // One NDJSON line serves both shapes: a streamed request
                     // reads it as its only (final) chunk.
                     respond(&mut socket, &format!("{line}\n")).await;
-                } else {
-                    respond(&mut socket, "{}").await;
-                }
+                });
             }
         });
         Self {
@@ -1456,6 +1484,87 @@ async fn a_call_to_a_missing_tool_is_reported_once_and_the_turn_recovers() {
     assert!(
         !content.contains("Error: Error:"),
         "stated once: {content:?}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// Stop, end to end: a turn whose model is still generating is cancelled, its
+/// late reply never reaches the transcript, and the session takes the next
+/// message normally.
+#[tokio::test]
+async fn stop_ends_an_in_flight_turn_and_the_session_carries_on() {
+    // The first step's reply is held back well past the cancel.
+    let ollama = ScriptedOllama::start(vec![
+        "WAIT 3000 Too late.\nTASK COMPLETE".to_string(),
+        "Second answer.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("stop".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+    let ack = client
+        .chat()
+        .send(&session, "first")
+        .await
+        .expect("chat.send is accepted");
+    let first = ack["message_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the ack names the turn's message: {ack}"))
+        .to_string();
+
+    // Cancel once the step is really in flight: the stub has seen it.
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        while ollama.chat_bodies.lock().await.len() < 2 {
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the planner and the first step reach the model");
+    client
+        .chat()
+        .cancel(&session)
+        .await
+        .expect("chat.cancel answers");
+
+    let stopped = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::MessageEnd {
+                    message_id,
+                    content,
+                    ..
+                }) if message_id == first => return content,
+                Ok(_) => {}
+                Err(e) => panic!("the event stream ended before the stop landed: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the stopped turn ends");
+    assert!(
+        !stopped.contains("Too late."),
+        "the in-flight reply must not land after Stop: {stopped:?}"
+    );
+
+    let next = converse(&client, &session, "second").await;
+    assert!(
+        next.contains("Second answer."),
+        "the session takes the next message: {next:?}"
     );
 
     client.disconnect().await;

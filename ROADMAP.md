@@ -1978,6 +1978,21 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             completes). Also probed: a model calling a tool it never discovered still gets it run
             (the registry resolves every registered tool) — not a defect, noted so it is not
             re-investigated.
+      - [x] *(2026-09-21)* **Stop is covered end to end.** e2e
+            `stop_ends_an_in_flight_turn_and_the_session_carries_on`: the scripted model holds its
+            first reply for 3 s; Stop lands while it is in flight, the late reply never reaches the
+            transcript, and the next message is answered. (The stub now serves one task per
+            connection with a `WAIT <ms>` script form, so a held reply never blocks other requests.)
+      - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
+            behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
+            comment says "the next message decides what happens to them" — but the harness simply
+            runs every open item in the scope, so the user's **next, unrelated** message also answers
+            the question they stopped: `first` → Stop → `second` came back as
+            `Second answer.\n\nSecond answer.\n\n_2 steps · 2 items completed_`, the stopped item
+            worked unasked. Resuming makes sense for a mission ("stop, wait — use X") and is wrong
+            for a stopped question. Options: close conversation-shaped (single, unchecked) items on
+            Stop and keep missions pending; or keep everything pending but let only the planner
+            re-admit it. Not changed unattended — this decides what Stop means.
             - [ ] **The converging repeat is still streamed.** The user sees the answer twice
                   (paragraph-separated) — down from seven, but the second copy is the signal and
                   cannot be recognized until it has finished streaming. Options: hold back a
