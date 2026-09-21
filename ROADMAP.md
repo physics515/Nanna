@@ -1983,6 +1983,23 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             first reply for 3 s; Stop lands while it is in flight, the late reply never reaches the
             transcript, and the next message is answered. (The stub now serves one task per
             connection with a `WAIT <ms>` script form, so a held reply never blocks other requests.)
+      - [x] *(2026-09-21)* **Any non-ASCII reply could die at a network chunk boundary.** All four
+            provider stream readers (Anthropic SSE, OpenAI, Ollama, OpenAI-compatible) decoded each
+            network chunk as UTF-8 on its own, so the first multibyte character a chunk boundary
+            split — emoji, accents, CJK — failed the stream with `Invalid UTF-8: incomplete utf-8
+            byte sequence`; retries hit the same wall. Reproduced through the real daemon: a 100 KB
+            reply split at byte 32767 came back as `_could not run: … Invalid UTF-8 …_` after
+            **76 s** of retries. New `Utf8StreamDecoder` carries the incomplete tail (≤ 3 bytes)
+            into the next chunk and still rejects genuinely invalid bytes; now 0.27 s and the reply
+            is byte-exact. The MCP legacy-SSE transport had the same decode but **silently dropped**
+            the chunk (`if let Ok(text)` with no else) — and the JSON-RPC response in it, leaving
+            that call waiting; it now buffers bytes and decodes one complete event at a time
+            (`take_sse_event`; the delimiter is ASCII, so a complete event is whole characters).
+            Tests: every split point of a multibyte string (decoder and SSE splitter), invalid
+            bytes still rejected, e2e `a_long_multibyte_reply_survives_chunk_boundaries`.
+            - [ ] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
+                  for the same per-chunk decode once #344 merges (it is not on master, so it could
+                  not be fixed here).
       - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
             behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
             comment says "the next message decides what happens to them" — but the harness simply

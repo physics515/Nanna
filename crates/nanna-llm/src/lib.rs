@@ -4800,6 +4800,7 @@ impl LlmClient {
             let mut buffer = String::new();
             let mut accumulator = StreamAccumulator::new();
 
+            let mut utf8 = Utf8StreamDecoder::default();
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
@@ -4809,8 +4810,8 @@ impl LlmClient {
                     }
                 };
 
-                match std::str::from_utf8(&chunk) {
-                    Ok(s) => buffer.push_str(s),
+                match utf8.push(&chunk) {
+                    Ok(s) => buffer.push_str(&s),
                     Err(e) => {
                         yield accumulator.interrupted(LlmError::Stream(format!("Invalid UTF-8 in stream: {e}")));
                         return;
@@ -4896,6 +4897,7 @@ impl LlmClient {
             let mut buffer = String::new();
             let mut state = OpenAiStreamState::default();
 
+            let mut utf8 = Utf8StreamDecoder::default();
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
@@ -4905,8 +4907,8 @@ impl LlmClient {
                     }
                 };
 
-                match std::str::from_utf8(&chunk) {
-                    Ok(s) => buffer.push_str(s),
+                match utf8.push(&chunk) {
+                    Ok(s) => buffer.push_str(&s),
                     Err(e) => {
                         yield Err(LlmError::Stream(format!("Invalid UTF-8: {e}")));
                         return;
@@ -4988,6 +4990,7 @@ impl LlmClient {
             let mut state = OllamaStreamState::default();
             let mut last_line: Option<String> = None;
 
+            let mut utf8 = Utf8StreamDecoder::default();
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
@@ -4998,8 +5001,8 @@ impl LlmClient {
                 };
 
                 bytes_received += chunk.len();
-                match std::str::from_utf8(&chunk) {
-                    Ok(s) => buffer.push_str(s),
+                match utf8.push(&chunk) {
+                    Ok(s) => buffer.push_str(&s),
                     Err(e) => {
                         yield Err(LlmError::Stream(format!("Invalid UTF-8: {e}")));
                         return;
@@ -5150,6 +5153,7 @@ impl LlmClient {
             // Track content blocks (text at index 0, tool calls at higher indices)
             let mut state = OpenAiStreamState::default();
 
+            let mut utf8 = Utf8StreamDecoder::default();
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
@@ -5159,8 +5163,8 @@ impl LlmClient {
                     }
                 };
 
-                match std::str::from_utf8(&chunk) {
-                    Ok(s) => buffer.push_str(s),
+                match utf8.push(&chunk) {
+                    Ok(s) => buffer.push_str(&s),
                     Err(e) => {
                         yield Err(LlmError::Stream(format!("Invalid UTF-8: {e}")));
                         return;
@@ -5358,6 +5362,45 @@ fn synthesized_tool_use_id() -> String {
     let id = format!("toolu_{n:016x}");
     debug_assert_eq!(id.len(), "toolu_".len() + 16, "fixed-width ids");
     id
+}
+
+/// Incremental UTF-8 decoding for a provider byte stream.
+///
+/// Network chunks do not respect character boundaries. Every stream reader
+/// here decoded each chunk on its own, so a multibyte character split across
+/// two chunks — an emoji, an accent, any CJK — failed the whole stream with
+/// `Invalid UTF-8: incomplete utf-8 byte sequence`, and the retries hit the
+/// same wall: a long non-ASCII reply came back as "could not run". This
+/// carries the incomplete tail (at most 3 bytes: the longest UTF-8 sequence
+/// minus one) into the next chunk, and still rejects bytes that are invalid
+/// rather than merely incomplete.
+#[derive(Default)]
+struct Utf8StreamDecoder {
+    carry: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    /// Decode `chunk` after whatever the previous chunk left incomplete.
+    fn push(&mut self, chunk: &[u8]) -> Result<String, std::str::Utf8Error> {
+        let mut bytes = std::mem::take(&mut self.carry);
+        bytes.extend_from_slice(chunk);
+        match std::str::from_utf8(&bytes) {
+            Ok(text) => Ok(text.to_owned()),
+            // `error_len() == None`: the input ENDS mid-character — hold
+            // the tail for the next chunk.
+            Err(error) if error.error_len().is_none() => {
+                let complete = error.valid_up_to();
+                let text = std::str::from_utf8(&bytes[..complete])?.to_owned();
+                self.carry = bytes.split_off(complete);
+                debug_assert!(
+                    !self.carry.is_empty() && self.carry.len() < 4,
+                    "an incomplete tail is 1 to 3 bytes"
+                );
+                Ok(text)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// One routed piece of a content stream: reasoning or reply.
@@ -7941,6 +7984,45 @@ mod anthropic_model_contract_tests {
 
         let off = serde_json::to_value(ThinkingConfig::Disabled).expect("serializes");
         assert_eq!(off, serde_json::json!({"type": "disabled"}));
+    }
+}
+
+#[cfg(test)]
+mod utf8_stream_decoder_tests {
+    use super::Utf8StreamDecoder;
+
+    /// Every split point of a multibyte string decodes to the same text.
+    #[test]
+    fn a_character_split_across_chunks_is_reassembled() {
+        let text = "Ünïcödé 🌙 月";
+        let bytes = text.as_bytes();
+        for split in 0..=bytes.len() {
+            let mut decoder = Utf8StreamDecoder::default();
+            let mut out = decoder
+                .push(&bytes[..split])
+                .expect("a prefix is incomplete, not invalid");
+            out.push_str(
+                &decoder
+                    .push(&bytes[split..])
+                    .expect("the rest completes it"),
+            );
+            assert_eq!(out, text, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn invalid_bytes_are_still_rejected() {
+        let mut decoder = Utf8StreamDecoder::default();
+        assert!(
+            decoder.push(&[b'o', b'k', 0xFF, b'!']).is_err(),
+            "0xFF is never UTF-8"
+        );
+        let mut decoder = Utf8StreamDecoder::default();
+        assert_eq!(decoder.push(&[0xF0, 0x9F]).expect("incomplete"), "");
+        assert!(
+            decoder.push(b"x").is_err(),
+            "a sequence broken by an ASCII byte is invalid, not incomplete"
+        );
     }
 }
 

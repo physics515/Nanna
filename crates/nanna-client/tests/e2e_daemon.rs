@@ -1570,3 +1570,40 @@ async fn stop_ends_an_in_flight_turn_and_the_session_carries_on() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A long non-ASCII reply arrives whole. Every provider stream decoded each
+/// network chunk as UTF-8 on its own, so the first multibyte character a
+/// chunk boundary split — here at byte 32767 of a 100 KB reply — failed the
+/// stream with `Invalid UTF-8`, the retries hit the same wall, and the user
+/// got `could not run` after more than a minute.
+#[tokio::test]
+async fn a_long_multibyte_reply_survives_chunk_boundaries() {
+    let reply: String = "Ünïcödé 🌙 月 — ".repeat(4000);
+    let ollama = ScriptedOllama::start(vec![format!("{reply}\nTASK COMPLETE")]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("unicode".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let answered = converse(&client, &session, "Talk to me.").await;
+    assert_eq!(
+        answered.trim().len(),
+        reply.trim().len(),
+        "the whole reply arrived: {:?}",
+        answered.chars().take(160).collect::<String>()
+    );
+    assert_eq!(answered.trim(), reply.trim());
+
+    client.disconnect().await;
+    daemon.stop();
+}

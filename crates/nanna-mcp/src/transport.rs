@@ -485,6 +485,58 @@ pub use stdio::StdioTransport;
 // ============================================================================
 
 #[cfg(feature = "http")]
+/// Split the first complete SSE event (terminated by a blank line) off the
+/// front of `buffer`, without the terminator. `None` until one is complete.
+fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    const TERMINATOR: &[u8] = b"\n\n";
+    let at = buffer
+        .windows(TERMINATOR.len())
+        .position(|window| window == TERMINATOR)?;
+    let mut event: Vec<u8> = buffer.drain(..at + TERMINATOR.len()).collect();
+    event.truncate(at);
+    debug_assert!(
+        !event.ends_with(TERMINATOR),
+        "the terminator is not part of the event"
+    );
+    Some(event)
+}
+
+#[cfg(test)]
+mod sse_event_tests {
+    use super::take_sse_event;
+
+    /// A multibyte character split across network chunks reaches the event
+    /// whole; the old per-chunk decode dropped the chunk and the event.
+    #[test]
+    fn an_event_split_mid_character_arrives_whole() {
+        let wire = "data: {\"result\":\"月 🌙\"}\n\n".as_bytes();
+        for split in 0..wire.len() {
+            let mut buffer = Vec::new();
+            buffer.extend_from_slice(&wire[..split]);
+            let early = take_sse_event(&mut buffer);
+            buffer.extend_from_slice(&wire[split..]);
+            let event = early
+                .or_else(|| take_sse_event(&mut buffer))
+                .expect("one event");
+            assert_eq!(
+                String::from_utf8(event).expect("whole characters"),
+                "data: {\"result\":\"月 🌙\"}",
+                "split at byte {split}"
+            );
+            assert!(buffer.is_empty(), "nothing left over");
+        }
+    }
+
+    #[test]
+    fn events_are_taken_one_at_a_time() {
+        let mut buffer = b"a\n\nb\n\nc".to_vec();
+        assert_eq!(take_sse_event(&mut buffer).as_deref(), Some(&b"a"[..]));
+        assert_eq!(take_sse_event(&mut buffer).as_deref(), Some(&b"b"[..]));
+        assert_eq!(take_sse_event(&mut buffer), None, "c is incomplete");
+        assert_eq!(buffer, b"c");
+    }
+}
+
 pub mod http {
     use super::{async_trait, Arc, Mutex, JsonRpcResponse, Result, McpError, Transport, JsonRpcRequest, JsonRpcNotification};
     use futures::StreamExt;
@@ -602,23 +654,32 @@ pub mod http {
                                 // Process SSE events
                                 let mut stream = response.bytes_stream();
                                 
-                                let mut buffer = String::new();
+                                // Raw bytes, decoded one COMPLETE event at a
+                                // time. Decoding each network chunk on its own
+                                // silently DROPPED any chunk that split a
+                                // multibyte character (`if let Ok(text)` with
+                                // no else) — and the event it belonged to with
+                                // it, leaving that request's caller waiting.
+                                // The delimiter is ASCII, so a complete event
+                                // is always whole characters.
+                                let mut buffer: Vec<u8> = Vec::new();
                                 while let Some(chunk) = stream.next().await {
                                     match chunk {
                                         Ok(bytes) => {
-                                            if let Ok(text) = std::str::from_utf8(&bytes) {
-                                                buffer.push_str(text);
-                                                
-                                                // Process complete SSE events
-                                                while let Some(pos) = buffer.find("\n\n") {
-                                                    let event = buffer[..pos].to_string();
-                                                    buffer = buffer[pos + 2..].to_string();
-                                                    
-                                                    Self::process_sse_event(
-                                                        &event,
-                                                        &pending,
-                                                        &message_endpoint,
-                                                    ).await;
+                                            buffer.extend_from_slice(&bytes);
+                                            while let Some(event) = super::take_sse_event(&mut buffer) {
+                                                match String::from_utf8(event) {
+                                                    Ok(event) => {
+                                                        Self::process_sse_event(
+                                                            &event,
+                                                            &pending,
+                                                            &message_endpoint,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(error = %e, "SSE event is not UTF-8 — skipped");
+                                                    }
                                                 }
                                             }
                                         }
