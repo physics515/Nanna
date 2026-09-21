@@ -21,6 +21,9 @@ pub use ollama::{normalize_ollama_host, ollama_server_changed, same_ollama_serve
 /// Each provider's API key in its own `[llm]` field and keyring entry, and
 /// the move of keys the old layout filed as Anthropic's.
 mod provider_key;
+/// Channel secrets (bot tokens, signing and webhook secrets) in the secure
+/// store, and out of `config.toml`.
+mod channel_secrets;
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
@@ -433,6 +436,12 @@ impl Default for ServerConfig {
     }
 }
 
+/// The channels Nanna answers on.
+///
+/// A channel's section in `config.toml` turns it on and holds its settings; its
+/// secrets (bot and app tokens, signing and webhook secrets) are held in the
+/// secure store and never written to the file (`channel_secrets.rs`). Each is
+/// empty until the load that fills it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ChannelsConfig {
@@ -445,6 +454,8 @@ pub struct ChannelsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramConfig {
+    /// Secret: in the secure store, not `config.toml`. Empty when unset.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bot_token: String,
     pub webhook_url: Option<String>,
     pub allowed_users: Option<Vec<i64>>,
@@ -455,12 +466,16 @@ pub struct TelegramConfig {
     /// fixed path with no bot token in it, so without this value anyone who can
     /// reach the port can drive the agent. The endpoint refuses to serve until
     /// it is set.
+    ///
+    /// Secret: in the secure store, not `config.toml`.
     #[serde(default)]
     pub webhook_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordConfig {
+    /// Secret: in the secure store, not `config.toml`. Empty when unset.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bot_token: String,
     pub application_id: String,
     pub public_key: String,
@@ -468,8 +483,13 @@ pub struct DiscordConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackConfig {
+    /// Secret: in the secure store, not `config.toml`. Empty when unset.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bot_token: String,
+    /// Secret: in the secure store, not `config.toml`.
     pub app_token: Option<String>,
+    /// Secret: in the secure store, not `config.toml`. Empty when unset.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signing_secret: String,
 }
 
@@ -482,6 +502,8 @@ pub struct SignalConfig {
     /// signal-cli-rest-api does not sign its callbacks, so a shared secret is
     /// the strongest proof available on this path. Without it the endpoint
     /// cannot tell the bridge from any other caller and refuses to serve.
+    ///
+    /// Secret: in the secure store, not `config.toml`.
     #[serde(default)]
     pub webhook_secret: Option<String>,
     /// Phone number registered with Signal (e.g., "+1234567890")
@@ -498,12 +520,15 @@ pub struct WhatsAppConfig {
     pub connection_method: String,
     /// Phone Number ID (for Cloud API)
     pub phone_number_id: Option<String>,
-    /// Access token (for Cloud API)
+    /// Access token (for Cloud API). Secret: in the secure store, not
+    /// `config.toml`.
     pub access_token: Option<String>,
-    /// Webhook verify token (for Cloud API — the GET subscription handshake)
+    /// Webhook verify token (for Cloud API — the GET subscription handshake).
+    /// Secret: in the secure store, not `config.toml`.
     pub verify_token: Option<String>,
     /// App secret (for Cloud API — HMAC key for the `X-Hub-Signature-256` on
     /// inbound POST payloads). Without it, POSTs to the webhook are unauthenticated.
+    /// Secret: in the secure store, not `config.toml`.
     #[serde(default)]
     pub app_secret: Option<String>,
     /// Session name (for Web bridge)
@@ -821,9 +846,11 @@ impl Config {
 
     /// Read and parse the config file at `path`, with a non-Anthropic
     /// `[llm].provider`'s key filed under its own name
-    /// ([`provider_key::refile_provider_key`]) — before any secret is
-    /// hydrated, so only a key the old layout left behind is moved. The
-    /// file's text comes back too, for what only the raw text can show.
+    /// ([`provider_key::refile_provider_key`]) and each channel secret the
+    /// file itself holds filed in `store` ([`channel_secrets::adopt`]) —
+    /// before any secret is hydrated, so only a key the old layout left
+    /// behind is moved and only the file's own secrets are filed. The file's
+    /// text comes back too, for what only the raw text can show.
     fn parse_file(
         path: &Path,
         store: &crate::credentials::SecureStore,
@@ -832,6 +859,7 @@ impl Config {
         let mut config: Self = toml::from_str(&content)?;
         info!("Loaded config from {path:?}");
         provider_key::refile_provider_key(&mut config.llm, store);
+        channel_secrets::adopt(&mut config.channels, store);
         Ok((config, content))
     }
 
@@ -875,6 +903,7 @@ impl Config {
         self.llm.anthropic_oauth_token = None;
         self.llm.ollama_api_key = None;
         self.tools.brave_api_key = None;
+        channel_secrets::strip(&mut self.channels);
     }
 
     /// Persist any secret fields currently held in-memory into the OS keyring
@@ -933,7 +962,7 @@ impl Config {
                 store.save_ollama_token(trimmed, &self.memory.ollama_host)?;
             }
         }
-        Ok(())
+        channel_secrets::file(&mut self.channels, store)
     }
 
     /// Hydrate secret fields from `SecureStore` + environment if they are unset.
@@ -983,6 +1012,7 @@ impl Config {
         fill(&mut self.tools.brave_api_key, keys::BRAVE_API_KEY, "BRAVE_API_KEY");
         fill(&mut self.llm.anthropic_oauth_token, keys::ANTHROPIC_OAUTH_TOKEN, "ANTHROPIC_OAUTH_TOKEN");
         self.hydrate_ollama_token(store, env, unbound);
+        channel_secrets::fill(&mut self.channels, store, env);
     }
 
     /// Fill `llm.ollama_api_key` for the configured Ollama server.

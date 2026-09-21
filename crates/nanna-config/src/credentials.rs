@@ -57,10 +57,18 @@ pub mod keys {
     /// to the provider's own entry. From then on only Anthropic's key is
     /// saved there, so it is never looked at again.
     pub const LLM_KEYS_FILED_BY_PROVIDER: &str = "llm_keys_filed_by_provider";
+    // Channel secrets: `[channels]` in `config.toml` names the channel and
+    // its other settings, and these hold the secrets (`channel_secrets.rs`).
     pub const TELEGRAM_BOT_TOKEN: &str = "telegram_bot_token";
+    pub const TELEGRAM_WEBHOOK_SECRET: &str = "telegram_webhook_secret";
     pub const DISCORD_BOT_TOKEN: &str = "discord_bot_token";
     pub const SLACK_BOT_TOKEN: &str = "slack_bot_token";
+    pub const SLACK_APP_TOKEN: &str = "slack_app_token";
+    pub const SLACK_SIGNING_SECRET: &str = "slack_signing_secret";
+    pub const SIGNAL_WEBHOOK_SECRET: &str = "signal_webhook_secret";
     pub const WHATSAPP_ACCESS_TOKEN: &str = "whatsapp_access_token";
+    pub const WHATSAPP_VERIFY_TOKEN: &str = "whatsapp_verify_token";
+    pub const WHATSAPP_APP_SECRET: &str = "whatsapp_app_secret";
     pub const ELEVENLABS_API_KEY: &str = "elevenlabs_api_key";
 }
 
@@ -299,9 +307,15 @@ impl SecureStore {
             keys::BRAVE_API_KEY,
             keys::OLLAMA_API_KEY,
             keys::TELEGRAM_BOT_TOKEN,
+            keys::TELEGRAM_WEBHOOK_SECRET,
             keys::DISCORD_BOT_TOKEN,
             keys::SLACK_BOT_TOKEN,
+            keys::SLACK_APP_TOKEN,
+            keys::SLACK_SIGNING_SECRET,
+            keys::SIGNAL_WEBHOOK_SECRET,
             keys::WHATSAPP_ACCESS_TOKEN,
+            keys::WHATSAPP_VERIFY_TOKEN,
+            keys::WHATSAPP_APP_SECRET,
             keys::ELEVENLABS_API_KEY,
         ];
 
