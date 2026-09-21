@@ -167,14 +167,13 @@ fn classify_error(code: i32, data: Option<&Value>, message: &str) -> ProbeVerdic
             let supported = data
                 .and_then(|d| d.get("supported"))
                 .and_then(Value::as_array)
-                .map(|list| {
+                .map_or_default(|list| {
                     list.iter()
                         .take(SUPPORTED_VERSIONS_MAX)
                         .filter_map(Value::as_str)
                         .map(str::to_string)
                         .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+                });
             select_version(&supported)
         }
         error_codes::MISSING_REQUIRED_CLIENT_CAPABILITY | error_codes::HEADER_MISMATCH => {
