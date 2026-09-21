@@ -5331,10 +5331,112 @@ fn stream_error_event(e: LlmError) -> StreamEvent {
 // Ollama streaming: NDJSON translation
 // ============================================================================
 
+/// One routed piece of a content stream: reasoning or reply.
+#[derive(Debug, PartialEq, Eq)]
+enum ContentSegment {
+    Thinking(String),
+    Text(String),
+}
+
+/// Streaming twin of [`strip_think_tags`]: routes inline `<think>…</think>`
+/// in `message.content` to thinking instead of the reply.
+///
+/// Models served without Ollama's thinking separation (no `think: true`, an
+/// older Ollama, a family the request does not flag) put their reasoning in
+/// `content`, tags and all. The non-streaming path already stripped it; the
+/// streaming path — the one chat uses — passed it through, so the tags and
+/// the whole chain of thought landed in the user's reply and in the history
+/// replayed to the model on later turns.
+///
+/// A tag can be split across fragments (`<thi` + `nk>`), so the splitter holds
+/// back the longest suffix that could still begin the tag it is waiting for.
+/// That hold-back is bounded by the tag's length minus one, and released at
+/// the next fragment or at [`Self::finish`].
+#[derive(Default)]
+struct InlineThinkSplitter {
+    inside: bool,
+    /// Text not yet routed: at most a partial tag.
+    pending: String,
+    /// A think block just closed: the reply's leading whitespace after it is
+    /// the model's separator, not content (matches `strip_think_tags`' trim).
+    trim_next_text: bool,
+}
+
+impl InlineThinkSplitter {
+    const OPEN: &'static str = "<think>";
+    const CLOSE: &'static str = "</think>";
+
+    /// Route `fragment`, appending complete segments to `out`.
+    fn push(&mut self, fragment: &str, out: &mut Vec<ContentSegment>) {
+        self.pending.push_str(fragment);
+        loop {
+            let tag = if self.inside { Self::CLOSE } else { Self::OPEN };
+            if let Some(at) = self.pending.find(tag) {
+                let before: String = self.pending.drain(..at).collect();
+                self.route(before, out);
+                self.pending.drain(..tag.len());
+                self.inside = !self.inside;
+                self.trim_next_text = !self.inside;
+                continue;
+            }
+            let held = partial_tag_suffix_len(&self.pending, tag);
+            let ready: String = self.pending.drain(..self.pending.len() - held).collect();
+            self.route(ready, out);
+            break;
+        }
+        debug_assert!(
+            self.pending.len() < Self::CLOSE.len(),
+            "only a partial tag may be held back"
+        );
+    }
+
+    /// Release whatever is held back, in the mode it was held in. An
+    /// unclosed think block stays thinking — the reply never sees it.
+    fn finish(&mut self, out: &mut Vec<ContentSegment>) {
+        let rest = std::mem::take(&mut self.pending);
+        self.route(rest, out);
+        debug_assert!(self.pending.is_empty(), "finish releases everything");
+    }
+
+    fn route(&mut self, text: String, out: &mut Vec<ContentSegment>) {
+        if self.inside {
+            if !text.is_empty() {
+                out.push(ContentSegment::Thinking(text));
+            }
+            return;
+        }
+        let text = if self.trim_next_text {
+            let trimmed = text.trim_start();
+            if trimmed.is_empty() {
+                return;
+            }
+            self.trim_next_text = false;
+            trimmed.to_string()
+        } else {
+            text
+        };
+        if !text.is_empty() {
+            out.push(ContentSegment::Text(text));
+        }
+    }
+}
+
+/// Length of the longest proper suffix of `text` that is a prefix of `tag`.
+/// `tag` is ASCII, so every prefix slice is a char boundary.
+fn partial_tag_suffix_len(text: &str, tag: &str) -> usize {
+    debug_assert!(tag.is_ascii(), "tags are ASCII so prefix slices are valid");
+    (1..tag.len())
+        .rev()
+        .find(|&k| text.ends_with(&tag[..k]))
+        .unwrap_or(0)
+}
+
 /// Block and stop bookkeeping while translating an Ollama `/api/chat` NDJSON
 /// stream into Anthropic stream events.
 #[derive(Default)]
 struct OllamaStreamState {
+    /// Inline `<think>` routing for `message.content` (see the type).
+    think_splitter: InlineThinkSplitter,
     thinking_block_started: bool,
     saw_stop_sentinel: bool,
     text_block_started: bool,
@@ -5384,16 +5486,7 @@ impl OllamaStreamState {
 
         if let Some(thinking) = obj["message"]["thinking"].as_str()
             && !thinking.is_empty() {
-                if !self.thinking_block_started {
-                    self.thinking_block_started = true;
-                    items.push(Ok(StreamEvent::ContentBlockStart {
-                        index: self.next_block_index,
-                        content_type: "thinking".to_string(),
-                        tool_id: None,
-                        tool_name: None,
-                    }));
-                }
-                items.push(Ok(StreamEvent::ThinkingDelta { index: self.next_block_index, thinking: thinking.to_string() }));
+                self.emit_thinking(thinking, &mut items);
             }
 
         // Stream text content.
@@ -5411,6 +5504,7 @@ impl OllamaStreamState {
             }
 
         if done {
+            self.flush_content(&mut items);
             // Close any remaining open blocks
             if self.thinking_block_started {
                 items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
@@ -5481,24 +5575,83 @@ impl OllamaStreamState {
         } else {
             content
         };
-        if !content.is_empty() {
-            // Close thinking block when transitioning to text
-            if self.thinking_block_started {
-                items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
-                self.thinking_block_started = false;
-                self.next_block_index += 1;
+        let mut segments = Vec::new();
+        self.think_splitter.push(content, &mut segments);
+        self.emit_segments(segments, items);
+    }
+
+    /// Release the splitter's hold-back at the end of the stream.
+    fn flush_content(&mut self, items: &mut Vec<Result<StreamEvent, LlmError>>) {
+        let mut segments = Vec::new();
+        self.think_splitter.finish(&mut segments);
+        self.emit_segments(segments, items);
+    }
+
+    fn emit_segments(
+        &mut self,
+        segments: Vec<ContentSegment>,
+        items: &mut Vec<Result<StreamEvent, LlmError>>,
+    ) {
+        for segment in segments {
+            match segment {
+                ContentSegment::Thinking(thinking) => self.emit_thinking(&thinking, items),
+                ContentSegment::Text(text) => self.emit_text(&text, items),
             }
-            if !self.text_block_started {
-                self.text_block_started = true;
-                items.push(Ok(StreamEvent::ContentBlockStart {
-                    index: self.next_block_index,
-                    content_type: "text".to_string(),
-                    tool_id: None,
-                    tool_name: None,
-                }));
-            }
-            items.push(Ok(StreamEvent::TextDelta { index: self.next_block_index, text: content.to_string() }));
         }
+    }
+
+    /// A thinking delta, opening a thinking block (and closing an open text
+    /// block first — reasoning can resume after reply text) as needed.
+    fn emit_thinking(&mut self, thinking: &str, items: &mut Vec<Result<StreamEvent, LlmError>>) {
+        debug_assert!(!thinking.is_empty(), "empty deltas are never emitted");
+        if self.text_block_started {
+            items.push(Ok(StreamEvent::ContentBlockStop {
+                index: self.next_block_index,
+            }));
+            self.text_block_started = false;
+            self.next_block_index += 1;
+        }
+        if !self.thinking_block_started {
+            self.thinking_block_started = true;
+            items.push(Ok(StreamEvent::ContentBlockStart {
+                index: self.next_block_index,
+                content_type: "thinking".to_string(),
+                tool_id: None,
+                tool_name: None,
+            }));
+        }
+        debug_assert!(!self.text_block_started, "one open block at a time");
+        items.push(Ok(StreamEvent::ThinkingDelta {
+            index: self.next_block_index,
+            thinking: thinking.to_string(),
+        }));
+    }
+
+    /// A text delta, opening a text block (and closing an open thinking block
+    /// first) as needed.
+    fn emit_text(&mut self, text: &str, items: &mut Vec<Result<StreamEvent, LlmError>>) {
+        debug_assert!(!text.is_empty(), "empty deltas are never emitted");
+        if self.thinking_block_started {
+            items.push(Ok(StreamEvent::ContentBlockStop {
+                index: self.next_block_index,
+            }));
+            self.thinking_block_started = false;
+            self.next_block_index += 1;
+        }
+        if !self.text_block_started {
+            self.text_block_started = true;
+            items.push(Ok(StreamEvent::ContentBlockStart {
+                index: self.next_block_index,
+                content_type: "text".to_string(),
+                tool_id: None,
+                tool_name: None,
+            }));
+        }
+        debug_assert!(!self.thinking_block_started, "one open block at a time");
+        items.push(Ok(StreamEvent::TextDelta {
+            index: self.next_block_index,
+            text: text.to_string(),
+        }));
     }
 
     /// Append complete tool-use blocks for a message's `tool_calls`, closing any
@@ -5542,7 +5695,7 @@ impl OllamaStreamState {
     /// line: an unterminated final `done` object or a stop sentinel still close
     /// the turn cleanly; anything else is reported as an aborted generation.
     fn finish(
-        &self,
+        &mut self,
         buffer: &str,
         last_line: Option<&str>,
         bytes_received: usize,
@@ -5556,6 +5709,7 @@ impl OllamaStreamState {
         // a false 502 into the success it actually was.
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(buffer.trim())
             && obj["done"].as_bool().unwrap_or(false) {
+                self.flush_content(&mut items);
                 if self.thinking_block_started || self.text_block_started {
                     items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
                 }
@@ -5574,6 +5728,7 @@ impl OllamaStreamState {
         // finished reply; discarding it cost one run 57 complete responses
         // and ultimately the whole benchmark.
         if self.saw_stop_sentinel {
+            self.flush_content(&mut items);
             if self.thinking_block_started {
                 items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
             }
@@ -7735,6 +7890,117 @@ mod anthropic_model_contract_tests {
 
         let off = serde_json::to_value(ThinkingConfig::Disabled).expect("serializes");
         assert_eq!(off, serde_json::json!({"type": "disabled"}));
+    }
+}
+
+#[cfg(test)]
+mod inline_think_tests {
+    use super::{ContentSegment, InlineThinkSplitter, OllamaStreamState, StreamEvent};
+
+    fn split(fragments: &[&str]) -> Vec<ContentSegment> {
+        let mut splitter = InlineThinkSplitter::default();
+        let mut out = Vec::new();
+        for fragment in fragments {
+            splitter.push(fragment, &mut out);
+        }
+        splitter.finish(&mut out);
+        out
+    }
+
+    /// Concatenate adjacent segments of the same kind — fragmentation is
+    /// an artifact of the stream, not of the routing.
+    fn joined(segments: Vec<ContentSegment>) -> Vec<ContentSegment> {
+        let mut out: Vec<ContentSegment> = Vec::new();
+        for segment in segments {
+            match (out.last_mut(), segment) {
+                (Some(ContentSegment::Text(a)), ContentSegment::Text(b))
+                | (Some(ContentSegment::Thinking(a)), ContentSegment::Thinking(b)) => {
+                    a.push_str(&b);
+                }
+                (_, segment) => out.push(segment),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn text_without_tags_passes_through_unchanged() {
+        assert_eq!(
+            joined(split(&["Hello ", "there, 1 < 2."])),
+            vec![ContentSegment::Text("Hello there, 1 < 2.".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_think_block_split_across_fragments_is_routed_to_thinking() {
+        assert_eq!(
+            joined(split(&[
+                "<thi",
+                "nk>let me ",
+                "think</th",
+                "ink>\n\nHello",
+                " there!"
+            ])),
+            vec![
+                ContentSegment::Thinking("let me think".to_string()),
+                ContentSegment::Text("Hello there!".to_string()),
+            ],
+            "tags split mid-token are still tags, and the separator after one is not reply"
+        );
+    }
+
+    #[test]
+    fn a_held_back_prefix_that_is_not_a_tag_is_released() {
+        assert_eq!(
+            joined(split(&["a <th", "ing> b <"])),
+            vec![ContentSegment::Text("a <thing> b <".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_think_block_never_reaches_the_reply() {
+        assert_eq!(
+            joined(split(&["<think>still going", " and going"])),
+            vec![ContentSegment::Thinking(
+                "still going and going".to_string()
+            )]
+        );
+    }
+
+    /// Through the NDJSON translator: the reply's text deltas carry no tag
+    /// and no reasoning, and the reasoning arrives as thinking.
+    #[test]
+    fn the_stream_translator_separates_inline_reasoning() {
+        let mut state = OllamaStreamState::default();
+        let mut events = Vec::new();
+        for (content, done) in [
+            ("<think>weigh it", false),
+            ("</think>Hi!", false),
+            ("", true),
+        ] {
+            let obj = serde_json::json!({
+                "message": { "role": "assistant", "content": content },
+                "done": done,
+            });
+            let (items, _) = state.on_object(&obj, 0);
+            events.extend(items.into_iter().map(|item| item.expect("no stream error")));
+        }
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let thinking: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ThinkingDelta { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hi!");
+        assert_eq!(thinking, "weigh it");
     }
 }
 

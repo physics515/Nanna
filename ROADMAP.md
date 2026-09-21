@@ -1930,6 +1930,27 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             (unverified-only and mixed ordering) + e2e
             `a_follow_up_turn_is_not_told_an_unchecked_answer_passed_a_check`, which fails when
             every row is rendered as verified.
+      - [x] *(2026-09-21)* **Inline `<think>` reasoning streamed straight into the reply.** A model
+            served without Ollama's thinking separation (no `think: true` — the request only sets it
+            for qwen3/deepseek-r1/qwq names — or an older Ollama) writes `<think>…</think>` in
+            `content`. The non-streaming path already stripped it (`strip_think_tags`); chat streams,
+            and the stream translator passed it through, so the tags and the whole chain of thought
+            became the reply and were replayed to the model on later turns. New
+            `InlineThinkSplitter` in the Ollama NDJSON translator routes it to thinking events,
+            holding back only a possible partial tag across fragment boundaries (bounded by the tag
+            length, released at the next fragment or at end of stream — including the done-in-buffer
+            and stop-sentinel endings), trimming the separator after a closed block, and keeping an
+            unclosed block out of the reply. Block bookkeeping moved into `emit_thinking` /
+            `emit_text`, which also fixes reasoning that resumes *after* reply text reusing the text
+            block's index. 5 unit tests + e2e `inline_reasoning_stays_out_of_the_reply` (reply is
+            exactly the answer; the reasoning is persisted as a `thinking` timeline entry); with the
+            splitter bypassed the e2e fails with the raw `<think>` text as the reply.
+      - [ ] *(found 2026-09-21)* **A reply of only `TASK COMPLETE` becomes an empty message.** The
+            claim marker is stripped at persistence, so a model that answers "hi" with the bare marker
+            closes the item and the user gets a turn with no text at all (the GUI then hides the
+            empty bubble — silence). An empty completion is already reported honestly
+            (`_could not run: empty completion…_`); a claimed completion with nothing said deserves
+            the same, or should not count as a claim for a conversation-shaped item.
             - [ ] **The converging repeat is still streamed.** The user sees the answer twice
                   (paragraph-separated) — down from seven, but the second copy is the signal and
                   cannot be recognized until it has finished streaming. Options: hold back a

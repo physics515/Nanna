@@ -1235,3 +1235,61 @@ async fn a_follow_up_turn_is_not_told_an_unchecked_answer_passed_a_check() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A model that writes its reasoning inline — `<think>…</think>` in the
+/// content, which Ollama passes through when it is not separating thinking —
+/// must not put that reasoning in the user's reply. The non-streaming path
+/// stripped it; chat streams, and the streaming path passed it through.
+#[tokio::test]
+async fn inline_reasoning_stays_out_of_the_reply() {
+    let ollama = ScriptedOllama::start(vec![
+        "<think>The user greets me; greet back.</think>\n\nHello there!\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("inline think".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let reply = converse(&client, &session, "hi").await;
+    assert_eq!(reply.trim(), "Hello there!");
+
+    // Persisted the same way: the reply's content is the reply, and the
+    // reasoning is kept — as a thinking entry in its timeline, where the GUI
+    // renders reasoning, never as reply text.
+    let history = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("sessions.history answers");
+    let reply_message = history["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().find(|m| m["role"] == "assistant"))
+        .unwrap_or_else(|| panic!("the reply is persisted: {history}"));
+    assert_eq!(reply_message["content"], "Hello there!", "{history}");
+    let timeline = reply_message["timeline"].as_array().expect("a timeline");
+    assert!(
+        timeline.iter().any(|item| item["kind"] == "thinking"
+            && item["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("greet back"))),
+        "the reasoning is kept as thinking: {history}"
+    );
+    assert!(
+        !history.to_string().contains("<think>"),
+        "no tag survives anywhere: {history}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
