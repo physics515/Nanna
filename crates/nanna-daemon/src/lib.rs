@@ -53,6 +53,7 @@ pub mod protocol;
 pub mod server;
 pub mod service;
 pub mod session;
+pub mod shutdown;
 pub mod tasks;
 pub mod tool_authoring;
 pub mod vision_service;
@@ -84,6 +85,10 @@ pub use nanna_memory::ActivityClock;
 pub use health::{PidFile, PidFileError, HealthServer, HealthState, DEFAULT_HEALTH_PORT};
 pub use webhook::{WebhookServer, WebhookConfig, WebhookEvent, WebhookMessage, DEFAULT_WEBHOOK_PORT};
 pub use log_buffer::{LogBuffer, LogEntry, LogSource};
+
+/// Lines the daemon's in-memory log buffer holds: the tail `system.logs` serves
+/// to a client (the GUI's Logs page). One value for every daemon entry point.
+pub const LOG_BUFFER_LINES: usize = 5000;
 
 use thiserror::Error;
 

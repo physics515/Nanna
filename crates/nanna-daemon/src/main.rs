@@ -209,8 +209,10 @@ fn main() {
     }
     
     // Setup logging for non-service modes with log buffer for GUI
-    let log_buffer =
-        nanna_daemon::log_buffer::LogBuffer::new(5000, nanna_daemon::log_buffer::LogSource::Daemon);
+    let log_buffer = nanna_daemon::log_buffer::LogBuffer::new(
+        nanna_daemon::LOG_BUFFER_LINES,
+        nanna_daemon::log_buffer::LogSource::Daemon,
+    );
     let log_layer = nanna_daemon::log_buffer::LogBufferLayer::new(log_buffer.clone());
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -301,57 +303,14 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
         }
 
         let mut daemon = builder.build();
-        
-        // Setup signal handlers
-        let shutdown_tx = daemon.shutdown_handle();
-        // Record the signal in the terminal reason file BEFORE requesting the
-        // drain: if the process is killed mid-drain the record says `signal`,
-        // and if the drain completes it is overwritten with `clean_shutdown`.
-        // Either way the file never reads `running` for a signal-initiated
-        // death. (No-op until the daemon arms the file at startup, so a
-        // duplicate instance Ctrl-C'd while losing the PID race cannot
-        // clobber the live daemon's record.)
-        let exit_reason = daemon.exit_reason_handle();
 
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
-            let mut sigint = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
-
-            let shutdown = shutdown_tx.clone();
-            tokio::spawn(async move {
-                let name = tokio::select! {
-                    _ = sigterm.recv() => {
-                        info!("Received SIGTERM");
-                        "SIGTERM"
-                    }
-                    _ = sigint.recv() => {
-                        info!("Received SIGINT");
-                        "SIGINT"
-                    }
-                };
-                exit_reason.record_exit("signal", Some(name));
-                let _ = shutdown.send(());
-            });
-        }
+        nanna_daemon::shutdown::install_signal_handlers(&daemon).map_err(|e| e.to_string())?;
 
         #[cfg(unix)]
         if cli.exit_with_parent {
-            spawn_parent_watch(shutdown_tx.clone(), daemon.exit_reason_handle());
+            spawn_parent_watch(daemon.shutdown_handle(), daemon.exit_reason_handle());
         }
 
-        #[cfg(windows)]
-        {
-            let shutdown = shutdown_tx.clone();
-            tokio::spawn(async move {
-                tokio::signal::ctrl_c().await.ok();
-                info!("Received Ctrl+C");
-                exit_reason.record_exit("signal", Some("ctrl_c"));
-                let _ = shutdown.send(());
-            });
-        }
-        
         daemon.run().await.map_err(|e| e.to_string())
     })
 }

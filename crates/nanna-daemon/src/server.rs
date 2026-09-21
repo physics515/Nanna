@@ -3052,6 +3052,15 @@ pub struct DaemonServer {
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
+    /// The serve loop's end of `shutdown_tx`, subscribed at construction and
+    /// taken by `run()`. A broadcast reaches only the receivers that exist
+    /// when it is sent, and `run()` reaches its serve loop only after the
+    /// whole boot (storage, services, MCP). A loop that subscribed there
+    /// missed any shutdown sent during boot, including a SIGTERM the signal
+    /// handler had already caught, so the daemon neither stopped nor died.
+    /// Held from here, every request made once the server exists is waiting
+    /// when the loop starts.
+    shutdown_rx: Option<broadcast::Receiver<()>>,
     /// PID file (prevents multiple instances)
     pid_file: Option<PidFile>,
     /// Log buffer for capturing daemon logs
@@ -3185,7 +3194,7 @@ impl DaemonServer {
         let sessions = Arc::new(SessionManager::new());
         let ipc = Arc::new(IpcServer::new(config.ipc.clone()));
         let persistence = Arc::new(PersistenceManager::new(&config.data_dir));
-        let (shutdown_tx, _) = broadcast::channel(1);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         // Create PID file if enabled
         let pid_file = if config.servers.pid_file {
@@ -3215,6 +3224,7 @@ impl DaemonServer {
             ipc,
             persistence,
             shutdown_tx,
+            shutdown_rx: Some(shutdown_rx),
             pid_file,
             log_buffer: None,
             storage: None,
@@ -3303,15 +3313,19 @@ impl DaemonServer {
     }
 
     /// Get the shutdown sender (for signaling shutdown)
+    ///
+    /// A send at any point after construction stops the daemon: one made
+    /// before `run()` reaches its serve loop is held until the loop starts,
+    /// and the daemon then drains as soon as it has booted.
     #[must_use]
     pub fn shutdown_handle(&self) -> broadcast::Sender<()> {
         self.shutdown_tx.clone()
     }
 
     /// Handle to the terminal reason file, for exit paths that live outside
-    /// `run()` (the signal / ctrl-c handlers in `main`). Clones share the
-    /// armed flag, so recording stays a no-op until `run()` has claimed the
-    /// file by writing its startup marker.
+    /// `run()` (the signal handlers in [`crate::shutdown`], the binary's
+    /// parent watch). Clones share the armed flag, so recording stays a no-op
+    /// until `run()` has claimed the file by writing its startup marker.
     #[must_use]
     pub fn exit_reason_handle(&self) -> crate::exit_reason::ExitReasonFile {
         self.exit_reason.clone()
@@ -3659,7 +3673,10 @@ impl DaemonServer {
                 crate::DaemonError::Ipc("Request receiver already taken".to_string())
             })?;
 
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut shutdown_rx = self
+            .shutdown_rx
+            .take()
+            .unwrap_or_else(|| self.shutdown_tx.subscribe());
 
         let ipc_handle = self.spawn_ipc_server(ipc_port);
 
@@ -4603,6 +4620,12 @@ impl DaemonServer {
     ) {
         // Cleanup
         info!("Shutting down daemon...");
+        // Re-announce to every task subscribed since the request. One made
+        // during boot (held for the serve loop, see `shutdown_rx`) predates
+        // the stats, MCP and config-watch receivers, which would otherwise
+        // wait out their deadlines below. A task that heard the first one has
+        // stopped listening, and every one of them matches any `recv` result.
+        let _ = self.shutdown_tx.send(());
         self.ipc.shutdown();
 
         // Keep channel_manager alive until the end of run() so the spawned

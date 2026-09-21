@@ -26,7 +26,9 @@ use commands::workspace::handle_workspace_command;
 use nanna_config::Config;
 use nanna_config::bind::LOOPBACK_HOST;
 use nanna_daemon::DEFAULT_IPC_PORT;
+use nanna_daemon::log_buffer::{LogBuffer, LogBufferLayer, LogSource};
 use setup::ensure_api_key;
+use std::path::PathBuf;
 use tracing::{info, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -39,14 +41,20 @@ struct Cli {
 
     /// Config file path
     #[arg(short, long)]
-    config: Option<String>,
+    config: Option<PathBuf>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
     log_level: String,
 
     /// Run in daemon mode (background service)
-    #[arg(long, hide = true)]
+    ///
+    /// Never with `--config`. The daemon reads its config file in several
+    /// places, and each finds it through `NANNA_CONFIG_PATH`, which `nanna
+    /// --config <file> daemon start` sets for the daemon it launches. A
+    /// `--config` here would reach only some of them, and the rest would read
+    /// and save the default file.
+    #[arg(long, hide = true, conflicts_with = "config")]
     daemon_mode: bool,
 
     /// Daemon host
@@ -310,18 +318,25 @@ fn parse_log_level(raw: &str) -> Level {
 /// stdout: ANY log written there corrupts the stream and the client drops the
 /// connection with a parse error. Every other command keeps writing to stdout,
 /// so this is a per-command decision, not a global one.
-fn init_logging(log_level: Level, logs_to_stderr: bool) {
+///
+/// `log_buffer`, when given, also receives every line: the daemon's in-memory
+/// tail, served over `system.logs`.
+fn init_logging(log_level: Level, logs_to_stderr: bool, log_buffer: Option<LogBuffer>) {
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(log_level.into())
         .from_env_lossy();
+    // `None` is a no-op layer.
+    let buffer_layer = log_buffer.map(LogBufferLayer::new);
     if logs_to_stderr {
         tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(buffer_layer)
             .with(filter)
             .init();
     } else {
         tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
+            .with(buffer_layer)
             .with(filter)
             .init();
     }
@@ -347,15 +362,32 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let logs_to_stderr = matches!(cli.command, Some(Commands::Mcp { .. }));
-    init_logging(parse_log_level(&cli.log_level), logs_to_stderr);
+    // A daemon keeps its recent lines in memory for `system.logs` (the GUI's
+    // Logs page), as `nanna-daemon` does. Other commands keep none.
+    let daemon_log_buffer = cli
+        .daemon_mode
+        .then(|| LogBuffer::new(nanna_daemon::LOG_BUFFER_LINES, LogSource::Daemon));
+    init_logging(
+        parse_log_level(&cli.log_level),
+        logs_to_stderr,
+        daemon_log_buffer.clone(),
+    );
 
     // The banner is a log line, so it follows the same writer — it must never
     // land on stdout ahead of the first JSON-RPC response.
     info!("🌙 Nanna v{} rising...", env!("CARGO_PKG_VERSION"));
 
+    // Daemon mode - run background server. The daemon loads its own
+    // configuration, through the builder `nanna-daemon` uses, so it is
+    // dispatched before the CLI loads one.
+    if let Some(log_buffer) = daemon_log_buffer {
+        info!("Starting in daemon mode on {}:{}", cli.host, cli.port);
+        return run_daemon(cli.host, cli.port, log_buffer).await;
+    }
+
     // Load configuration
     let config = if let Some(path) = &cli.config {
-        Config::load_from(&path.into())?
+        Config::load_from(path)?
     } else {
         Config::load().unwrap_or_else(|e| {
             info!("Using default config ({})", e);
@@ -363,12 +395,6 @@ async fn main() -> anyhow::Result<()> {
         })
     }
     .with_env_overrides();
-
-    // Daemon mode - run background server
-    if cli.daemon_mode {
-        info!("Starting in daemon mode on {}:{}", cli.host, cli.port);
-        return run_daemon(&config, cli.host, cli.port).await;
-    }
 
     // Handle commands
     match cli.command {
@@ -409,7 +435,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Daemon { action }) => {
-            handle_daemon_command(action, &config).await?;
+            handle_daemon_command(action, &config, cli.config.as_deref()).await?;
             return Ok(());
         }
         Some(Commands::Mcp { action }) => {
@@ -501,6 +527,38 @@ mod tests {
             .expect("the daemon-mode flag parses");
         assert!(cli.daemon_mode);
         assert!(!Cli::try_parse_from(["nanna"]).expect("bare `nanna` parses").daemon_mode);
+    }
+
+    /// The command line `nanna daemon start` gives its child parses back to
+    /// exactly what was asked for: daemon mode, on the host and port the
+    /// starting command used.
+    #[test]
+    fn the_daemon_command_line_parses_back_to_its_settings() {
+        let args = commands::daemon::daemon_args("127.0.0.2", 6001);
+        let cli = Cli::try_parse_from(std::iter::once("nanna".into()).chain(args))
+            .expect("the daemon command line parses");
+        assert!(cli.daemon_mode);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.config, None);
+        assert_eq!(cli.host, "127.0.0.2");
+        assert_eq!(cli.port, 6001);
+    }
+
+    /// A daemon is never given its config file as `--config`, which only part
+    /// of it would read. `NANNA_CONFIG_PATH` reaches every reader.
+    #[test]
+    fn daemon_mode_refuses_a_config_argument() {
+        let refused = Cli::try_parse_from([
+            "nanna",
+            nanna_daemon::health::DAEMON_MODE_FLAG,
+            "--config",
+            "nanna.toml",
+        ]);
+        assert!(refused.is_err(), "daemon mode accepted --config");
+        assert!(
+            Cli::try_parse_from(["nanna", "--config", "nanna.toml", "daemon", "status"]).is_ok(),
+            "the daemon commands still take --config"
+        );
     }
 
     /// `doctor` stays offline unless asked: the network leg is opt-in.

@@ -13,15 +13,34 @@ use nanna_config::Config;
 use nanna_config::bind::LOOPBACK_HOST;
 use nanna_daemon::DEFAULT_IPC_PORT;
 use nanna_daemon::health::{DAEMON_MODE_FLAG, PidFile, PidFileState, ProcessProbe};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+/// The data directory of the daemon these commands manage: `[general]
+/// data_dir`, else the platform default. It is resolved as the daemon resolves
+/// its own (`DaemonBuilder::from_nanna_config` → [`Config::resolve_data_dir`]),
+/// so `status` and `stop` read the PID file the daemon wrote. These commands
+/// used `Config::default_data_dir`, which ignores `[general] data_dir`, so on
+/// a relocated install they looked at the wrong PID file.
+fn daemon_data_dir(config: &Config) -> anyhow::Result<PathBuf> {
+    Ok(config.resolve_data_dir()?)
+}
+
 /// Handle daemon subcommands
-pub async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> anyhow::Result<()> {
-    let pid_file = PidFile::new(&Config::default_data_dir()?);
+///
+/// `config_path` is the CLI's `--config`: the daemon `start` launches runs on
+/// the same file, so it resolves the same data directory as these commands.
+pub async fn handle_daemon_command(
+    action: DaemonAction,
+    config: &Config,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let data_dir = daemon_data_dir(config)?;
+    let pid_file = PidFile::new(&data_dir);
 
     match action {
         DaemonAction::Start { host, port } => {
@@ -32,7 +51,7 @@ pub async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> an
                 println!("   Run 'nanna daemon stop' to stop it");
                 return Ok(());
             }
-            let (pid, log_file) = spawn_daemon_process(&host, port)?;
+            let (pid, log_file) = spawn_daemon_process(&host, port, &data_dir, config_path)?;
             println!("✅ Daemon started!");
             println!("   PID: {pid}");
             println!("   Address: ws://{host}:{port}/ws");
@@ -59,7 +78,7 @@ pub async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> an
                 println!("⚠️  Daemon is already running (PID {pid})");
                 return Ok(());
             }
-            let (pid, _) = spawn_daemon_process(&host, port)?;
+            let (pid, _) = spawn_daemon_process(&host, port, &data_dir, config_path)?;
             println!("✅ Daemon restarted!");
             println!("   PID: {pid}");
             println!("   Address: ws://{host}:{port}/ws");
@@ -73,14 +92,20 @@ pub async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> an
 ///
 /// The child claims the PID file itself, under the daemon's lock, once it
 /// starts — or is refused if another daemon won the role in the meantime.
-fn spawn_daemon_process(host: &str, port: u16) -> anyhow::Result<(u32, PathBuf)> {
+/// Its output goes to `daemon.log` in `data_dir`, beside the store it opens.
+fn spawn_daemon_process(
+    host: &str,
+    port: u16,
+    data_dir: &Path,
+    config_path: Option<&Path>,
+) -> anyhow::Result<(u32, PathBuf)> {
     use std::fs;
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe()?;
-    let log_dir = Config::default_data_dir()?;
-    fs::create_dir_all(&log_dir)?;
-    let log_file = log_dir.join("daemon.log");
+    fs::create_dir_all(data_dir)?;
+    let log_file = data_dir.join("daemon.log");
+    let config_file = daemon_config_file(config_path)?;
 
     let log_handle = fs::OpenOptions::new()
         .create(true)
@@ -89,30 +114,50 @@ fn spawn_daemon_process(host: &str, port: u16) -> anyhow::Result<(u32, PathBuf)>
 
     info!("Spawning daemon process...");
 
+    let mut command = Command::new(exe);
+    command
+        .args(daemon_args(host, port))
+        .stdout(Stdio::from(log_handle.try_clone()?))
+        .stderr(Stdio::from(log_handle));
+    if let Some(file) = config_file {
+        command.env(Config::CONFIG_PATH_ENV, file);
+    }
+    // CREATE_NO_WINDOW: a console-less background process.
     #[cfg(windows)]
-    let child = Command::new(exe)
-        .arg(DAEMON_MODE_FLAG)
-        .arg("--host")
-        .arg(host)
-        .arg("--port")
-        .arg(port.to_string())
-        .stdout(Stdio::from(log_handle.try_clone()?))
-        .stderr(Stdio::from(log_handle))
-        .creation_flags(0x0800_0000)
-        .spawn()?;
-
-    #[cfg(not(windows))]
-    let child = Command::new(exe)
-        .arg(DAEMON_MODE_FLAG)
-        .arg("--host")
-        .arg(host)
-        .arg("--port")
-        .arg(port.to_string())
-        .stdout(Stdio::from(log_handle.try_clone()?))
-        .stderr(Stdio::from(log_handle))
-        .spawn()?;
+    command.creation_flags(0x0800_0000);
+    let child = command.spawn()?;
 
     Ok((child.id(), log_file))
+}
+
+/// The command line (after the program) of the daemon `start` launches.
+#[must_use]
+pub fn daemon_args(host: &str, port: u16) -> Vec<OsString> {
+    vec![
+        DAEMON_MODE_FLAG.into(),
+        "--host".into(),
+        host.into(),
+        "--port".into(),
+        port.to_string().into(),
+    ]
+}
+
+/// The config file the daemon `start` launches must run on, as its
+/// `NANNA_CONFIG_PATH`: the `--config` file this command read, made absolute
+/// so the daemon reads the same file wherever it resolves relative paths
+/// from. `None` when no file was named: the daemon then inherits this
+/// command's environment and finds the same default file.
+///
+/// Not a `--config` argument. The daemon reads its config file in more than
+/// one place (the builder, and the control plane that serves and saves
+/// Settings), and only the variable reaches all of them.
+///
+/// # Errors
+///
+/// When a relative `config_path` cannot be made absolute (no current
+/// directory).
+fn daemon_config_file(config_path: Option<&Path>) -> std::io::Result<Option<PathBuf>> {
+    config_path.map(std::path::absolute).transpose()
 }
 
 /// Stop the daemon the PID file names — only a process the daemon's own probe
@@ -230,5 +275,53 @@ fn stale_note(state: &PidFileState) -> Option<String> {
         }
         PidFileState::Absent
         | PidFileState::Recorded(_, ProcessProbe::Daemon | ProcessProbe::Unknown) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A relocated install's daemon keeps its PID file under `[general]
+    /// data_dir`. `status` and `stop` must read it there, not in the platform
+    /// default, where they used to look.
+    #[test]
+    fn the_commands_read_the_pid_file_under_the_configured_data_dir() {
+        let relocated = std::env::temp_dir().join("nanna-relocated-install");
+        let mut config = Config::default();
+        config.general.data_dir = Some(relocated.clone());
+
+        let data_dir = daemon_data_dir(&config).expect("a configured data dir resolves");
+        assert_eq!(data_dir, relocated);
+        assert_eq!(
+            PidFile::new(&data_dir).path(),
+            relocated.join("nanna-daemon.pid").as_path()
+        );
+    }
+
+    /// `nanna --config <file> daemon start` runs the daemon on that same
+    /// file, made absolute, so the daemon resolves the data dir the commands
+    /// did. Without `--config` the daemon is given nothing and finds the
+    /// default file.
+    #[test]
+    fn the_daemon_is_started_on_the_config_file_the_command_read() {
+        assert_eq!(daemon_config_file(None).unwrap(), None);
+
+        let relative = Path::new("configs").join("nanna.toml");
+        let file = daemon_config_file(Some(&relative))
+            .unwrap()
+            .expect("a named file is passed on");
+        assert!(file.is_absolute(), "{file:?}");
+        assert_eq!(file, std::env::current_dir().unwrap().join(&relative));
+    }
+
+    /// Daemon mode, host and port: the probe identifies the daemon by the
+    /// first, and `start` reports the other two as its address.
+    #[test]
+    fn the_daemon_is_started_in_daemon_mode_on_the_requested_address() {
+        assert_eq!(
+            daemon_args("127.0.0.1", 5149),
+            ["--daemon-mode", "--host", "127.0.0.1", "--port", "5149"]
+        );
     }
 }
