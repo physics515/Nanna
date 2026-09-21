@@ -3176,29 +3176,55 @@ fn clamp_display(text: &str, max: usize) -> String {
 /// self-terminated run CONTINUE the mission instead of restarting it: the
 /// verdicts name the commands that passed and when, i.e. the artifact state
 /// the environment last confirmed.
+///
+/// Verified and unverified completions are rendered under separate headers.
+/// An unverified item closed on the model's own word (`TASK COMPLETE`, or an
+/// answer that converged) with no check run at all, so listing it under
+/// "done-condition PASSING — do not redo or re-assess" told the planner a
+/// check had confirmed something no check ever looked at — and told it not
+/// to revisit exactly the work a follow-up like "that's wrong" is about.
 fn established_work_context(rows: &[EstablishedRow]) -> Option<String> {
+    let (verified, unverified): (Vec<&EstablishedRow>, Vec<&EstablishedRow>) =
+        rows.iter().partition(|row| row.verdict.is_some());
+    debug_assert_eq!(verified.len() + unverified.len(), rows.len());
     if rows.is_empty() {
         return None;
     }
-    let mut out = String::from(
-        "## Verified done in earlier work this session\n\
-         These closed with their done-condition PASSING (the verdict shows what the \
-         environment confirmed, and when). Do not redo or re-assess them — continue \
-         from this state:\n",
-    );
-    for row in rows {
-        let title = &row.title;
-        let when = &row.when;
-        match &row.verdict {
-            Some(v) => {
-                let _ = writeln!(out, "- #{} {title} — verified {when}: {v}", row.id);
-            }
-            // Unverified completions are still state, marked as such.
-            None => {
-                let _ = writeln!(out, "- #{} {title} — closed {when} (unverified)", row.id);
-            }
+    let mut out = String::new();
+    if !verified.is_empty() {
+        out.push_str(
+            "## Verified done in earlier work this session\n\
+             These closed with their done-condition PASSING (the verdict shows what the \
+             environment confirmed, and when). Do not redo or re-assess them — continue \
+             from this state:\n",
+        );
+        for row in &verified {
+            let verdict = row.verdict.as_deref().unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "- #{} {} — verified {}: {verdict}",
+                row.id, row.title, row.when
+            );
         }
     }
+    if !unverified.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(
+            "## Closed earlier on the model's own word (no check ran)\n\
+             Nothing verified these; they are what was said, not what was confirmed. \
+             Build on them, but re-assess one if the request questions it:\n",
+        );
+        for row in &unverified {
+            let _ = writeln!(
+                out,
+                "- #{} {} — closed {} (unverified)",
+                row.id, row.title, row.when
+            );
+        }
+    }
+    debug_assert!(!out.is_empty(), "a non-empty row set always renders");
     Some(out)
 }
 
@@ -4592,6 +4618,55 @@ mod tests {
             "the verdict IS the artifact state: {block}"
         );
         assert!(!block.contains("Implement DEL"), "open work stays out: {block}");
+    }
+
+    fn row(id: i64, title: &str, verdict: Option<&str>) -> EstablishedRow {
+        EstablishedRow {
+            id,
+            title: title.to_string(),
+            verdict: verdict.map(str::to_string),
+            when: "2026-09-21T11:10:44Z".to_string(),
+            acceptance: None,
+        }
+    }
+
+    /// An item closed on the model's word was listed under "done-condition
+    /// PASSING — do not redo or re-assess", which no check had confirmed.
+    #[test]
+    fn unverified_completions_are_not_presented_as_passing_checks() {
+        let only_unverified = established_work_context(&[row(1, "Answer the question", None)])
+            .expect("a closed item renders");
+        assert!(!only_unverified.contains("PASSING"), "{only_unverified}");
+        assert!(
+            !only_unverified.contains("Do not redo"),
+            "{only_unverified}"
+        );
+        assert!(
+            only_unverified.contains("no check ran"),
+            "{only_unverified}"
+        );
+        assert!(
+            only_unverified.contains("#1 Answer the question"),
+            "{only_unverified}"
+        );
+
+        let mixed = established_work_context(&[
+            row(2, "Implement SET", Some("`sh test.sh` exited 0")),
+            row(1, "Answer the question", None),
+        ])
+        .expect("closed items render");
+        let passing = mixed.find("PASSING").expect("the verified section is kept");
+        let unchecked = mixed
+            .find("no check ran")
+            .expect("the unverified section is kept");
+        let set = mixed.find("#2 Implement SET").expect("verified row");
+        let answer = mixed
+            .find("#1 Answer the question")
+            .expect("unverified row");
+        assert!(
+            passing < set && set < unchecked && unchecked < answer,
+            "{mixed}"
+        );
     }
 
     #[test]

@@ -1155,3 +1155,83 @@ async fn a_model_that_never_claims_completion_still_finishes_the_turn() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// Send `text` on `session` and wait for that turn's `message_end`.
+///
+/// Subscribes before sending: a broadcast only carries what is sent after it.
+async fn converse(client: &Client, session: &str, text: &str) -> String {
+    let mut events = client.subscribe_session(session.to_string());
+    let ack = client
+        .chat()
+        .send(session, text)
+        .await
+        .expect("chat.send is accepted");
+    let message_id = ack["message_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the ack names the turn's message: {ack}"))
+        .to_string();
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::MessageEnd {
+                    message_id: id,
+                    content,
+                    ..
+                }) if id == message_id => {
+                    return content;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("the session's event stream ended before the turn did: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the turn ends before the hang ceiling")
+}
+
+/// A follow-up turn's planner is told what earlier turns closed — and an
+/// answer that closed on the model's word (no check ran) must not be
+/// presented as a passing done-condition it is told not to re-assess. That
+/// is exactly the item a follow-up like "that's wrong" is about.
+#[tokio::test]
+async fn a_follow_up_turn_is_not_told_an_unchecked_answer_passed_a_check() {
+    let ollama = ScriptedOllama::start(vec![
+        "Paris is the capital of France.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("follow-up".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    converse(&client, &session, "What is the capital of France?").await;
+    converse(&client, &session, "Are you sure?").await;
+
+    let bodies = ollama.chat_bodies.lock().await.clone();
+    let follow_up_plan = bodies
+        .iter()
+        .filter(|body| body.contains(PLANNER_PROMPT_OPENING))
+        .nth(1)
+        .expect("the second turn was planned");
+    assert!(
+        follow_up_plan.contains("no check ran"),
+        "the earlier answer is listed as unverified"
+    );
+    assert!(
+        !follow_up_plan.contains("PASSING"),
+        "nothing in this session passed a check, so nothing may be presented as one"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

@@ -1917,6 +1917,19 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             both negatives, + e2e `a_model_that_never_claims_completion_still_finishes_the_turn`
             (2 steps, no "could not finish"; fails with the full 7-copy transcript when the rule is
             disabled).
+      - [x] *(2026-09-21)* **A follow-up turn was told an unchecked answer had passed a check.**
+            The turn-start "established work" block the planner reads put every closed item under
+            *"done-condition PASSING … Do not redo or re-assess them"* — including items that closed
+            on the model's own word with no check at all (each line then said `(unverified)`,
+            contradicting its own header). Found by probing a two-turn conversation through the real
+            daemon. That is precisely the item a follow-up like "are you sure?" or "that's wrong" is
+            about, and the planner was instructed not to revisit it. Now two headers:
+            verified rows keep theirs; unverified rows go under *"Closed earlier on the model's own
+            word (no check ran) … re-assess one if the request questions it"*.
+            `artifact_state_block` already filtered to verified rows and is unchanged. Unit test
+            (unverified-only and mixed ordering) + e2e
+            `a_follow_up_turn_is_not_told_an_unchecked_answer_passed_a_check`, which fails when
+            every row is rendered as verified.
             - [ ] **The converging repeat is still streamed.** The user sees the answer twice
                   (paragraph-separated) — down from seven, but the second copy is the signal and
                   cannot be recognized until it has finished streaming. Options: hold back a
