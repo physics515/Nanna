@@ -2189,3 +2189,84 @@ async fn re_sending_a_stopped_request_adopts_its_open_item() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// An attached image reaches the model with the question; an attachment it
+/// cannot read is named in the request so the model can say so. The harness
+/// path used to drop every attachment with only a daemon-log warning — "what
+/// is in this picture?" arrived as the bare question.
+#[tokio::test]
+async fn an_attached_image_reaches_the_model_and_an_unreadable_file_is_named() {
+    // A valid 1x1 PNG: the loop resizes images for the model, so it must decode.
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let ollama = ScriptedOllama::start(vec!["A single pixel.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("attachments".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+    let ack = client
+        .request(nanna_client::Action::Chat(nanna_client::ChatAction::Send {
+            session_id: session.clone(),
+            content: "What is in this picture?".to_string(),
+            attachments: vec![
+                nanna_client::Attachment {
+                    filename: "pixel.png".to_string(),
+                    content_type: "image/png".to_string(),
+                    data: PNG.to_string(),
+                },
+                nanna_client::Attachment {
+                    filename: "report.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    data: "JVBERi0xLjQK".to_string(),
+                },
+            ],
+        }))
+        .await
+        .expect("chat.send is accepted");
+    let turn = ack["message_id"].as_str().unwrap_or_default().to_string();
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            if let Ok(nanna_client::Event::MessageEnd { message_id, .. }) = events.recv().await
+                && message_id == turn
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the turn ends");
+
+    let bodies = ollama.chat_bodies.lock().await.clone();
+    let step = bodies
+        .iter()
+        .find(|body| !body.contains(PLANNER_PROMPT_OPENING))
+        .expect("a step reached the model");
+    let request: serde_json::Value = serde_json::from_str(step).expect("json");
+    let images: Vec<&str> = request["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["images"].as_array())
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(images.len(), 1, "the image rides the step: {images:?}");
+    assert!(
+        step.contains("report.pdf (application/pdf)") && step.contains("cannot be read"),
+        "the unreadable file is named for the model"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

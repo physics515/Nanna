@@ -5692,9 +5692,23 @@ gaps, all fixed same-day:
 **Open:** interjection still has no live end-to-end pass (the machinery is now reachable; needs a
 mid-run send observed landing at a boundary); `PENDING_MESSAGES_MAX` overflow drops the oldest
 silently — it should announce itself per the summaries-must-announce-themselves rule; Stop is
-boundary-granular — an in-flight step runs to completion before the run stops; **attachments** are not
-carried into harness steps (the retired direct path passed images through; the harness path warns and
-drops them — needs plumbing into `StepRunner`).
+boundary-granular — an in-flight step runs to completion before the run stops *(stale as of 2026-09-21:
+`stop_ends_an_in_flight_turn_and_the_session_carries_on` cancels an in-flight model call in ~0.6 s)*;
+~~**attachments** are not carried into harness steps~~ **(done 2026-09-21, see below)**.
+- [x] *(2026-09-21)* **Attachments reach the model again — and the Ollama/OpenAI wires carry images at all.**
+      Two layers were broken. (1) `chat.send` warned in the daemon log and dropped every attachment, so
+      "what is in this picture?" reached the model as the bare question. Images (inline base64,
+      `image/*`) now ride **every step** of the turn (`AgentStepRunner::attachments` — each step starts
+      from a fresh context, so a later step working on the image needs it too; the planner gets none);
+      anything else (a PDF, a URL) is named in the turn's goal — *"The user attached a file that cannot be
+      read in this chat … report.pdf (application/pdf)"* — so the model can say so. (2) Underneath that,
+      the shared OpenAI/Ollama wire conversion had a catch-all that silently discarded `Image` blocks:
+      images had never reached an Ollama or OpenAI-compatible model on this path, only Anthropic's native
+      wire. Now Ollama gets `images: [base64]` (a URL image is named in the text — Ollama takes none) and
+      OpenAI-compatible gets text-then-`image_url` content parts. Unit tests (`split_attachments` via the
+      e2e, three wire tests) + e2e `an_attached_image_reaches_the_model_and_an_unreadable_file_is_named`.
+      Not carried: images on a message admitted into a run already in flight (it joins as text; logged).
+      Not verified against a real vision model — none on this host.
 
 ---
 

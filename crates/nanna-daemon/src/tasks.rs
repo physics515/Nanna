@@ -1626,6 +1626,54 @@ pub struct AgentStepRunner {
     /// provider plumbing. Each pending transition reaches the model once, in
     /// the next tool result — see [`nanna_agent::DegradationLedger`].
     pub degradations: Option<Arc<nanna_agent::DegradationLedger>>,
+    /// Images the user attached to the message this run answers, as
+    /// `(base64_data, media_type)`. Sent with EVERY step: each step starts
+    /// from a fresh context, so a later step working on the image would
+    /// otherwise not see it. Empty for runs no message started.
+    pub attachments: Arc<Vec<(String, String)>>,
+}
+
+/// Split a message's attachments into the images a step can send to the
+/// model, `(base64_data, media_type)`, and a note naming the ones it cannot.
+///
+/// The harness path used to warn in the daemon log and DROP every attachment
+/// — an image sent with "what is in this picture?" reached the model as the
+/// bare question. Images (inline base64 of an `image/*` type) now ride each
+/// step; anything else — a PDF, a URL, a text file — is named in the note so
+/// the model can say it could not read it, rather than answering as if
+/// nothing had been attached.
+#[must_use]
+pub fn split_attachments(
+    attachments: &[crate::protocol::Attachment],
+) -> (Vec<(String, String)>, Option<String>) {
+    let mut images = Vec::new();
+    let mut unreadable = Vec::new();
+    for attachment in attachments {
+        let inline =
+            !attachment.data.starts_with("http://") && !attachment.data.starts_with("https://");
+        if attachment.content_type.starts_with("image/") && inline {
+            images.push((attachment.data.clone(), attachment.content_type.clone()));
+        } else {
+            unreadable.push(format!(
+                "{} ({})",
+                attachment.filename, attachment.content_type
+            ));
+        }
+    }
+    debug_assert_eq!(images.len() + unreadable.len(), attachments.len());
+    let note = (!unreadable.is_empty()).then(|| {
+        format!(
+            "[The user attached {} that cannot be read in this chat — only inline images \
+             can: {}. Say so if the request depends on it.]",
+            if unreadable.len() == 1 {
+                "a file"
+            } else {
+                "files"
+            },
+            unreadable.join(", ")
+        )
+    });
+    (images, note)
 }
 
 /// Streams a harness step into a chat session using the *existing* chat event
@@ -3306,6 +3354,7 @@ impl AgentStepRunner {
             // 2026-08-02, session 05775d1d: 22 steps, 79 identical
             // `explore {}` calls, 3 short-circuits).
             repeat_ledger: Some(Arc::clone(&self.repeat_ledger)),
+            attachments: self.attachments.as_ref().clone(),
             initial_active_tools: active,
             tool_activation: nanna_agent::ToolActivation {
                 restrict_to_active_tools: restrict_to_active,

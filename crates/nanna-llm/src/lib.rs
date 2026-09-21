@@ -6180,14 +6180,23 @@ const ERROR_PREFIX: &str = "Error: ";
 
 /// Append the wire messages for an Anthropic user message: its text blocks as
 /// one user message, then each tool result as its own `tool` message.
-fn push_wire_user_messages(messages: &mut Vec<serde_json::Value>, msg: &AnthropicMessage) {
-    // User messages: may contain text and/or tool_result blocks
+fn push_wire_user_messages(
+    messages: &mut Vec<serde_json::Value>,
+    msg: &AnthropicMessage,
+    wire: ToolArgsWire,
+) {
+    // User messages: may contain text, images and/or tool_result blocks
     let mut text_parts = Vec::new();
+    let mut images: Vec<&ImageSource> = Vec::new();
     let mut tool_results = Vec::new();
 
     for block in &msg.content {
         match block {
             ContentBlock::Text { text } => text_parts.push(text.clone()),
+            // Images used to fall into the catch-all below and vanish: an
+            // image the user attached never reached an Ollama or
+            // OpenAI-compatible model, only Anthropic's native wire.
+            ContentBlock::Image { source } => images.push(source),
             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
                 tool_results.push(serde_json::json!({
                     "role": "tool",
@@ -6199,15 +6208,62 @@ fn push_wire_user_messages(messages: &mut Vec<serde_json::Value>, msg: &Anthropi
         }
     }
 
-    // Emit text parts as a user message
-    if !text_parts.is_empty() {
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": text_parts.join("\n"),
-        }));
+    // Emit text (and any images) as a user message
+    if !text_parts.is_empty() || !images.is_empty() {
+        messages.push(wire_user_message(&text_parts.join("\n"), &images, wire));
     }
     // Emit tool results as separate "tool" role messages
     messages.extend(tool_results);
+}
+
+/// A user message with images in the wire's own shape.
+///
+/// - Ollama: `images` is a list of bare base64 strings beside `content`. It
+///   takes no URLs, so a URL image is named in the text instead of sent.
+/// - OpenAI-compatible: `content` becomes a list of parts, text first, each
+///   image an `image_url` (a `data:` URL for inline base64).
+fn wire_user_message(text: &str, images: &[&ImageSource], wire: ToolArgsWire) -> serde_json::Value {
+    if images.is_empty() {
+        return serde_json::json!({ "role": "user", "content": text });
+    }
+    match wire {
+        ToolArgsWire::JsonObject => {
+            let mut content = text.to_string();
+            let mut inline: Vec<&str> = Vec::new();
+            for image in images {
+                match image {
+                    ImageSource::Base64 { data, .. } => inline.push(data),
+                    ImageSource::Url { url } => {
+                        use std::fmt::Write as _;
+                        let _ = write!(
+                            content,
+                            "\n[image at {url} — not sent: this model takes inline images only]"
+                        );
+                    }
+                }
+            }
+            debug_assert!(inline.len() <= images.len());
+            serde_json::json!({ "role": "user", "content": content, "images": inline })
+        }
+        ToolArgsWire::JsonString => {
+            let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
+            parts.extend(images.iter().map(|image| {
+                let url = match image {
+                    ImageSource::Base64 { media_type, data } => {
+                        format!("data:{media_type};base64,{data}")
+                    }
+                    ImageSource::Url { url } => url.clone(),
+                };
+                serde_json::json!({ "type": "image_url", "image_url": { "url": url } })
+            }));
+            debug_assert_eq!(
+                parts.len(),
+                images.len() + 1,
+                "text first, then one part per image"
+            );
+            serde_json::json!({ "role": "user", "content": parts })
+        }
+    }
 }
 
 /// The wire message for an Anthropic assistant message: its text blocks joined
@@ -6285,7 +6341,7 @@ fn anthropic_to_wire_request(
     for msg in &request.messages {
         let role = msg.role.as_str();
         match role {
-            "user" => push_wire_user_messages(&mut messages, msg),
+            "user" => push_wire_user_messages(&mut messages, msg, args_wire),
             "assistant" => messages.push(wire_assistant_message(msg, args_wire)),
             _ => {}
         }
@@ -8022,6 +8078,60 @@ mod utf8_stream_decoder_tests {
         assert!(
             decoder.push(b"x").is_err(),
             "a sequence broken by an ASCII byte is invalid, not incomplete"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wire_image_tests {
+    use super::{ImageSource, ToolArgsWire, wire_user_message};
+
+    fn png() -> ImageSource {
+        ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "AAAA".to_string(),
+        }
+    }
+
+    #[test]
+    fn ollama_gets_bare_base64_beside_the_text() {
+        let message = wire_user_message("look", &[&png()], ToolArgsWire::JsonObject);
+        assert_eq!(message["content"], "look");
+        assert_eq!(message["images"], serde_json::json!(["AAAA"]));
+        let url = ImageSource::Url {
+            url: "https://x/y.png".to_string(),
+        };
+        let with_url = wire_user_message("look", &[&url], ToolArgsWire::JsonObject);
+        assert_eq!(
+            with_url["images"],
+            serde_json::json!([]),
+            "Ollama takes no URLs"
+        );
+        assert!(
+            with_url["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("https://x/y.png")),
+            "a URL image is named, not silently dropped: {with_url}"
+        );
+    }
+
+    #[test]
+    fn openai_gets_text_then_image_parts() {
+        let message = wire_user_message("look", &[&png()], ToolArgsWire::JsonString);
+        let parts = message["content"].as_array().expect("content parts");
+        assert_eq!(
+            parts[0],
+            serde_json::json!({ "type": "text", "text": "look" })
+        );
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn a_message_without_images_is_unchanged() {
+        let message = wire_user_message("hi", &[], ToolArgsWire::JsonString);
+        assert_eq!(
+            message,
+            serde_json::json!({ "role": "user", "content": "hi" })
         );
     }
 }

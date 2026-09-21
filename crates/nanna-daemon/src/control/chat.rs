@@ -57,15 +57,12 @@ impl ControlPlane {
                     });
                 }
 
-                // Attachments are not carried into harness steps yet (open
-                // P19 item, see ROADMAP) — warn so the gap is visible in the
-                // logs instead of silently dropping user input.
-                if !attachments.is_empty() {
-                    warn!(
-                        count = attachments.len(),
-                        "attachments are not yet supported by long-horizon chat — ignored"
-                    );
-                }
+                // Images ride every step of the turn; anything the model
+                // cannot read is named in the goal so it can say so, instead
+                // of being dropped with only a daemon-log warning (P19).
+                let (images, unreadable) = crate::tasks::split_attachments(&attachments);
+                let goal = unreadable
+                    .map_or_else(|| content.clone(), |note| format!("{content}\n\n{note}"));
 
                 // ── Long-horizon chat (P19): the only path ──
                 // Every turn is a harness run: the message is planned, the
@@ -78,7 +75,7 @@ impl ControlPlane {
                 // memory writes, planning — runs inside the spawned turn
                 // (`prepare_chat_turn`), so this response is a genuine
                 // DELIVERY ack in milliseconds, not a progress report.
-                match self.run_chat_turn(&session_id, &content).await {
+                match self.run_chat_turn_with(&session_id, &goal, images).await {
                     // The run proceeds in a spawned task; ACK immediately so
                     // the IPC request never outlives the client's patience —
                     // a run can last hours, and the transcript is driven by

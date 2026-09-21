@@ -445,6 +445,20 @@ impl ControlPlane {
         session_id: &str,
         content: &str,
     ) -> Result<Option<String>, String> {
+        self.run_chat_turn_with(session_id, content, Vec::new())
+            .await
+    }
+
+    /// [`Self::run_chat_turn`] for a message that carried images, as
+    /// `(base64_data, media_type)` — every step of the turn sends them.
+    /// A message admitted into a run already in flight joins that run's
+    /// plan as text: its images are not carried (logged).
+    pub(crate) async fn run_chat_turn_with(
+        self: &Arc<Self>,
+        session_id: &str,
+        content: &str,
+        attachments: Vec<(String, String)>,
+    ) -> Result<Option<String>, String> {
         let (Some(agent), Some(router), Some(tools), Some(storage), Some(event_tx)) = (
             self.agent.clone(),
             self.router.clone(),
@@ -461,6 +475,7 @@ impl ControlPlane {
         // A live run owns this session: the message joins it at the next step
         // boundary rather than starting a competing run.
         if !registry.try_claim(session_id).await {
+            warn_uncarried_images(session_id, attachments.len());
             let depth = pending.push(content.to_string()).await;
             tracing::info!(
                 session_id,
@@ -589,6 +604,7 @@ impl ControlPlane {
             turn_baselines,
             session_id: session_id.to_string(),
             content: content.to_string(),
+            attachments: Arc::new(attachments),
             message_id: message_id.clone(),
             resumed_from_park,
             scope: "session".to_string(),
@@ -643,6 +659,18 @@ impl ControlPlane {
     }
 }
 
+/// A message admitted into a run already in flight joins its plan as text;
+/// any images it carried are not carried along. Say so in the log.
+fn warn_uncarried_images(session_id: &str, count: usize) {
+    if count > 0 {
+        tracing::warn!(
+            session_id,
+            count,
+            "images sent into a run already in flight are not carried — only the text joins it"
+        );
+    }
+}
+
 /// One chat turn: the handles its spawned task owns, and its identity.
 struct ChatTurn {
     this: Arc<ControlPlane>,
@@ -668,6 +696,9 @@ struct ChatTurn {
     turn_baselines: Option<Arc<crate::tasks::TurnBaselines>>,
     session_id: String,
     content: String,
+    /// Images the message carried, `(base64_data, media_type)`; every step
+    /// of the turn sends them (see `AgentStepRunner::attachments`).
+    attachments: Arc<Vec<(String, String)>>,
     message_id: String,
     /// Zero for an ordinary turn; carried forward when a park waiter
     /// started this one, so repeated provider outages spend a single
@@ -881,6 +912,7 @@ impl ChatTurn {
             // Capability transitions reach the model once, in the
             // next tool result (P22 Tier 4).
             degradations: self.this.degradations.clone(),
+            attachments: Arc::clone(&self.attachments),
         };
         // The planner shares the step runner's provider handling
         // but must not stream its JSON into the transcript —
@@ -2332,6 +2364,9 @@ fn planner_runner_for(step_runner: &AgentStepRunner) -> AgentStepRunner {
         gpu_fault_count: step_runner.gpu_fault_count.clone(),
         repeat_ledger: Arc::clone(&step_runner.repeat_ledger),
         degradations: step_runner.degradations.clone(),
+        // The planner answers in JSON about the request's text; the images
+        // are for the steps that do the work.
+        attachments: Arc::default(),
     }
 }
 
@@ -3744,6 +3779,7 @@ fn fresh_step_runner(previous: &AgentStepRunner) -> AgentStepRunner {
         workspace_id: previous.workspace_id.clone(),
         gpu_fault_count: previous.gpu_fault_count.clone(),
         degradations: previous.degradations.clone(),
+        attachments: Arc::clone(&previous.attachments),
     }
 }
 
