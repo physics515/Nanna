@@ -432,6 +432,45 @@ async fn sessions_persist_across_a_daemon_restart() {
     restarted.stop();
 }
 
+/// A user tool is kept in the data dir the daemon was started on — the same
+/// `DaemonConfig::data_dir` that `--data-dir` and `[general] data_dir` set, and
+/// that holds the store. The control plane used to pick its own from the
+/// platform default, which knows neither, so an isolated or relocated daemon
+/// kept its user tools beside some other install's store (observed 2026-09-21:
+/// a scratch daemon created `$XDG_DATA_HOME/nanna/user_tools`).
+#[tokio::test]
+async fn a_user_tool_is_kept_in_the_daemons_own_data_dir() {
+    const NAME: &str = "e2e_data_dir_probe";
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let tools_dir = data_dir.path().join("user_tools");
+    let daemon = TestDaemon::start(data_dir).await;
+    let client = daemon.connect_client().await;
+
+    let create = nanna_client::ToolAction::Create {
+        name: NAME.to_string(),
+        description: "probe".to_string(),
+        code: format!(
+            "export default {{ name: \"{NAME}\", description: \"probe\", \
+             execute() {{ return \"ok\"; }} }}"
+        ),
+        needs_shell: None,
+    };
+    let created = client
+        .request(nanna_client::Action::Tool(create))
+        .await
+        .expect("tool.create answers");
+    assert_eq!(created["status"], "created", "{created}");
+    let written = tools_dir.join(format!("{NAME}.json"));
+    assert!(
+        written.is_file(),
+        "the tool is written to {}, under the daemon's data dir",
+        written.display()
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
 /// P8 "Client API completeness": a job added through the typed scheduler wrapper is
 /// the one the daemon lists, fetches and removes.
 #[tokio::test]
