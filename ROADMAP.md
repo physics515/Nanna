@@ -2036,6 +2036,14 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             - [ ] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
                   for the same per-chunk decode once #344 merges (it is not on master, so it could
                   not be fixed here).
+      - [x] *(2026-09-21)* **The e2e suite now gates PRs: `.github/workflows/e2e.yml`.** CI compiled
+            the test suite (`test-compile.yml`, `--no-run`) but ran almost none of it — only three
+            budget-gate subsets — so the conversation path was exercised by nightly runs alone. The new
+            job runs `cargo test -p nanna-client --test e2e_daemon --locked` on Ubuntu for PRs touching
+            Rust, pushes to master, and on demand. Verified hermetic locally with no D-Bus session and an
+            empty HOME (34/34). It reads its toolchain from `rust-toolchain.toml`
+            (`rustup toolchain install`, no argument) instead of duplicating the pin, so a pin move
+            cannot strand it. Not yet run on GitHub — first run is this PR.
       - [x] *(2026-09-21)* **Overlapping turns in two sessions pinned.** e2e
             `overlapping_turns_in_two_sessions_stay_apart`: both turns in flight at once, each reply
             answers its own question and lands only in its own history (the shape behind the
