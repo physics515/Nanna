@@ -1997,6 +1997,12 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             (`take_sse_event`; the delimiter is ASCII, so a complete event is whole characters).
             Tests: every split point of a multibyte string (decoder and SSE splitter), invalid
             bytes still rejected, e2e `a_long_multibyte_reply_survives_chunk_boundaries`.
+            - [x] *(2026-09-21, same class)* **Signal and WhatsApp inbound messages were corrupted, not
+                  dropped:** both listeners decoded each SSE chunk with `from_utf8_lossy`, so a
+                  message whose emoji or accented letter a chunk boundary split reached the agent
+                  as `��`. Both now frame raw bytes first (`listeners::sse::take_event`, shared) and
+                  decode one complete event at a time; tests over every split point. Not
+                  live-verified — no Signal/WhatsApp bridge on this host.
             - [ ] **PR #344's new `nanna-mcp/src/sse_legacy.rs` reads `bytes_stream()` too** — check it
                   for the same per-chunk decode once #344 merges (it is not on master, so it could
                   not be fixed here).

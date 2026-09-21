@@ -271,7 +271,8 @@ impl SignalListener {
 
             // Read SSE stream
             let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
+            // Raw bytes, framed before decoding — see `sse::take_event`.
+            let mut buffer: Vec<u8> = Vec::new();
 
             loop {
                 tokio::select! {
@@ -282,12 +283,8 @@ impl SignalListener {
                     chunk = stream.next() => {
                         match chunk {
                             Some(Ok(bytes)) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                
-                                // Process complete SSE events
-                                while let Some(pos) = buffer.find("\n\n") {
-                                    let event = buffer[..pos].to_string();
-                                    buffer = buffer[pos + 2..].to_string();
+                                buffer.extend_from_slice(&bytes);
+                                while let Some(event) = super::sse::take_event(&mut buffer) {
                                     
                                     // Parse SSE event
                                     if let Some(data) = event.strip_prefix("data: ")
