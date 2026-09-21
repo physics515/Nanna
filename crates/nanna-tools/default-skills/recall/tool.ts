@@ -1,7 +1,7 @@
 export default {
   name: "recall",
   requires: ["memory.search", "memory.get"],
-  version: "0.1.0",
+  version: "0.1.1",
   description: "Read long-term memory. Two modes: pass a HANDLE (the id printed in a [memory:xxxxxxxx ...] stub) to fetch that exact stored result back, with optional offset/limit to page through a large one; or pass a search query to find memories ranked by relevance. Tool results too large for context are stored whole and replaced by a handle stub — this is how you get the full text back.",
   output: "context",
   parameters: {
@@ -52,8 +52,10 @@ export default {
         page_chars: input.page_chars
       });
     } catch (e) {
-      // Embedding model not configured — return gracefully instead of erroring
-      return "Memory search unavailable (no embedding model configured). Continuing without memory context.";
+      // The service says why (it has already tried a keyword match when
+      // semantic search could not run); pass that through rather than guess.
+      var why = "" + (e && e.message ? e.message : e);
+      return "Memory search found nothing: " + why + ". Continuing without memory context.";
     }
 
     if (!results || results.length === 0) {
@@ -78,6 +80,12 @@ export default {
       lines.push((i + 1) + ". [" + r.id + "]" + score + "\n   " + r.content + more);
     }
 
-    return "Found " + results.length + " memories:\n\n" + lines.join("\n\n");
+    // Keyword results come from the fallback used when semantic search cannot
+    // run: they matched WORDS, so a memory phrased differently can still exist.
+    var byKeyword = results.some(function(r) { return r.match === "keyword"; });
+    var header = byKeyword
+      ? "Found " + results.length + " memories by keyword match (semantic search is unavailable right now, so these share words with the query, not necessarily meaning; relevance = share of query words present):"
+      : "Found " + results.length + " memories:";
+    return header + "\n\n" + lines.join("\n\n");
   }
 }

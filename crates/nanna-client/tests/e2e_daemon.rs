@@ -1713,3 +1713,61 @@ async fn a_reminder_set_in_chat_survives_a_restart_and_is_delivered() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// Memory with no embedder answering — this repo's own dev host, and any
+/// install without an embedding provider. `remember` stores the memory whole
+/// and says embeddings are degraded; `recall` used to answer "No memories
+/// found matching" about it seconds later, because the search service turned
+/// "cannot embed the query" into an empty list. It now falls back to a
+/// keyword match and says that is what it did.
+#[tokio::test]
+async fn recall_without_an_embedder_finds_a_memory_by_keyword() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"CALL remember {"content":"The user's cat is named Moonpie."}"#.to_string(),
+        "Noted.\nTASK COMPLETE".to_string(),
+        r#"CALL recall {"query":"what is my cat's name"}"#.to_string(),
+        "Your cat is Moonpie.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+            // The one test that wants memory: without an embedder, which is
+            // the condition under test.
+            .with_memory(true)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("memory".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    converse(&client, &session, "My cat is named Moonpie. Remember that.").await;
+    converse(&client, &session, "What's my cat's name?").await;
+
+    let bodies = ollama.chat_bodies.lock().await.clone();
+    let recalled = bodies
+        .iter()
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .flat_map(|request| request["messages"].as_array().cloned().unwrap_or_default())
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["content"].as_str().map(str::to_string))
+        .find(|content| content.contains("keyword") || content.contains("No memories found"))
+        .expect("the recall result was sent back to the model");
+    assert!(
+        recalled.contains("Moonpie"),
+        "the stored memory is found: {recalled:?}"
+    );
+    assert!(
+        recalled.contains("by keyword match"),
+        "and the result says how it was found: {recalled:?}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

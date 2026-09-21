@@ -940,8 +940,25 @@ fn memory_search_services(
                         .unwrap_or(0),
                 );
                 let workspace = ws.read().await;
-                match mem.recall_scoped(&query, workspace.as_deref()).await {
-                    Ok(results) => {
+                match mem
+                    .recall_scoped_with_coverage(&query, workspace.as_deref())
+                    .await
+                {
+                    // An empty answer from a scan that could not compare
+                    // every stored memory (entries queued for embedding, or
+                    // bound to another model) is not "nothing matched".
+                    Ok((results, coverage)) if results.is_empty() && !coverage.is_complete() => {
+                        keyword_search(
+                            &mem,
+                            &query,
+                            workspace.as_deref(),
+                            limit,
+                            page_chars,
+                            offset,
+                        )
+                        .await
+                    }
+                    Ok((results, _)) => {
                         let items: Vec<Value> = results
                             .into_iter()
                             .take(limit)
@@ -952,6 +969,7 @@ fn memory_search_services(
                                     "id": r.id,
                                     "content": content,
                                     "score": r.score,
+                                    "match": "semantic",
                                     // Always present, never inferred from
                                     // whether `content` "looks" cut off. A
                                     // page that does not announce itself is
@@ -969,12 +987,22 @@ fn memory_search_services(
                         Ok(Value::Array(items))
                     }
                     Err(e) => {
-                        // If embedding is not configured, return empty results
-                        // instead of an error so the agent can continue gracefully
+                        // No embedder answering: the query cannot be embedded,
+                        // so semantic recall cannot run at all. That used to
+                        // answer an empty list — "no memories found" about a
+                        // memory stored seconds earlier. Match words instead.
                         let msg = e.to_string();
                         if msg.contains("embedding") || msg.contains("No embedding function") {
-                            tracing::debug!("Memory search skipped: {}", msg);
-                            Ok(Value::Array(vec![]))
+                            tracing::info!("Memory search falling back to keywords: {}", msg);
+                            keyword_search(
+                                &mem,
+                                &query,
+                                workspace.as_deref(),
+                                limit,
+                                page_chars,
+                                offset,
+                            )
+                            .await
                         } else {
                             Err(msg)
                         }
@@ -985,6 +1013,75 @@ fn memory_search_services(
     );
 
     services
+}
+
+/// `memory.search`'s answer when semantic recall cannot give one: memories
+/// ranked by the query's words ([`crate::keyword_recall`]), in the same
+/// paged shape, each marked `"match": "keyword"`.
+///
+/// Scope follows `recall_scoped`: a workspace sees global memories plus its
+/// own; no workspace sees everything. Nothing found is an error whose text
+/// says semantic search was unavailable — an empty list would read as "no
+/// such memory", which the fallback cannot know.
+async fn keyword_search(
+    mem: &MemoryService,
+    query: &str,
+    workspace: Option<&str>,
+    limit: usize,
+    page_chars: usize,
+    offset: usize,
+) -> Result<serde_json::Value, String> {
+    use serde_json::{Value, json};
+
+    let terms = crate::keyword_recall::query_terms(query);
+    let entries: Vec<_> = mem
+        .list_all()
+        .await
+        .into_iter()
+        .filter(|entry| {
+            workspace.is_none()
+                || entry.workspace_id.is_none()
+                || entry.workspace_id.as_deref() == workspace
+        })
+        .collect();
+    let hits =
+        crate::keyword_recall::rank(&terms, entries.iter().map(|e| e.content.as_str()), limit);
+    if hits.is_empty() {
+        return Err(format!(
+            "semantic memory search is unavailable right now (no embedding provider is \
+             answering), and no stored memory contains the words of \"{query}\" either — \
+             {} memories were searched by keyword",
+            entries.len()
+        ));
+    }
+    let items: Vec<Value> = hits
+        .iter()
+        .filter_map(|hit| entries.get(hit.index).map(|entry| (hit, entry)))
+        .map(|(hit, entry)| {
+            let total = entry.content.chars().count();
+            let start = offset.min(total);
+            let content: String = entry
+                .content
+                .chars()
+                .skip(start)
+                .take(page_chars.max(1))
+                .collect();
+            let returned = content.chars().count();
+            json!({
+                "id": entry.id,
+                "content": content,
+                "score": hit.score,
+                "match": "keyword",
+                "offset": start,
+                "returned": returned,
+                "total": total,
+                "truncated": start + returned < total,
+                "best_chunk": Value::Null,
+            })
+        })
+        .collect();
+    debug_assert_eq!(items.len(), hits.len(), "every hit indexes a listed entry");
+    Ok(Value::Array(items))
 }
 
 /// `memory.delete` and `memory.list`: the unscoped housekeeping pair.

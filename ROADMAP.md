@@ -2049,6 +2049,22 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             skill's description makes to the model. ~30 s by necessity (the due sweep's cadence).
             New builder option `with_heartbeat(false)`: the first probe ran with the scheduler on
             and the heartbeat turn consumed the scripted `remind` call.
+      - [x] *(2026-09-21)* **`recall` told the model "No memories found" about a memory stored
+            seconds earlier, whenever no embedder was answering.** `remember` handled the degraded
+            state honestly (stored whole, queued for embedding, says so), but `memory.search` turned
+            "cannot embed the query" into an empty list — so on any install without an embedding
+            provider (this dev host included) recall was useless *and* untrue. Now it falls back to
+            a keyword match (`keyword_recall`: terms ≥ 3 chars, stopwords dropped, ≤ 16 terms,
+            ranked by share of terms present; one pass over stored contents, degraded path only),
+            also when a semantic answer is empty from a scan that could not compare every row
+            (entries queued for backfill). Results carry `"match": "keyword"` and the `recall` skill
+            (0.1.1) says they are word matches, not meaning matches; a fallback that finds nothing
+            is an error that says semantic search was unavailable and how many memories were
+            searched by keyword. Unit tests + e2e `recall_without_an_embedder_finds_a_memory_by_keyword`;
+            with the old service the e2e fails with the original `No memories found matching: …`.
+            Workspace scope follows `recall_scoped` (global + own workspace). The testing-effect
+            FSRS strengthening does not apply to keyword hits — deliberately, a word match is weaker
+            evidence of relevance than a semantic one.
       - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
             behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
             comment says "the next message decides what happens to them" — but the harness simply
