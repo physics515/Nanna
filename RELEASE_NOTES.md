@@ -1,143 +1,81 @@
-# Nanna v0.3.21-beta.30 — Things That Talk Back
+# Nanna v0.3.24-beta.33 — Plain Chat, Told Straight
 
-If you wrote to Nanna from Telegram, Discord or Slack, every message was answered with
-**"I encountered an error processing your message."** Every one.
+Ask Nanna a question with a small local model and you could get the answer **seven times in a row,
+followed by "could not finish: every planned task was abandoned."** Press Regenerate and the new
+answer came with a warning that "nothing was written… if you expected something to exist by now, it
+does not." Attach a picture and it never reached the model. Write in anything but plain ASCII and a
+long reply could die halfway through with a UTF-8 error.
 
-Not because the model failed — the model was never asked. Two things were wrong at once. The
-conversation a chat message belongs to was never created, and the daemon refuses a message for a
-conversation that does not exist. And even past that, the channel code read its reply out of the
-daemon's response to "send this message" — which, since the daemon learned to acknowledge a message
-the moment it arrives (so a long task never times out the sender), is a receipt, not an answer.
-
-This release makes the chat apps real conversations again, and then builds on that: reminders that
-arrive, questions Nanna can ask you, results that land where you asked for them, and an undo for the
-files she writes.
+None of that was the model's fault. This release comes from driving the real conversation path —
+daemon, IPC, client — against a scripted model, turn by turn, and fixing what it found. Every fix
+below is now a test that runs on each pull request.
 
 ## What's Fixed
 
-**Chat apps get answers.** Each chat gets its own conversation, created on first contact with its
-reply route remembered — so it survives a restart. Telegram and Discord show "typing…" while Nanna
-works on your message. When a turn finishes, the answer is sent back to
-the chat it came from. If a message cannot be answered at all, the chat is told why ("no model
-provider is configured"), not "an error". Webhook conversations are covered by the same path.
+**An answer is given once.** Small models often answer and forget to say they are done. Nanna used
+to ask again and again, streaming the same answer each time until it gave up. Two identical answers
+with nothing done in between now count as finished — and the saved reply keeps one copy. (You may
+briefly see the repeat while it streams; the seven copies and the "could not finish" are gone.)
 
-**Reminders work — and survive a restart.** `remind`, `list_reminders` and `cancel_reminder` were
-the last three tools withheld at boot; **no bundled tool is missing its service any more**. A due
-reminder is posted into the conversation that set it — in the app, and in the chat app you wrote
-from. A reminder that came due while Nanna was not running is delivered at the next start and says
-how late it is. Driven for real: set, delivered 7 s later; set, daemon stopped, restarted 90 s
-later, delivered 6 s after boot with "is 2 min late".
+**Replies read as prose.** When a task took several steps, each step's text ran straight into the
+next — `…the file.The file says…`. Each step now starts a new paragraph, live and in history.
 
-**The scheduler no longer runs two copies of one job.** Anything still running when the next
-30-second check came round was started again — a slow one-shot fired **8 times** in the test that
-now pins it, a slow recurring job ran **11 copies at once**. And a fired one-shot was re-armed by
-every restart. Both are gone.
+**No more false alarms on Regenerate.** The "repeat completion" warning exists for long jobs that
+keep claiming success while nothing changes on disk. It no longer fires on a plain answer you asked
+for again.
 
-**MCP servers actually start — and their tools would have broken every request.** The MCP client
-was complete and nothing ever launched it. Configured servers now start at boot, in the background.
-On the way: MCP tools were named `server:tool`, and the colon is invalid for both Anthropic and
-OpenAI, which reject the *whole request* over it — the first MCP tool anyone added would have failed
-every turn. They are named `mcp__server__tool` now. A server that needs a token lists it in
-`secret_env` and you store it with `nanna mcp secret set <server> <VAR>` — it stays in the OS
-keyring and only that server receives it.
+**Stop means stop.** A question you stopped used to be answered anyway on your next, unrelated
+message. A turn now works what it planned. Unfinished work from earlier is shown to Nanna so she can
+pick it back up if your message asks for it — and if she does, it is resumed, not duplicated. A
+stopped reply is saved as "[Stopped by user]", as the app showed it, instead of an empty message.
+Deleting a conversation now stops the work still running in it.
 
-**A failed tool call over IPC said nothing.** A direct tool call that failed answered `success:
-false` with an empty string; the reason was dropped. It is returned now.
+**Pictures reach the model.** Attached images were dropped, and underneath that, images had never
+been sent to Ollama or OpenAI-compatible models at all. Both are fixed. A file Nanna cannot read
+(a PDF, say) is named to her so she can tell you, instead of silently vanishing.
+
+**Any language survives streaming.** A multi-byte character — an emoji, an accent, any CJK — split
+across two network packets killed the whole reply with a UTF-8 error, on every provider. A long
+non-English reply could fail after more than a minute of retries. Now it arrives intact. The same
+bug corrupted Signal and WhatsApp messages into `��` and could silently drop MCP responses; fixed
+there too.
+
+**Memory works without an embedding provider.** With no embedder configured, `recall` told the model
+"no memories found" about something saved seconds earlier. It now falls back to matching words and
+says that is what it did.
+
+**Honest reports.** A follow-up question is no longer told that an unchecked answer "passed its
+check". A task abandoned after 6 steps no longer says 8. A reply that is just "TASK COMPLETE" says it
+finished without a reply instead of showing nothing. Internal notes meant for the model no longer
+appear in the report you read.
+
+**Big tool calls stay in context.** A tool call with a huge argument pushed Nanna's own call out of
+her memory of the conversation. Large arguments are now summarized the same way large results are.
+
+**Reasoning stays out of replies.** Models that write `<think>…</think>` inline had their whole
+chain of thought delivered as the answer. It is now kept as reasoning.
+
+**Small things.** Tool errors no longer read `Error: Error: …`; tool calls from Ollama get unique ids;
+a blank message is refused instead of being answered as if you had asked something.
+A message too long for the model's context window now says exactly that, instead of blaming GPU
+memory.
 
 ## What's New
 
-**Ask when unsure.** `ask_user` posts a clarifying question into the conversation — app or chat app —
-and waits up to half an hour for your reply, which the running task picks up and continues with. No
-reply, and it carries on with its best judgement and says what it assumed.
+**The Logs page can follow one conversation.** Every log line now carries the conversation, step
+and tool call it came from, and search matches it — paste a session id to see just that
+conversation.
 
-**Undo for file writes.** Before `write_file`, `edit_file` or `file_buffer` changes a file, its
-previous content is saved outside your project. Nanna can list and restore her own checkpoints
-(`file_history`), and the chat header has a **Files** button that does the same for you. A restore
-is itself undoable; restoring a file a tool created removes it. Bounded: 100 recent checkpoints per
-conversation plus each file's first version, 256 MiB per conversation, 1 GiB overall.
+**Structured tracing.** The daemon's log names each turn, step, model call and tool call, with how
+long it took, how many tokens it used and whether it succeeded.
 
-**Chat commands.** From any chat app: `/status` (up? busy here? able to answer at all?), `/stop`
-(cancel what Nanna is doing in that chat), `/new` (start the chat over), `/model <name>` to pin that conversation's model
-(`/model default` undoes it), `/help`.
+**Two new CI gates.** The end-to-end conversation suite runs on every pull request, and a dependency
+audit (RustSec and npm) runs on every lockfile change and weekly.
 
-**Rules you set can be lifted — by you.** When a file rule you declared ("don't touch tests/")
-really blocks the work, Nanna can ask, quoting your own words; only a clear yes lifts it.
+## Still Open
 
-**Export a chat** to Markdown or JSON from the session menu.
-
-**Scheduled jobs can post their results into a conversation**, and so into a chat app. A quiet
-heartbeat posts nothing.
-
-**Hand edits of `config.toml` apply without a restart** (models, providers, scheduler switches). A
-half-saved file that does not parse is logged and the running configuration is kept; saving the same
-values changes nothing.
-
-**Spend by day, month and conversation.** The per-request log existed with nothing writing it; it is
-written now, and `system.cost_rollup` prices it. The Model Stats page shows spend by day for the last
-30 days. Models with no list price (local, unknown) are named and marked, never counted as $0.
-
-**Operations.** Prometheus `/metrics` on the health port (tools, models, MCP servers, channel
-messages in and out, reminders, live runs). `system.status` and the Tools page show each MCP server
-as started, failed (with the error) or not started (with the reason). `nanna doctor` checks MCP
-commands are on `PATH`.
-
-**Memory learns from use.** When Nanna recalls a result she stored earlier, the memories that
-served it are credited — the first producer of the "used successfully" signal the memory system has
-priced since July.
-
-## Crashes and Silences Found by Cleaning Up
-
-A pass that took the workspace to zero compiler, clippy and rustdoc warnings turned up ten real
-bugs on the way. The ones you could have hit:
-
-**An app update left the old server running.** Updating replaced the app but not the daemon behind
-it, so a new UI kept talking to the previous release — with every bug that update was meant to fix.
-The installer stops the daemon now, and on startup the app checks the version of whatever answers
-on its port and replaces a server from another release.
-
-**A second Nanna could not open a browser.** Every Chromium was launched on one shared profile
-directory, and Chromium refuses to start on a profile another Chromium holds. It also insisted on
-Playwright's own downloaded browser when that backend was compiled in, ignoring the Chromium already
-installed — which read as "Browser 'chromium' is not installed".
-
-**With no model configured, chats failed without saying why.** Four separate paths — a chat turn,
-the older chat route, sub-agents and the startup heartbeat — sent requests naming no model at all.
-Every one of them now stops and names the setting to fix (Settings → Models).
-
-**Crashes on ordinary text.** A re-embed log line, the Telegram token preview and a chat-wedge
-class of bug all cut strings at a fixed byte offset, which panics when a character straddles it.
-An empty search query divided by zero. Asking for a sub-agent without a system prompt panicked
-outright.
-
-**A cron expression could hang the scheduler forever:** `0-30/0` never advanced, and a step near
-four billion wrapped around instead of ending.
-
-## What This Release Does Not Do
-
-**None of this was driven through a live chat app.** There is no bot token on the build host. The
-channel path is tested with a recording channel against the real control plane and session store; a
-real Telegram round-trip is the remaining check.
-
-**MCP servers speaking only the newest protocol (2026-07-28) will not connect.** That revision drops
-the `initialize` handshake Nanna's client uses. Such a server is reported as failed, with its error,
-on the Tools page and in `system.status` — but it does not work yet. Stdio servers only;
-HTTP servers are not started from config.
-
-**`ask_user` waiting inside a running task, and a scheduled job's result being posted after a real
-model run, were not exercised end to end** — both need a live model turn. The mechanics under them
-are tested against the real run registry and session store.
-
-**GUI changes are not WebDriver-verified.** Linux still lacks a WebKitGTK driver matching the app's
-WebKitGTK generation. The GUI builds, and its logic is covered by unit tests.
-
-## Numbers
-
-- **2,106 Rust tests and 271 GUI tests pass, 0 fail**; clippy reports 0 errors and no new warnings.
-- **3 → 0** bundled tools withheld for want of a daemon service.
-- **8 → 1** fires of a slow one-shot job; **11 → 1** concurrent copies of a slow recurring job.
-- Dependencies: 19 compatible bumps, `deno_core` 0.411 → 0.412; `@vueuse/core` removed (nothing
-  imported it).
-- **3,331 → 0** clippy warnings (pedantic + nursery), **56 → 0** rustdoc warnings, and 0 build
-  warnings — with **no `#[allow]` left anywhere** in the workspace: the 36 that existed are gone and
-  what they hid is fixed. `--all-features` compiles for the first time, so the deno, playwright and
-  python paths are checked and tested too.
+- The converging answer still streams twice before the saved reply drops the repeat — the second
+  copy is the signal, and it cannot be recognized until it has streamed.
+- Work you never return to stays open (and visible to Nanna) indefinitely.
+- Images sent while a task is already running join it as text only.
+- Not verified against a real vision model or a live Signal/WhatsApp bridge — none on the build host.

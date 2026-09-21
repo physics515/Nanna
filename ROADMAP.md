@@ -2016,6 +2016,23 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             guard (or stop the turn, as delete now does) — check what the GUI shows for either answer.
             *Latent today:* no GUI command invokes `session.clear`; its only production caller is `/new`,
             which is guarded. It becomes live the moment a "clear chat" button is wired.
+      - [x] *(2026-09-21)* **A request longer than the window blamed GPU memory.** Probed with a
+            300 KB pasted log: every turn failed in 80 ms with "num_ctx was demoted under GPU memory
+            pressure … free GPU memory and resume" — no demotion had happened, and no freed memory
+            shortens a request. `ContextBelowFloor` now names the cause from its own numbers (step
+            frame + reply room over the window ⇒ the request is too long). e2e
+            `a_request_longer_than_the_window_says_so`.
+      - [ ] **A pasted document too large for the window cannot be worked at all.** Named honestly
+            now, but the only remedy is "shorten it". A step frame could carry a bounded excerpt of an
+            oversized request and keep the whole of it readable (as oversized tool results already are),
+            so "summarize this log" works on any model. Owner call: it changes what the model sees of
+            the user's own words.
+      - [x] *(2026-09-21)* **A blank message ran a whole planned turn.** `chat.send` with
+            whitespace-only content and no attachments was persisted and planned, the model guessing
+            at a request nobody made. Refused with `"error": "empty_message"` before anything is
+            stored (channels relay the reason). e2e `a_blank_message_is_refused_and_starts_no_turn`.
+            Also probed, no defect: an unknown session is refused as `session_not_found`;
+            Regenerate after a tool turn replaces the reply cleanly.
       - [x] *(2026-09-21)* **Deleting a session left its turn running.** Probed: the model kept
             generating for the deleted conversation (a mission would have kept calling tools, for
             hours), and its reply was persisted into nothing. `session.delete` and `delete_all` now stop
