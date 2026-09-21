@@ -1055,7 +1055,7 @@ impl ChatTurn {
         if self.resumed_from_park > 0 {
             return None;
         }
-        crate::tasks::TurnAdmission::at_turn_start(
+        let admission = crate::tasks::TurnAdmission::at_turn_start(
             &self.storage,
             &self.scope,
             self.scope_id.as_deref(),
@@ -1065,7 +1065,19 @@ impl ChatTurn {
             tracing::warn!(%message, "could not snapshot leftovers — admitting the whole scope");
         })
         .ok()
-        .map(Arc::new)
+        .map(Arc::new)?;
+        // Published beside the turn's baseline (and dropped with it), so a
+        // `tasks.add` that reuses an open leftover admits it into this turn.
+        if let Some(ref baselines) = self.turn_baselines {
+            baselines
+                .register_admission(
+                    &self.scope,
+                    self.scope_id.as_deref(),
+                    Arc::clone(&admission),
+                )
+                .await;
+        }
+        Some(admission)
     }
 
     /// Runs the mission; `Some((stop_kind, exit_cause, run_evidence))` when

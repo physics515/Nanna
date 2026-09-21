@@ -577,6 +577,13 @@ fn task_add_service(
                 .iter()
                 .find(|t| t.parent_id == parent_id && same_title(&t.title, &title))
             {
+                // The model asked for this work: if it is an item an earlier
+                // turn left open, the live turn must now admit it, or the
+                // model is told its task exists while nothing schedules it.
+                if let Some(admission) = turn_baselines.admission(&scope, scope_id.as_deref()).await
+                {
+                    admission.adopt_id(existing.id);
+                }
                 return Ok(json!({
                     "task": task_to_json(existing),
                     "deduplicated": true,
@@ -1237,6 +1244,18 @@ impl TurnAdmission {
                 .adopted
                 .lock()
                 .is_ok_and(|adopted| adopted.contains(&id))
+    }
+
+    /// Admit leftover `id` into this turn — the model asked for that work
+    /// again through `tasks.add`, which reused the open item instead of
+    /// creating a duplicate. A no-op for an id that is not a leftover.
+    pub fn adopt_id(&self, id: i64) {
+        if self.leftovers.contains_key(&id)
+            && let Ok(mut adopted) = self.adopted.lock()
+        {
+            adopted.insert(id);
+        }
+        debug_assert!(self.admits(id), "an adopted or new id is admitted");
     }
 
     /// Re-adopt the leftovers the plan proposes again, removing those tasks
@@ -3824,6 +3843,9 @@ fn scope_key(scope: &str, scope_id: Option<&str>) -> String {
 #[derive(Debug, Default)]
 pub struct TurnBaselines {
     inner: RwLock<HashMap<String, HashSet<i64>>>,
+    /// The live turn's [`TurnAdmission`] per scope, so `tasks.add`'s reuse of
+    /// an open item can admit it into the turn that asked for it.
+    admissions: RwLock<HashMap<String, Arc<TurnAdmission>>>,
 }
 
 impl TurnBaselines {
@@ -3845,7 +3867,36 @@ impl TurnBaselines {
     /// that releases the run claim, so a leaked entry would need the whole
     /// tail to be skipped — and the next turn's `open_turn` replaces it.
     pub async fn close_turn(&self, scope: &str, scope_id: Option<&str>) {
-        self.inner.write().await.remove(&scope_key(scope, scope_id));
+        let key = scope_key(scope, scope_id);
+        self.inner.write().await.remove(&key);
+        self.admissions.write().await.remove(&key);
+    }
+
+    /// Publish the live turn's admission for a scope (replacing a stale one).
+    pub async fn register_admission(
+        &self,
+        scope: &str,
+        scope_id: Option<&str>,
+        admission: Arc<TurnAdmission>,
+    ) {
+        self.admissions
+            .write()
+            .await
+            .insert(scope_key(scope, scope_id), admission);
+    }
+
+    /// The live turn's admission for a scope, or `None` when no turn is live
+    /// or the turn admits the whole scope.
+    pub async fn admission(
+        &self,
+        scope: &str,
+        scope_id: Option<&str>,
+    ) -> Option<Arc<TurnAdmission>> {
+        self.admissions
+            .read()
+            .await
+            .get(&scope_key(scope, scope_id))
+            .cloned()
     }
 
     /// The turn-start baseline for a scope, or `None` when no turn is live.
@@ -5314,6 +5365,54 @@ mod tests {
     /// work every step, turning 5 seeded tasks into ~50 — "Write data file
     /// with header and 3 rows" was created ten times — so the plan grew
     /// faster than it was worked. Re-adding an OPEN title reuses that item.
+    /// When `tasks.add` reuses an item an earlier turn left open, the live
+    /// turn admits it — otherwise the model is told "work on it rather than
+    /// planning it again" about an item the harness will never schedule.
+    #[tokio::test]
+    async fn reusing_a_leftover_admits_it_into_the_live_turn() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baselines = Arc::new(TurnBaselines::new());
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            baselines.clone(),
+        );
+        let leftover = add_task(
+            &services,
+            json!({"title": "Write data file", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let leftover_id = leftover["task"]["id"].as_i64().expect("an id");
+
+        // A new turn starts: the item is now a leftover it does not admit.
+        let admission = Arc::new(
+            TurnAdmission::at_turn_start(&storage, "session", Some("s1"))
+                .await
+                .expect("snapshot"),
+        );
+        baselines
+            .register_admission("session", Some("s1"), admission.clone())
+            .await;
+        assert!(!admission.admits(leftover_id));
+
+        let again = add_task(
+            &services,
+            json!({"title": "write data file", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        assert_eq!(again["deduplicated"], json!(true));
+        assert!(
+            admission.admits(leftover_id),
+            "the reused leftover joins the turn that asked for it"
+        );
+
+        baselines.close_turn("session", Some("s1")).await;
+        assert!(
+            baselines.admission("session", Some("s1")).await.is_none(),
+            "the admission is dropped with the turn"
+        );
+    }
+
     #[tokio::test]
     async fn re_adding_an_open_title_reuses_the_existing_task() {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
