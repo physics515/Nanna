@@ -1432,17 +1432,22 @@ impl Config {
         self
     }
 
-    /// The LLM keys [`Self::with_env_overrides`] takes from `env`.
+    /// The LLM keys [`Self::with_env_overrides`] takes from `env`: each
+    /// provider's variable overrides that provider's own field. A blank
+    /// variable is unset, as it is at load, and overrides nothing: an
+    /// exported-but-empty `ANTHROPIC_API_KEY` used to blank the stored key.
     fn override_llm_keys(&mut self, env: impl Fn(&str) -> Option<String>) {
-        if let Some(key) = env("ANTHROPIC_API_KEY") {
-            self.llm.api_key = Some(key);
-        }
+        let set = |field: &mut Option<String>, name: &str| {
+            if let Some(key) = env(name).filter(|key| !key.trim().is_empty()) {
+                *field = Some(key);
+            }
+        };
+        set(&mut self.llm.api_key, "ANTHROPIC_API_KEY");
         // Until 2026-09-18 this went to `api_key` when `[llm].provider` was
         // `openai` — the CLI's chat key then — which the daemon registers as
         // the Anthropic credential.
-        if let Some(key) = env("OPENAI_API_KEY") {
-            self.llm.openai_api_key = Some(key);
-        }
+        set(&mut self.llm.openai_api_key, "OPENAI_API_KEY");
+        set(&mut self.llm.openrouter_api_key, "OPENROUTER_API_KEY");
     }
 }
 
@@ -1599,6 +1604,43 @@ mod tests {
             (name == "OPENAI_API_KEY").then(|| "env-openai".to_string())
         });
         assert_eq!(config.llm.api_key, None);
+    }
+
+    #[test]
+    fn the_openrouter_variable_overrides_its_own_field() {
+        let mut config = Config::default();
+        config.llm.provider = "openrouter".to_string();
+        config.llm.openrouter_api_key = Some("from-config".to_string());
+        config.override_llm_keys(|name| {
+            (name == "OPENROUTER_API_KEY").then(|| "env-openrouter".to_string())
+        });
+        assert_eq!(
+            config.llm.openrouter_api_key.as_deref(),
+            Some("env-openrouter")
+        );
+        assert_eq!(config.llm.api_key, None);
+    }
+
+    /// An exported-but-empty variable is unset, as it is at load: it must not
+    /// blank a key the keyring or config.toml supplied.
+    #[test]
+    fn a_blank_environment_key_overrides_nothing() {
+        let mut config = Config::default();
+        config.llm.api_key = Some("stored-anthropic".to_string());
+        config.llm.openai_api_key = Some("stored-openai".to_string());
+        config.llm.openrouter_api_key = Some("stored-openrouter".to_string());
+        config.override_llm_keys(|name| match name {
+            "ANTHROPIC_API_KEY" => Some(String::new()),
+            "OPENAI_API_KEY" => Some("  ".to_string()),
+            "OPENROUTER_API_KEY" => Some("\t".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.llm.api_key.as_deref(), Some("stored-anthropic"));
+        assert_eq!(config.llm.openai_api_key.as_deref(), Some("stored-openai"));
+        assert_eq!(
+            config.llm.openrouter_api_key.as_deref(),
+            Some("stored-openrouter")
+        );
     }
 
     // -----------------------------------------------------------------
