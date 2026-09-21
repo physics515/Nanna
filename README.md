@@ -347,6 +347,15 @@ the OS keyring (or, with no keyring on the machine, an encrypted `0600` file) an
 receives it; a server
 whose secret is missing is not started, and `system.status` / the Tools page say which command sets it.
 
+Channel secrets are kept the same way. `nanna init` and the Channels page store bot and app
+tokens and signing and webhook secrets in the keyring; `config.toml` keeps the channel's section,
+which turns it on, and its other settings. A secret found in `config.toml` (written there by hand,
+or by an older version) is filed in the keyring when the file is loaded and leaves the file at the
+next save, so the line can simply be deleted. For a channel that has a section, a secret
+can also come from the environment: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`,
+`DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET`,
+`SIGNAL_WEBHOOK_SECRET`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`.
+
 **Environment Variables:**
 
 | Variable | Purpose |

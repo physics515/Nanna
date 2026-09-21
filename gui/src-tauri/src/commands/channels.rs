@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{error, info};
 
 /// Save channel configuration
 ///
@@ -16,8 +16,10 @@ use tracing::info;
 /// `bot_token` (telegram, discord, slack), `application_id` and `public_key`
 /// (discord), `signing_secret` (slack), `phone_number` (signal) or
 /// `connection_method` (whatsapp). Returns `Unknown channel: …` for any other
-/// channel, and `Failed to save config: …` when `config.toml` cannot be written
-/// — the cached config has already changed by then.
+/// channel, `Failed to store channel secrets securely: …` when the secure store
+/// refuses them (`config.toml` is then not written), and `Failed to save
+/// config: …` when `config.toml` cannot be written — the cached config has
+/// already changed by then.
 #[tauri::command]
 pub async fn save_channel_config(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -149,13 +151,29 @@ pub async fn save_channel_config(
         _ => return Err(format!("Unknown channel: {channel}")),
     }
 
-    // Save to disk
-    state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {e}"))?;
+    store_and_save(&mut state_guard.config, &channel)?;
     drop(state_guard);
 
     info!("Saved {} channel configuration", channel);
     Ok(())
+}
+
+/// File the secrets `config` holds in the secure store, then write
+/// `config.toml`.
+///
+/// `save` keeps secrets out of the file, so one filed nowhere else would be
+/// gone at the next start. They are refilled, so this session's config (a
+/// connection test) still has them. When the store refuses them, the file is
+/// not written.
+fn store_and_save(config: &mut nanna_config::Config, channel: &str) -> Result<(), String> {
+    if let Err(e) = config.migrate_secrets_to_keyring() {
+        error!("Failed to store {channel} channel secrets in the secure store: {e}");
+        return Err(format!("Failed to store channel secrets securely: {e}"));
+    }
+    config.load_secrets_from_store();
+    config
+        .save()
+        .map_err(|e| format!("Failed to save config: {e}"))
 }
 
 /// Test channel connection
