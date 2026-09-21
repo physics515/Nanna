@@ -1771,3 +1771,108 @@ async fn recall_without_an_embedder_finds_a_memory_by_keyword() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// `ask_user` end to end — the one interruption the product wants: the model
+/// asks a clarifying question mid-turn, the question is posted into the
+/// conversation, the user's next message is handed to the waiting call as the
+/// answer, and the turn finishes with it. The answer is consumed there: the
+/// next turn does not work "Paris" again as a task of its own.
+#[tokio::test]
+async fn a_clarifying_question_is_answered_by_the_next_message() {
+    let ollama = ScriptedOllama::start(vec![
+        r#"CALL ask_user {"question":"Which city do you mean?","wait_secs":60}"#.to_string(),
+        "Got it — Paris.\nTASK COMPLETE".to_string(),
+        "You're welcome.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("clarify".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+    let ack = client
+        .chat()
+        .send(&session, "Tell me about the city.")
+        .await
+        .expect("chat.send is accepted");
+    let turn = ack["message_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the ack names the turn's message: {ack}"))
+        .to_string();
+
+    let reply = tokio::time::timeout(READY_HANG_CEILING, async {
+        let mut asked = false;
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::SessionMessageAdded { content, .. })
+                    if !asked && content.contains("Which city") =>
+                {
+                    asked = true;
+                    client
+                        .chat()
+                        .send(&session, "Paris")
+                        .await
+                        .expect("the answer is accepted");
+                }
+                Ok(nanna_client::Event::MessageEnd {
+                    message_id,
+                    content,
+                    ..
+                }) if message_id == turn => return content,
+                Ok(_) => {}
+                Err(e) => panic!("the event stream ended before the turn did: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the turn ends before the hang ceiling");
+    assert_eq!(reply.trim(), "Got it — Paris.");
+
+    let answered = ollama
+        .chat_bodies
+        .lock()
+        .await
+        .iter()
+        .any(|body| body.contains("The user answered: Paris"));
+    assert!(
+        answered,
+        "the waiting call received the reply as its result"
+    );
+
+    let before = ollama.chat_bodies.lock().await.len();
+    let next = converse(&client, &session, "Thanks!").await;
+    assert_eq!(next.trim(), "You're welcome.");
+    // Every step the next turn ran, by the task line of its prompt.
+    let tasks: Vec<String> = ollama.chat_bodies.lock().await[before..]
+        .iter()
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .filter_map(|request| {
+            let prompt = request["messages"].as_array()?.last()?["content"]
+                .as_str()?
+                .to_string();
+            prompt
+                .lines()
+                .find(|line| line.starts_with("Task #"))
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(!tasks.is_empty(), "the next turn ran a step");
+    assert!(
+        tasks.iter().all(|task| !task.ends_with("Paris")),
+        "the answer was consumed, not queued as new work: {tasks:?}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}

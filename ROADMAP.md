@@ -2065,6 +2065,14 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             Workspace scope follows `recall_scoped` (global + own workspace). The testing-effect
             FSRS strengthening does not apply to keyword hits — deliberately, a word match is weaker
             evidence of relevance than a semantic one.
+      - [x] *(2026-09-21)* **`ask_user` pinned end to end.** e2e
+            `a_clarifying_question_is_answered_by_the_next_message`: the scripted model asks
+            mid-turn, the question is posted into the conversation, the user's next message is
+            handed to the waiting call (`The user answered: Paris`), the turn finishes with it, and
+            the next turn does not work "Paris" again as a task. Noted, not changed: the answer's
+            `chat.send` ack reads `"status":"interjected"… "admitted to the run in progress"` — true
+            of the mechanism (the reply rides the pending queue the call drains), and no client
+            reads the status today.
       - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
             behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
             comment says "the next message decides what happens to them" — but the harness simply
