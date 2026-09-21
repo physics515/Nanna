@@ -1211,13 +1211,11 @@ fn memory_summarize_services(
                 let joined = texts.join("\n\n---\n\n");
                 // Resolved per call: whichever summarization list the
                 // user has set right now is the one that answers.
-                let models = {
-                    let live = summarizer_config.read().await;
-                    crate::dream_summarizer::summarization_models(
-                        &live.summarization_priority,
-                        std::slice::from_ref(&live.model),
-                    )
-                };
+                let models =
+                    crate::dream_summarizer::for_agent_service(&*summarizer_config.read().await);
+                if models.is_empty() {
+                    return Err(crate::agent_service::NO_MODEL_CONFIGURED.to_string());
+                }
                 let summarize =
                     crate::dream_summarizer::summarize_with_failover(router, models);
                 let summary = summarize(joined).await?;
@@ -1823,6 +1821,27 @@ pub struct LlmConfig {
     pub ollama_api_key: Option<String>,
     /// Legacy: API key field (for backwards compatibility)
     pub api_key: Option<String>,
+}
+
+/// Record `configured_host` as the server of a saved Ollama token that
+/// records none — one saved by a build before tokens were bound.
+///
+/// Such a token has been going to the configured server, and every load reads
+/// it as the configured server's. Unrecorded, that stays true of whatever
+/// address is configured next, including one edited into `config.toml` while
+/// the daemon is stopped. Recorded once at the first start, it stays with the
+/// server it was going to. A failure is logged and changes nothing: the next
+/// start tries again, and reloads while running attribute it to the running
+/// server anyway.
+fn record_legacy_ollama_token_server(configured_host: &str) {
+    match SecureStore::new().bind_unbound_ollama_token(configured_host) {
+        Ok(true) => info!(
+            "Recorded {} as the server the saved Ollama token belongs to",
+            nanna_config::ollama::redacted_ollama_host(configured_host)
+        ),
+        Ok(false) => {}
+        Err(e) => warn!("Could not record which server the saved Ollama token belongs to: {e}"),
+    }
 }
 
 /// A credential from the environment, falling back to the secure store.
@@ -2487,14 +2506,24 @@ async fn dream_once(
 
     // Read the summarization list LIVE, once per
     // cycle: whatever the user last set is what
-    // this dream summarizes on. Falls back to the
-    // chat model exactly as the boot path did.
-    let live_cfg = agent.agent_config().await;
-    let summarization_models =
-        crate::dream_summarizer::summarization_models(
-            &live_cfg.summarization_priority,
-            std::slice::from_ref(&live_cfg.model),
+    // this dream summarizes on. With none, the
+    // chat models in their configured order — the
+    // one rule every memory consumer shares.
+    let summarization_models = {
+        let handle = agent.config_handle();
+        let live = handle.read().await;
+        crate::dream_summarizer::for_agent_service(&live)
+    };
+    if summarization_models.is_empty() {
+        return (
+            true,
+            Some(format!(
+                "Skipped ({})",
+                crate::agent_service::NO_MODEL_CONFIGURED
+            )),
+            None,
         );
+    }
 
     // The idle gate AND the full dream cycle (feedback
     // flush -> FSRS testing-effect flush -> consolidate)
@@ -2899,6 +2928,10 @@ async fn deliver_scheduled_reminder(
 pub struct DaemonServer {
     config: DaemonConfig,
     embedding: EmbeddingConfig,
+    /// The part of `embedding` a config change may still move once the router
+    /// is built (the Ollama token), shared by every Ollama embedding client
+    /// and the control plane that applies config changes.
+    live_embedding: Arc<crate::embedding_reload::LiveEmbeddingSettings>,
     memory_path: Option<PathBuf>,
     _brave_api_key: Option<String>,
     sessions: Arc<SessionManager>,
@@ -2910,6 +2943,8 @@ pub struct DaemonServer {
     scheduler_slot: crate::reminder_service::SchedulerSlot,
     /// Per-server MCP state: written by the boot task, read by `system.status`.
     mcp_status: crate::mcp_startup::McpStatus,
+    /// The MCP background task, awaited by `finish_shutdown`.
+    mcp_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The dreaming orchestrator, for `memory.get`'s use feedback. Filled once
     /// in `run()`, right after it is built.
     dreaming_slot: DreamingSlot,
@@ -2943,7 +2978,7 @@ impl DaemonServer {
     /// with a line saying so, rather than substituting a different model. A
     /// silent substitution is what put a hardcoded paid embedder in front of
     /// the free one the user had chosen.
-    fn embedding_provider_for(
+    pub(crate) fn embedding_provider_for(
         &self,
         spec: &str,
     ) -> Option<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> {
@@ -2994,10 +3029,14 @@ impl DaemonServer {
                     ),
                 ))
             }
+            // Every Ollama entry shares the one token handle, read per request:
+            // a token saved while the daemon runs reaches these clients without
+            // rebuilding them (see `LiveEmbeddingSettings`).
             "ollama" => Some((
                 info,
                 Arc::new(
                     nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
+                        .with_bearer(self.live_embedding.ollama_bearer())
                         .with_model(&model),
                 ),
             )),
@@ -3056,15 +3095,21 @@ impl DaemonServer {
 
         let exit_reason = crate::exit_reason::ExitReasonFile::new(&config.data_dir);
 
+        let live_embedding = Arc::new(crate::embedding_reload::LiveEmbeddingSettings::new(
+            &embedding,
+        ));
+
         Self {
             config,
             embedding,
+            live_embedding,
             memory_path,
             _brave_api_key: brave_api_key,
             sessions,
             control_slot: Arc::new(tokio::sync::RwLock::new(None)),
             scheduler_slot: Arc::new(std::sync::OnceLock::new()),
             mcp_status: crate::mcp_startup::McpStatus::default(),
+            mcp_task: std::sync::Mutex::new(None),
             dreaming_slot: Arc::new(std::sync::OnceLock::new()),
             ipc,
             persistence,
@@ -3076,6 +3121,13 @@ impl DaemonServer {
             storage_error: None,
             exit_reason,
         }
+    }
+
+    /// What a config change may still update on the running embedding
+    /// clients; the control plane applies every committed change to it.
+    #[must_use]
+    pub(crate) fn live_embedding(&self) -> Arc<crate::embedding_reload::LiveEmbeddingSettings> {
+        Arc::clone(&self.live_embedding)
     }
 
     /// Recovery report from a startup quarantine + rebuild, if one happened.
@@ -3895,6 +3947,7 @@ impl DaemonServer {
         .with_mcp_status(Arc::clone(&self.mcp_status))
         .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
         .with_memory_recovery(self.memory_recovery.clone())
+        .with_live_embedding(self.live_embedding())
         .with_chat_runs(chat_runs.clone())
         .with_degradations(degradations.clone())
         .with_shutdown(self.shutdown_tx.clone());
@@ -4407,6 +4460,38 @@ impl DaemonServer {
         }
     }
 
+    /// Start the configured MCP servers in the background and keep the task
+    /// that owns them, for `finish_shutdown` to await.
+    async fn start_mcp_servers(
+        &self,
+        tools: &Arc<nanna_tools::ToolRegistry>,
+        chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    ) {
+        let mcp = crate::mcp_startup::spawn_mcp_servers(
+            &self.config.mcp,
+            Arc::clone(tools),
+            Arc::clone(&self.mcp_status),
+            self.shutdown_tx.subscribe(),
+            |key| nanna_config::credentials::SecureStore::new().get(key).ok(),
+            // A server's question (MCP elicitation) goes to the user through
+            // `ask_user`, in the conversation whose turn called the tool.
+            Some(Arc::new(crate::ask_user_service::McpAskUser {
+                deps: crate::ask_user_service::AskUserDeps {
+                    sessions: Arc::clone(&self.sessions),
+                    events: self.ipc.event_sender(),
+                    chat_runs: Arc::clone(chat_runs),
+                },
+            })),
+        )
+        .await;
+        if let Some(task) = mcp.task
+            && let Ok(mut slot) = self.mcp_task.lock()
+        {
+            debug_assert!(slot.is_none(), "services are initialized once");
+            *slot = Some(task);
+        }
+    }
+
     /// Drain and stop: shut the IPC server, let the stats task take its final
     /// save, release the PID file and record the clean exit.
     async fn finish_shutdown(
@@ -4426,6 +4511,14 @@ impl DaemonServer {
 
         // Wait for stats auto-save task to complete final save
         let _ = tokio::time::timeout(Duration::from_secs(5), stats_save_handle).await;
+
+        // The MCP task closes its servers on the same broadcast; wait for it,
+        // or the process exits before the close runs and a server that
+        // ignores stdin EOF outlives the daemon.
+        let mcp_task = self.mcp_task.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(task) = mcp_task {
+            crate::mcp_startup::await_mcp_shutdown(task).await;
+        }
 
         ipc_handle.abort();
 
@@ -4518,14 +4611,7 @@ impl DaemonServer {
 
         // MCP servers register their tools as each handshake completes; the
         // count above is the tool surface before them.
-        crate::mcp_startup::spawn_mcp_servers(
-            &self.config.mcp,
-            Arc::clone(&tools),
-            Arc::clone(&self.mcp_status),
-            self.shutdown_tx.subscribe(),
-            |key| nanna_config::credentials::SecureStore::new().get(key).ok(),
-        )
-        .await;
+        self.start_mcp_servers(&tools, chat_runs).await;
 
         // Register discover_tools (JS/TS skill with registry access)
         if let Some(ref dir) = tools_dir {
@@ -4830,13 +4916,13 @@ impl DaemonServer {
         // injected whether or not the user wanted them, which is how a paid
         // 1536-dim embedder ended up live on an install whose config asked
         // for a free one first and a 768-dim local model second.
-        let specs: Vec<String> = if self.embedding.priority.is_empty() {
-            let legacy = format!("{}/{}", self.embedding.provider, self.embedding.model);
-            info!("No embedding_priority configured; using the single pair '{legacy}'");
-            vec![legacy]
-        } else {
-            self.embedding.priority.clone()
-        };
+        if self.embedding.priority.is_empty() {
+            info!(
+                "No embedding_priority configured; using the single pair '{}/{}'",
+                self.embedding.provider, self.embedding.model
+            );
+        }
+        let specs = self.embedding.specs();
 
         let resolved: Vec<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> = specs
             .iter()
@@ -5546,7 +5632,7 @@ fn build_tool_policy(enabled: Option<&[String]>, disabled: &[String]) -> ToolPol
 ///
 /// An entry with no slash is treated as a bare model on the default local
 /// provider, matching how a bare chat model name resolves.
-fn split_embedding_spec(spec: &str) -> Option<(String, String)> {
+pub(crate) fn split_embedding_spec(spec: &str) -> Option<(String, String)> {
     let spec = spec.trim();
     if spec.is_empty() {
         return None;
@@ -5577,6 +5663,9 @@ pub struct EmbeddingConfig {
     pub model: String,
     /// Ollama host (if using Ollama)
     pub ollama_host: String,
+    /// Bearer token for that host — `[llm] ollama_api_key`, the one Ollama
+    /// credential, which chat already sends. `None` sends no `Authorization`.
+    pub ollama_api_key: Option<String>,
     /// Ordered `provider/model` specs, most preferred first.
     ///
     /// This is the user's stated order and it is authoritative: the router
@@ -5591,12 +5680,47 @@ pub struct EmbeddingConfig {
     pub priority: Vec<String>,
 }
 
+impl EmbeddingConfig {
+    /// The embedding settings as the config file states them — shared by boot
+    /// and the reload path, so the two cannot derive different embedders from
+    /// the same file.
+    #[must_use]
+    pub fn from_nanna(config: &nanna_config::Config) -> Self {
+        Self {
+            provider: config.memory.embedding_provider.clone(),
+            model: config.memory.embedding_model.clone(),
+            ollama_host: config.memory.ollama_host.clone(),
+            // The one Ollama credential, blank meaning none (as chat reads it).
+            ollama_api_key: config
+                .llm
+                .ollama_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string),
+            priority: config.memory.embedding_priority.clone(),
+        }
+    }
+
+    /// The ordered `provider/model` specs the router is built from:
+    /// [`Self::priority`], or the single legacy pair when it is empty.
+    #[must_use]
+    pub fn specs(&self) -> Vec<String> {
+        if self.priority.is_empty() {
+            vec![format!("{}/{}", self.provider, self.model)]
+        } else {
+            self.priority.clone()
+        }
+    }
+}
+
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
             provider: "ollama".to_string(),
             model: "nomic-embed-text".to_string(),
             ollama_host: "http://localhost:11434".to_string(),
+            ollama_api_key: None,
             priority: Vec::new(),
         }
     }
@@ -5672,6 +5796,7 @@ impl DaemonBuilder {
         let config = match Config::load() {
             Ok(cfg) => {
                 info!("Loaded Nanna config successfully");
+                record_legacy_ollama_token_server(&cfg.memory.ollama_host);
                 cfg.with_env_overrides()
             }
             Err(e) => {
@@ -5709,16 +5834,7 @@ impl DaemonBuilder {
     /// idle settings, the vision-model list and the MCP server list.
     fn apply_memory_settings(&mut self, config: &nanna_config::Config) {
         // Set embedding configuration from Nanna memory config
-        self.embedding
-            .provider
-            .clone_from(&config.memory.embedding_provider);
-        self.embedding.model.clone_from(&config.memory.embedding_model);
-        self.embedding
-            .ollama_host
-            .clone_from(&config.memory.ollama_host);
-        self.embedding
-            .priority
-            .clone_from(&config.memory.embedding_priority);
+        self.embedding = EmbeddingConfig::from_nanna(config);
 
         // Thread the memory-compression settings so the scheduled dream cycle
         // honors them (previously only the IPC-triggered path did).
@@ -5805,25 +5921,13 @@ impl DaemonBuilder {
             self.config.agent.model.clone_from(&config.llm.model);
         }
 
-        // Set summarization configuration
+        // Set summarization configuration. The list is all it takes: each
+        // entry resolves through the chat router, with chat's server, token
+        // and keys (`llm_router::summarizer_clients`).
         self.config
             .agent
             .summarization_priority
             .clone_from(&config.llm.summarization_priority);
-        self.config
-            .agent
-            .summarization_ollama_url
-            .clone_from(&config.llm.ollama_url);
-
-        // Pass API keys to agent config so summarization can use OpenRouter/OpenAI
-        self.config
-            .agent
-            .openrouter_api_key
-            .clone_from(&config.llm.openrouter_api_key);
-        self.config
-            .agent
-            .openai_api_key
-            .clone_from(&config.llm.openai_api_key);
 
         // Thinking mode is NOT read from config: it is always on (owner
         // directive 2026-08-04). `AgentServiceConfig::default` already carries
@@ -6093,7 +6197,44 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 mod tests {
     use super::*;
 
+    /// With no Settings summarization list, `memory.summarize` walks the chat
+    /// models in their configured order — the rule every memory consumer
+    /// shares. It used to take the single chat model, so a first chat model
+    /// with no provider failed the call while a second one could answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_summarize_walks_the_chat_models_when_settings_list_none() {
+        use crate::embedding_reload::test_ollama::{ollama_credentials, spawn_token_gated};
+        let (host, seen) = spawn_token_gated("bound-token").await;
+        let router = Arc::new(crate::llm_router::LlmRouter::new());
+        router.rebuild(&ollama_credentials(&host, "bound-token"));
+        let chat_models = vec![
+            // No OpenRouter key is registered: this one cannot answer.
+            "openrouter/nanna-test/unreachable".to_string(),
+            "ollama/nanna-test-chat:1b".to_string(),
+        ];
+        let config = Arc::new(tokio::sync::RwLock::new(
+            crate::agent_service::AgentServiceConfig {
+                model: chat_models[0].clone(),
+                model_priority: chat_models,
+                summarization_priority: Vec::new(),
+                ..crate::agent_service::AgentServiceConfig::default()
+            },
+        ));
+        let services = memory_summarize_services(router, config);
+        let summarize = services.get("memory.summarize").expect("registered");
 
+        let reply = summarize(serde_json::json!({ "texts": ["one fragment", "another"] }))
+            .await
+            .expect("the second chat model answers");
+
+        assert!(reply["summary"].as_str().is_some_and(|s| !s.is_empty()), "{reply}");
+        let reached = seen.lock().expect("record lock").clone();
+        assert!(
+            reached.iter().any(|r| r.path == "/api/chat"
+                && r.model.as_deref() == Some("nanna-test-chat:1b")),
+            "{reached:?}"
+        );
+    }
 
     /// A memory saved through the `remember` TOOL used to carry no `fact_type`
     /// at all, so the drift pin — which can only protect what it can identify —

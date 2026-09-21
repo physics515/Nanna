@@ -18,6 +18,18 @@ describe('parseMcpServers', () => {
     expect(parseMcpServers(daemon)).toEqual(daemon)
   })
 
+  it('keeps how a started server was reached, and ignores a malformed link', () => {
+    expect(
+      parseMcpServers([
+        { name: 'remote', state: 'started', tools: 2, link: '2026-07-28 over Streamable HTTP' },
+        { name: 'odd', state: 'started', tools: 1, link: 42 },
+      ]),
+    ).toEqual([
+      { name: 'remote', state: 'started', tools: 2, link: '2026-07-28 over Streamable HTTP' },
+      { name: 'odd', state: 'started', tools: 1 },
+    ])
+  })
+
   it('drops malformed entries and never throws', () => {
     expect(parseMcpServers(null)).toEqual([])
     expect(parseMcpServers({ servers: daemon })).toEqual([])
@@ -38,6 +50,8 @@ describe('describeMcpServer', () => {
   it('says what each state means', () => {
     expect(describeMcpServer({ name: 'a', state: 'started', tools: 1 })).toBe('1 tool')
     expect(describeMcpServer({ name: 'a', state: 'started', tools: 3 })).toBe('3 tools')
+    expect(describeMcpServer({ name: 'a', state: 'started', tools: 13, link: '2024-11-05 over HTTP+SSE' }))
+      .toBe('13 tools · 2024-11-05 over HTTP+SSE')
     expect(describeMcpServer({ name: 'a', state: 'starting', tools: 0 })).toBe('starting…')
     expect(describeMcpServer({ name: 'a', state: 'failed', tools: 0, detail: 'ENOENT' })).toBe('failed: ENOENT')
     expect(describeMcpServer({ name: '', state: 'not_started', tools: 0, detail: 'dup' })).toBe('dup')

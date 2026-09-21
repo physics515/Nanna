@@ -158,6 +158,208 @@ async fn config_set_rebuilds_llm_router_providers() {
     assert!(providers.contains(&"ollama"));
 }
 
+/// The embedding router is built once, at boot. A token saved in Settings used
+/// to reach chat (whose router is rebuilt) and never the embedder: against a
+/// server that wants the token, every memory embed kept getting 401 and was
+/// stored without a vector until a restart — with nothing saying one was
+/// needed. Through the daemon's own wiring, the saved token must go out on the
+/// very next embed, even though the old token's 401 had benched the provider.
+///
+/// The same saves change the embedding model, which must NOT follow: the
+/// store's vectors are bound to the model the router was built with, and a
+/// silent swap is the dimension split-brain.
+///
+/// `ConfigAction::Set`, not `Reload`, so the test never touches the real
+/// on-disk config; every mutation path shares the propagation step.
+#[tokio::test]
+async fn a_saved_ollama_token_reaches_the_running_embedder_but_the_model_waits() {
+    let (base, seen) = crate::embedding_reload::test_ollama::spawn_token_gated("new-token").await;
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = crate::server::DaemonServer::new(
+        crate::server::DaemonConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..crate::server::DaemonConfig::default()
+        },
+        crate::server::EmbeddingConfig {
+            provider: "ollama".into(),
+            model: "boot-embed".into(),
+            ollama_host: base.clone(),
+            ollama_api_key: Some("old-token".into()),
+            priority: Vec::new(),
+        },
+        None,
+        None,
+    );
+    let (info, client) = server
+        .embedding_provider_for("ollama/boot-embed")
+        .expect("an Ollama spec always resolves");
+    let router = crate::embedding_router::EmbeddingRouter::new(info, client);
+    router
+        .embed_one_now("before")
+        .await
+        .expect_err("the server refuses the token the daemon booted with");
+
+    let cp = ControlPlane::new(Arc::new(SessionManager::new()))
+        .with_live_embedding(server.live_embedding());
+    {
+        // The running config names the server and model the daemon booted with.
+        let mut config = cp.config.write().await;
+        config.memory.ollama_host.clone_from(&base);
+        config.memory.embedding_provider = "ollama".into();
+        config.memory.embedding_model = "boot-embed".into();
+        config.memory.embedding_priority.clear();
+    }
+    let cp = Arc::new(cp);
+    for (path, value) in [
+        ("memory.embedding_model", json!("other-embed")),
+        ("llm.ollama_api_key", json!("new-token")),
+    ] {
+        let resp = cp
+            .handle(
+                "test",
+                Action::Config(ConfigAction::Set {
+                    path: path.into(),
+                    value,
+                }),
+            )
+            .await;
+        assert_eq!(resp["status"], "updated", "{path}: {resp}");
+    }
+
+    let (vector, switched) = router
+        .embed_one_now("after")
+        .await
+        .expect("the saved token opens the server on the next embed");
+    assert_eq!(vector.len(), 3);
+    assert!(
+        switched.is_none(),
+        "the one provider stays the one provider"
+    );
+    let last = seen
+        .lock()
+        .expect("record lock")
+        .last()
+        .cloned()
+        .expect("the embed reached the server");
+    assert_eq!(last.authorization.as_deref(), Some("Bearer new-token"));
+    assert_eq!(
+        last.model.as_deref(),
+        Some("boot-embed"),
+        "the model the store is bound to, not the one just saved"
+    );
+}
+
+
+/// The Ollama bearer token is bound to the server it was saved for — and a
+/// token saved by an older build records no server. `config.set` of a new
+/// address (the agent can send one) used to re-read the store for the new
+/// address, find no record, and hand the old server's token to the new one:
+/// chat, embeddings and the probe would all have sent it there.
+#[tokio::test]
+async fn config_set_does_not_hand_a_legacy_ollama_token_to_a_new_address() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = nanna_config::SecureStore::file_only_at(dir.path().to_path_buf());
+    store
+        .set(
+            nanna_config::credentials::keys::OLLAMA_API_KEY,
+            "legacy-token",
+        )
+        .expect("set");
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.credential_store = store.clone();
+    {
+        // As the boot load left it: the legacy token, for the configured server.
+        let mut config = cp.config.write().await;
+        config.memory.ollama_host = "https://gpu.example/ollama".to_string();
+        config.llm.ollama_api_key = Some("legacy-token".to_string());
+    }
+    let cp = Arc::new(cp);
+
+    let set_host = |host: &str| {
+        Action::Config(ConfigAction::Set {
+            path: "memory.ollama_host".into(),
+            value: json!(host),
+        })
+    };
+    let resp = cp
+        .handle("test", set_host("https://elsewhere.example"))
+        .await;
+    assert_eq!(resp["status"], "updated");
+    {
+        let config = cp.config.read().await;
+        assert_eq!(config.memory.ollama_host, "https://elsewhere.example");
+        assert_ne!(
+            config.llm.ollama_api_key.as_deref(),
+            Some("legacy-token"),
+            "the new address must not get the token that was going to the old one"
+        );
+    }
+    assert_eq!(
+        store
+            .ollama_token_host()
+            .expect("a file store answers")
+            .as_deref(),
+        Some("https://gpu.example/ollama"),
+        "the token is recorded as the old server's"
+    );
+
+    // Back to the server it was going to: it goes there again.
+    let resp = cp
+        .handle("test", set_host("https://gpu.example/ollama/"))
+        .await;
+    assert_eq!(resp["status"], "updated");
+    assert_eq!(
+        cp.config.read().await.llm.ollama_api_key.as_deref(),
+        Some("legacy-token")
+    );
+}
+
+/// `config.reset` and `config.import` replace the whole config, the address
+/// with it. A token saved with no server recorded was the replaced address's;
+/// unrecorded, the next reload would read it as the new address's.
+#[tokio::test]
+async fn reset_and_import_record_a_legacy_ollama_tokens_server_first() {
+    use nanna_config::credentials::keys;
+    for action in [
+        ConfigAction::Reset { path: None },
+        ConfigAction::Import {
+            config: serde_json::to_value(Config::default()).expect("json"),
+        },
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = nanna_config::SecureStore::file_only_at(dir.path().to_path_buf());
+        store
+            .set(keys::OLLAMA_API_KEY, "legacy-token")
+            .expect("set");
+        let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+        cp.credential_store = store.clone();
+        {
+            let mut config = cp.config.write().await;
+            config.memory.ollama_host = "https://gpu.example/ollama".to_string();
+            config.llm.ollama_api_key = Some("legacy-token".to_string());
+        }
+        let cp = Arc::new(cp);
+        let label = format!("{action:?}");
+        cp.handle("test", Action::Config(action)).await;
+
+        let config = cp.config.read().await;
+        assert_eq!(
+            config.memory.ollama_host, "http://localhost:11434",
+            "{label}"
+        );
+        assert_ne!(
+            config.llm.ollama_api_key.as_deref(),
+            Some("legacy-token"),
+            "{label}: the default address must not get the old server's token"
+        );
+        assert_eq!(
+            store.get(keys::OLLAMA_API_KEY_HOST).ok().as_deref(),
+            Some("https://gpu.example/ollama"),
+            "{label}: recorded as the replaced server's"
+        );
+    }
+}
+
 /// Negative space: with no memory configured at all, consolidation reports the
 /// missing store rather than reaching the dreaming gate.
 #[tokio::test]
@@ -539,4 +741,78 @@ async fn a_scheduled_job_can_post_into_an_existing_conversation_only() {
 
     let unrouted = cp.handle("test", add(None)).await;
     assert_eq!(unrouted["status"], "created");
+}
+
+/// `[llm].ollama_url` is retired: summaries go through chat's router and its
+/// one Ollama server. A `set` of it used to answer `updated` while serde
+/// dropped the key on the round trip, so a script that moved its summarizer
+/// that way would never learn it no longer does.
+#[tokio::test]
+async fn setting_a_retired_key_is_refused_with_what_replaced_it() {
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let before = cp.config.read().await.clone();
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.ollama_url".into(),
+                value: json!("http://gpu.example:11434"),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["error"], "retired_key", "{resp}");
+    assert_eq!(resp["path"], "llm.ollama_url", "{resp}");
+    let message = resp["message"].as_str().unwrap_or_default();
+    assert!(message.contains("memory.ollama_host"), "{message}");
+    assert_eq!(
+        cp.config.read().await.memory.ollama_host,
+        before.memory.ollama_host,
+        "nothing else moves"
+    );
+}
+
+/// The same key inside an object set at its parent is refused the same way:
+/// a `set` of `llm` carrying `ollama_url` used to answer `updated` and drop
+/// the key, and the rest of the object with it went through unnoticed.
+#[tokio::test]
+async fn a_retired_key_inside_a_parent_object_is_refused_too() {
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let before = cp.config.read().await.llm.model.clone();
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm".into(),
+                value: json!({
+                    "model": "nanna-test-other-model",
+                    "ollama_url": "http://gpu.example:11434",
+                }),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["error"], "retired_key", "{resp}");
+    assert_eq!(resp["path"], "llm", "{resp}");
+    let message = resp["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("ollama_url") && message.contains("memory.ollama_host"),
+        "{message}"
+    );
+    assert_eq!(cp.config.read().await.llm.model, before, "nothing is applied");
+
+    // The same object without the retired key is an ordinary set.
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm".into(),
+                value: json!({ "model": "nanna-test-other-model" }),
+            }),
+        )
+        .await;
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(cp.config.read().await.llm.model, "nanna-test-other-model");
 }

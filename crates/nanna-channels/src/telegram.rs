@@ -21,6 +21,27 @@ pub struct TelegramChannel {
     client: Client,
     bot_token: String,
     default_parse_mode: Option<String>,
+    /// `https://api.telegram.org`, or a self-hosted Bot API server.
+    api_base: String,
+}
+
+/// Longest draft Telegram accepts, in characters (the message text limit).
+pub const TELEGRAM_DRAFT_CHARS_MAX: usize = 4096;
+
+/// The text a draft shows for `text`: all of it when it fits, else its tail
+/// behind a marker, so the newest words stay visible as the reply grows. Pure.
+#[must_use]
+pub fn draft_text(text: &str) -> String {
+    const MARKER: &str = "…";
+    let count = text.chars().count();
+    if count <= TELEGRAM_DRAFT_CHARS_MAX {
+        return text.to_string();
+    }
+    let keep = TELEGRAM_DRAFT_CHARS_MAX - MARKER.chars().count();
+    let tail: String = text.chars().skip(count - keep).collect();
+    let shown = format!("{MARKER}{tail}");
+    debug_assert_eq!(shown.chars().count(), TELEGRAM_DRAFT_CHARS_MAX);
+    shown
 }
 
 impl TelegramChannel {
@@ -35,7 +56,59 @@ impl TelegramChannel {
             client,
             bot_token: bot_token.into(),
             default_parse_mode: Some("Markdown".to_string()),
+            api_base: TELEGRAM_API_BASE.to_string(),
         }
+    }
+
+    /// Talk to `api_base` instead of `https://api.telegram.org` — a
+    /// self-hosted Bot API server (or a test double).
+    #[must_use]
+    pub fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
+        self.api_base = api_base.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Stream `text` into a private chat as the reply's draft
+    /// (`sendMessageDraft`, Bot API 9.x+; private chats only).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send_typing`].
+    ///
+    /// # Panics
+    ///
+    /// On a zero `draft_id` — Telegram rejects it, so it is a caller bug.
+    pub async fn send_message_draft(
+        &self,
+        chat_id: i64,
+        draft_id: i64,
+        text: &str,
+    ) -> Result<bool, ChannelError> {
+        #[derive(Serialize)]
+        struct DraftParams {
+            chat_id: i64,
+            draft_id: i64,
+            text: String,
+            /// Show a stop button; a press arrives as `stopped_message_generation`
+            /// (Bot API 10.3), which the listener turns into `/stop`.
+            can_stop: bool,
+            /// Keep what was written visible after a stop, until the final
+            /// message (the partial answer) replaces it.
+            keep_on_stop: bool,
+        }
+        assert!(draft_id != 0, "Telegram requires a non-zero draft_id");
+        debug_assert!(chat_id > 0, "drafts exist only in private chats");
+        self.request(
+            "sendMessageDraft",
+            DraftParams {
+                chat_id,
+                draft_id,
+                text: draft_text(text),
+                can_stop: true,
+                keep_on_stop: true,
+            },
+        )
+        .await
     }
 
     /// Set the default parse mode for messages.
@@ -47,7 +120,7 @@ impl TelegramChannel {
 
     /// Build the API URL for a method.
     fn api_url(&self, method: &str) -> String {
-        format!("{}/bot{}/{}", TELEGRAM_API_BASE, self.bot_token, method)
+        format!("{}/bot{}/{}", self.api_base, self.bot_token, method)
     }
 
     /// Make an API request.
@@ -770,6 +843,31 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
+    /// A positive chat id is a private chat (groups and channels are
+    /// negative), which is the only place Telegram shows drafts.
+    fn supports_drafts(&self, channel: &ChannelId) -> bool {
+        channel.id.parse::<i64>().is_ok_and(|chat_id| chat_id > 0)
+    }
+
+    async fn send_draft(
+        &self,
+        channel: &ChannelId,
+        draft_id: i64,
+        text: &str,
+    ) -> Result<(), ChannelError> {
+        let chat_id: i64 = channel
+            .id
+            .parse()
+            .map_err(|_| ChannelError::Send("Invalid chat ID".to_string()))?;
+        if chat_id <= 0 {
+            return Ok(());
+        }
+        // Empty text is deliberate: Telegram shows its animated "Thinking…"
+        // placeholder for it, which is what a turn shows before its words.
+        self.send_message_draft(chat_id, draft_id, text).await?;
+        Ok(())
+    }
+
     async fn send_typing(&self, channel_id: &ChannelId) -> Result<(), ChannelError> {
         let chat_id: i64 = channel_id
             .id
@@ -800,6 +898,85 @@ impl Channel for TelegramChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_draft_shows_its_newest_words() {
+        assert_eq!(draft_text("short"), "short");
+        let long: String = "a".repeat(TELEGRAM_DRAFT_CHARS_MAX) + "END";
+        let shown = draft_text(&long);
+        assert_eq!(shown.chars().count(), TELEGRAM_DRAFT_CHARS_MAX);
+        assert!(shown.starts_with('…'));
+        assert!(shown.ends_with("aEND"), "the tail survives");
+        let multibyte = "é".repeat(TELEGRAM_DRAFT_CHARS_MAX + 10);
+        assert_eq!(
+            draft_text(&multibyte).chars().count(),
+            TELEGRAM_DRAFT_CHARS_MAX,
+            "counted in chars, not bytes"
+        );
+    }
+
+    #[test]
+    fn drafts_are_offered_for_private_chats_only() {
+        let telegram = TelegramChannel::new("123:ABC");
+        assert!(telegram.supports_drafts(&ChannelId::new("telegram", "4242")));
+        assert!(
+            !telegram.supports_drafts(&ChannelId::new("telegram", "-1001234")),
+            "a group"
+        );
+        assert!(!telegram.supports_drafts(&ChannelId::new("telegram", "not-a-number")));
+    }
+
+    #[tokio::test]
+    async fn a_draft_is_posted_as_send_message_draft() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 4096];
+            // Read until the JSON body is complete (headers + a closing brace).
+            while !request.ends_with(b"}") {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"ok":true,"result":true}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let telegram = TelegramChannel::new("123:ABC").with_api_base(base);
+        telegram
+            .send_draft(&ChannelId::new("telegram", "4242"), 7, "Thinking about it")
+            .await
+            .expect("sent");
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("POST /bot123:ABC/sendMessageDraft "),
+            "{request}"
+        );
+        let body = &request[request.find('{').unwrap()..];
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "chat_id": 4242, "draft_id": 7, "text": "Thinking about it",
+                "can_stop": true, "keep_on_stop": true
+            })
+        );
+
+        // A group chat is not asked at all (no server is listening now).
+        telegram
+            .send_draft(&ChannelId::new("telegram", "-1001"), 7, "x")
+            .await
+            .expect("a no-op, not an error");
+    }
 
     #[test]
     fn test_api_url() {

@@ -80,6 +80,13 @@ struct Cli {
     /// Disable rotating file logs (console + in-memory buffer only).
     #[arg(long)]
     no_file_log: bool,
+
+    /// Shut down (gracefully) when the process that started this daemon
+    /// exits. The GUI passes it for its sidecar, so a killed GUI does not
+    /// leave a daemon holding its port and store; a standalone daemon never
+    /// gets it. Unix only — on Windows the GUI's Job Object already does this.
+    #[arg(long)]
+    exit_with_parent: bool,
 }
 
 /// The switches for the daemon's optional servers and its PID file.
@@ -306,6 +313,11 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
             });
         }
 
+        #[cfg(unix)]
+        if cli.exit_with_parent {
+            spawn_parent_watch(shutdown_tx.clone(), daemon.exit_reason_handle());
+        }
+
         #[cfg(windows)]
         {
             let shutdown = shutdown_tx.clone();
@@ -319,6 +331,56 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
         
         daemon.run().await.map_err(|e| e.to_string())
     })
+}
+
+/// How often the daemon checks that its parent is still alive under
+/// `--exit-with-parent`: one cheap syscall a second bounds how long an
+/// orphaned sidecar lives before its graceful shutdown starts.
+#[cfg(unix)]
+const PARENT_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the parent that started us is gone: a process whose parent exits
+/// is re-parented (to init or a subreaper), so its parent id changes. Pure.
+#[cfg(unix)]
+const fn parent_gone(original: u32, now: u32) -> bool {
+    now != original
+}
+
+/// Watch for the parent's exit and then shut down the way a signal does:
+/// record why, and send the drain broadcast (which, among other things,
+/// closes the MCP servers this daemon started).
+#[cfg(unix)]
+fn spawn_parent_watch(
+    shutdown: tokio::sync::broadcast::Sender<()>,
+    exit_reason: nanna_daemon::exit_reason::ExitReasonFile,
+) {
+    let original = std::os::unix::process::parent_id();
+    assert!(original > 0, "a running process always has a parent");
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PARENT_POLL);
+        loop {
+            tick.tick().await;
+            let now = std::os::unix::process::parent_id();
+            if parent_gone(original, now) {
+                info!("Parent process {original} exited (now re-parented to {now}); shutting down");
+                exit_reason.record_exit("parent_exited", None);
+                let _ = shutdown.send(());
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(all(test, unix))]
+mod parent_watch_tests {
+    use super::parent_gone;
+
+    #[test]
+    fn a_changed_parent_id_means_the_parent_is_gone() {
+        assert!(!parent_gone(4242, 4242));
+        assert!(parent_gone(4242, 1), "re-parented to init");
+        assert!(parent_gone(4242, 777), "re-parented to a subreaper");
+    }
 }
 
 fn start_service(cli: &Cli) -> Result<(), String> {

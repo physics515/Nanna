@@ -71,9 +71,10 @@
             <div class="px-8 empty:hidden">
               <ConnectionStatus
                 v-if="!isOnline"
-                status="offline"
+                :status="daemonStarting ? 'connecting' : 'offline'"
+                :title-override="backendLabel.short"
                 :visible="true"
-                :can-retry="true"
+                :can-retry="!daemonStarting"
                 :message="offlineDetail"
                 @retry="onReconnect"
               />
@@ -265,11 +266,13 @@ import { parseEditDiff } from '~/lib/editDiff'
 import { parseSessionMessageAdded, shouldAppendSessionMessage } from '~/lib/sessionMessageAdded'
 import { shouldReloadForClear } from '~/lib/sessionCleared'
 
-const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend } = useBackend()
+const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend, label: backendLabel } = useBackend()
+// A booting daemon has nothing to retry: the app attaches it as soon as its
+// port opens, and the banner says how long it has been.
+const daemonStarting = computed(() => backendStatus.value?.daemon_state === 'starting')
 const offlineDetail = computed(() => {
-  const url = backendStatus.value?.daemon_url || 'ws://127.0.0.1:5149'
-  const host = String(url).replace(/^wss?:\/\//, '')
-  return 'Daemon not reachable on ' + host + '. Chat needs the control plane.'
+  const tooltip = backendLabel.value.tooltip
+  return tooltip + (/[.…]$/.test(tooltip) ? ' ' : '. ') + 'Chat needs the control plane.'
 })
 async function onReconnect() {
   try {

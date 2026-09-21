@@ -113,6 +113,10 @@ import {
 import { provideSettingsPage } from '~/composables/useSettingsPage'
 import { useBackend } from '~/composables/useBackend'
 
+// Works without a daemon, and holds fields being edited: the startup gate's
+// first attach keeps this page instead of remounting it (useStartupGate).
+definePageMeta({ worksOffline: true })
+
 const route = useRoute()
 const router = useRouter()
 

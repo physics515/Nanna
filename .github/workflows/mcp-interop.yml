@@ -1,0 +1,65 @@
+# MCP interop: nanna-mcp against the REAL reference SDK servers and client.
+#
+# `crates/nanna-mcp/tests/dual_era_live.rs` drives the official TypeScript SDK
+# (`@modelcontextprotocol/server` 2.0, `server-everything`, pinned by the
+# fixture's package-lock) over stdio, Streamable HTTP (modern and 2025-era) and
+# the deprecated HTTP+SSE transport, plus a server on the official Rust SDK
+# (`tests/fixtures/rmcp-server`, built by the test) — including multi-round-trip elicitation,
+# `x-mcp-header` mirroring and list-change delivery. Those tests are `#[ignore]`
+# locally because they need Node and an `npm ci`; without this job nothing
+# would ever run them, and the protocol moves (2026-07-28 removed the
+# `initialize` handshake, and the first real modern client found a caching
+# field our own reading of the spec had missed).
+name: mcp-interop
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "crates/nanna-mcp/**"
+      - "crates/nanna-agent/src/mcp.rs"
+      - ".github/workflows/mcp-interop.yml"
+  pull_request:
+    paths:
+      - "crates/nanna-mcp/**"
+      - "crates/nanna-agent/src/mcp.rs"
+      - ".github/workflows/mcp-interop.yml"
+
+concurrency:
+  group: mcp-interop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-sdk:
+    name: nanna-mcp vs the reference SDKs
+    runs-on: ubuntu-latest
+    # Measured: the first run (cold cache, PR #344) took 3m23s end to end,
+    # 2m44s of it building and running the suite (11 tests, 25 s). 15 is ~4x
+    # that — room for a cache miss on a slow runner. Re-measure rather than
+    # raise.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same pin as every other job; keep in lockstep with rust-toolchain.toml.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-17
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mcp-interop
+
+      # The SDK packages declare `node >=20`; 22 matches gui.yml.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install the pinned reference SDKs
+        working-directory: crates/nanna-mcp/tests/fixtures/sdk-servers
+        run: npm ci --no-audit --no-fund
+
+      - name: Run the live interop suite
+        run: cargo test -p nanna-mcp --test dual_era_live --locked -- --ignored

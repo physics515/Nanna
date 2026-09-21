@@ -7,6 +7,7 @@ use crate::transport::Transport;
 use crate::{McpClient, McpError, Tool as McpTool, ToolContent};
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "tools-integration")]
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -86,6 +87,12 @@ mod tools_impl {
     use nanna_tools::{ParameterType, Tool, ToolDefinition, ToolError, ToolParameter, ToolResult};
     use serde_json::Value;
     use std::collections::HashSet;
+
+    /// Least time between two registry resyncs in
+    /// [`McpToolsManager::watch_list_changes`]: one second coalesces a burst
+    /// of announcements into one `tools/list` without making a real change
+    /// wait noticeably.
+    pub const RESYNC_INTERVAL_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// Wrapper that adapts an MCP tool to the nanna-tools `Tool` trait
     pub struct McpToolWrapper<T: Transport + 'static> {
@@ -416,24 +423,215 @@ mod tools_impl {
             Ok(())
         }
 
-        /// Close all connections
+        /// Re-read one server's tools and bring `registry` in line with them:
+        /// tools it no longer offers are unregistered, the rest (new or
+        /// changed) registered over their old entries. Returns
+        /// `(registered, removed)`.
         ///
         /// # Errors
         ///
-        /// Returns error if any close fails
+        /// Returns [`McpError::Protocol`] for an unknown server, or the
+        /// refresh error; the registry is untouched on error.
+        pub async fn resync_server(
+            &self,
+            server: &str,
+            registry: &nanna_tools::ToolRegistry,
+        ) -> Result<(usize, usize), McpError> {
+            let client = self
+                .clients
+                .read()
+                .await
+                .get(server)
+                .cloned()
+                .ok_or_else(|| McpError::Protocol(format!("unknown MCP server '{server}'")))?;
+            let fresh: Vec<Arc<McpToolWrapper<T>>> = client
+                .refresh_tools()
+                .await?
+                .into_iter()
+                .map(|tool| Arc::new(McpToolWrapper::new(client.clone(), tool, server)))
+                .collect();
+            let fresh_names: HashSet<String> = fresh.iter().map(|w| w.full_name()).collect();
+            let mut gone: Vec<String> = Vec::new();
+            {
+                let mut wrappers = self.tool_wrappers.write().await;
+                wrappers.retain(|wrapper| {
+                    if wrapper.prefix != server {
+                        return true;
+                    }
+                    let name = wrapper.full_name();
+                    if !fresh_names.contains(&name) {
+                        gone.push(name);
+                    }
+                    false
+                });
+                wrappers.extend(fresh.iter().cloned());
+            }
+            for name in &gone {
+                registry.unregister(name).await;
+            }
+            for wrapper in &fresh {
+                registry.register_boxed(wrapper.clone()).await;
+            }
+            debug_assert!(gone.iter().all(|name| !fresh_names.contains(name)));
+            Ok((fresh.len(), gone.len()))
+        }
+
+        /// Keep `registry` in step with every server's tool list until `stop`
+        /// resolves: wait for any server to announce a change, resync the
+        /// servers whose tools changed, repeat. Resyncs are at least
+        /// [`RESYNC_INTERVAL_MIN`] apart, so a server announcing changes in a
+        /// burst (or in a loop) costs one `tools/list` per interval, not one
+        /// per announcement.
+        pub async fn watch_list_changes(
+            &self,
+            registry: &nanna_tools::ToolRegistry,
+            stop: impl std::future::Future<Output = ()>,
+        ) {
+            let watched: Vec<(String, Arc<crate::transport::ListChangedFlags>)> = self
+                .clients
+                .read()
+                .await
+                .iter()
+                .filter_map(|(name, client)| client.list_changed_flags().map(|f| (name.clone(), f)))
+                .collect();
+            tokio::pin!(stop);
+            if watched.is_empty() {
+                stop.await;
+                return;
+            }
+            loop {
+                let any_change = futures::future::select_all(
+                    watched.iter().map(|(_, flags)| Box::pin(flags.changed())),
+                );
+                tokio::select! {
+                    () = &mut stop => return,
+                    _ = any_change => {}
+                }
+                for (server, flags) in &watched {
+                    if !flags.take(crate::transport::McpList::Tools) {
+                        continue;
+                    }
+                    match self.resync_server(server, registry).await {
+                        Ok((registered, removed)) => tracing::info!(
+                            server = %server, registered, removed,
+                            "MCP tool list changed; registry resynced"
+                        ),
+                        Err(e) => warn!(server = %server, error = %e, "MCP tool resync failed"),
+                    }
+                }
+                tokio::select! {
+                    () = &mut stop => return,
+                    () = tokio::time::sleep(RESYNC_INTERVAL_MIN) => {}
+                }
+            }
+        }
+
+        /// Close all connections, concurrently: each close may spend a grace
+        /// period waiting for its server to exit, and one slow or failing
+        /// server must not keep the others running.
+        ///
+        /// # Errors
+        ///
+        /// Returns the first close error, after every close has been attempted.
         pub async fn close_all(&self) -> Result<(), McpError> {
             let clients = self.clients.read().await;
-            for client in clients.values() {
-                client.close().await?;
-            }
+            let outcomes =
+                futures::future::join_all(clients.values().map(|client| client.close())).await;
+            debug_assert_eq!(outcomes.len(), clients.len());
             drop(clients);
-            Ok(())
+            outcomes.into_iter().collect()
         }
     }
 
     impl<T: Transport + 'static> Default for McpToolsManager<T> {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    mod resync_tests {
+        use super::{McpClient, McpToolsManager};
+        use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+        use crate::transport::{ListChangedFlags, McpList, Transport};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Serves `[a, b]` on the first `tools/list` and `[b, c]` after.
+        struct ShiftingTools {
+            calls: AtomicUsize,
+            flags: Arc<ListChangedFlags>,
+        }
+
+        #[async_trait::async_trait]
+        impl Transport for ShiftingTools {
+            async fn request(&self, request: JsonRpcRequest) -> crate::Result<JsonRpcResponse> {
+                let names = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ["a", "b"]
+                } else {
+                    ["b", "c"]
+                };
+                let tools: Vec<_> = names
+                    .iter()
+                    .map(|n| serde_json::json!({ "name": n, "inputSchema": { "type": "object" } }))
+                    .collect();
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: request.id,
+                    result: Some(serde_json::json!({ "tools": tools })),
+                    error: None,
+                })
+            }
+            async fn notify(&self, _n: JsonRpcNotification) -> crate::Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
+                Some(self.flags.clone())
+            }
+        }
+
+        async fn names(registry: &nanna_tools::ToolRegistry) -> Vec<String> {
+            let mut names = Vec::new();
+            for name in ["mcp__srv__a", "mcp__srv__b", "mcp__srv__c"] {
+                if registry.get(name).await.is_some() {
+                    names.push(name.trim_start_matches("mcp__srv__").to_string());
+                }
+            }
+            names
+        }
+
+        #[tokio::test]
+        async fn a_list_change_adds_and_removes_registry_tools() {
+            let flags = Arc::new(ListChangedFlags::default());
+            let client = McpClient::new(ShiftingTools {
+                calls: AtomicUsize::new(0),
+                flags: flags.clone(),
+            });
+            client.mark_initialized_for_test().await;
+            client.refresh_tools().await.unwrap();
+            let manager = McpToolsManager::new();
+            manager.register("srv", client).await.unwrap();
+            let registry = nanna_tools::ToolRegistry::new();
+            manager.register_with_registry(&registry).await.unwrap();
+            assert_eq!(names(&registry).await, ["a", "b"]);
+
+            // The server announces a change; the watch loop resyncs and stops.
+            flags.mark(McpList::Tools);
+            let stop = tokio::time::sleep(std::time::Duration::from_millis(300));
+            manager.watch_list_changes(&registry, stop).await;
+            assert_eq!(
+                names(&registry).await,
+                ["b", "c"],
+                "a removed, c added, b kept"
+            );
+            assert_eq!(
+                manager.tools().await.len(),
+                2,
+                "the manager's own list matches"
+            );
         }
     }
 
@@ -530,7 +728,7 @@ mod tools_impl {
 }
 
 #[cfg(feature = "tools-integration")]
-pub use tools_impl::{McpToolWrapper, McpToolsManager};
+pub use tools_impl::{McpToolWrapper, McpToolsManager, RESYNC_INTERVAL_MIN};
 
 // ============================================================================
 // Standalone adapter (no nanna-tools dependency)
@@ -709,16 +907,17 @@ impl<T: Transport + 'static> McpManager<T> {
         Ok(())
     }
 
-    /// Close all connections
+    /// Close all connections concurrently (see the tools manager's
+    /// `close_all` for why).
     ///
     /// # Errors
     ///
-    /// Returns error if any close fails
+    /// Returns the first close error, after every close has been attempted.
     pub async fn close_all(&self) -> Result<(), McpError> {
-        for client in self.clients.values() {
-            client.close().await?;
-        }
-        Ok(())
+        let outcomes =
+            futures::future::join_all(self.clients.values().map(|client| client.close())).await;
+        debug_assert_eq!(outcomes.len(), self.clients.len());
+        outcomes.into_iter().collect()
     }
 }
 

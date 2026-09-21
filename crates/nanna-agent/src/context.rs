@@ -251,33 +251,33 @@ pub enum SummarizationTarget {
 /// Configuration for context summarization
 #[derive(Debug, Clone, Default)]
 pub struct ContextSummarizationConfig {
-    /// Model priority list for summarization (e.g., `["ollama/llama3.2", "anthropic/claude-3-haiku"]`)
+    /// Model priority list for summarization, in the order Settings lists it
+    /// (e.g., `["ollama/llama3.2", "anthropic/claude-haiku-4-5"]`). Walked in
+    /// that order; the next entry is tried whenever one cannot be reached or
+    /// its summary fails.
     pub model_priority: Vec<String>,
-    /// Ollama URL if using ollama models
-    pub ollama_url: Option<String>,
     /// Maximum iterations to prevent infinite loops
     pub max_iterations: usize,
-    /// `OpenRouter` API key (for "openrouter/" prefixed models)
-    pub openrouter_api_key: Option<String>,
-    /// `OpenAI` API key (for "openai/" prefixed models)
-    pub openai_api_key: Option<String>,
+    /// How each `model_priority` entry becomes a client: the agent's injected
+    /// resolver (see [`crate::SummarizerClients`]). `None` resolves nothing,
+    /// so every pass falls through to the announced truncation.
+    pub clients: Option<crate::SummarizerClients>,
 }
 
 impl ContextSummarizationConfig {
     #[must_use]
-    pub fn new(model_priority: Vec<String>) -> Self {
+    pub const fn new(model_priority: Vec<String>) -> Self {
         Self {
             model_priority,
-            ollama_url: Some("http://localhost:11434".to_string()),
             max_iterations: 20,
-            openrouter_api_key: None,
-            openai_api_key: None,
+            clients: None,
         }
     }
 
+    /// Resolve specs through `clients`.
     #[must_use]
-    pub fn with_ollama_url(mut self, url: impl Into<String>) -> Self {
-        self.ollama_url = Some(url.into());
+    pub fn with_clients(mut self, clients: crate::SummarizerClients) -> Self {
+        self.clients = Some(clients);
         self
     }
 }
@@ -2205,48 +2205,19 @@ impl AgentContext {
         }
     }
 
-    /// Create an LLM client for the specified model
+    /// The client and bare model id for one summarization spec.
+    ///
+    /// Through the agent's injected resolver and nothing else. This used to be
+    /// a grammar of its own — a bare name meant Ollama here, the chat client in
+    /// the loop runner and Anthropic in the router, `anthropic/` was refused
+    /// outright, and `ollama/` went to `[llm].ollama_url` without the token —
+    /// so one Settings entry reached three different places depending on which
+    /// consumer ran.
     fn create_client_for_model(
         model_spec: &str,
         config: &ContextSummarizationConfig,
     ) -> Result<(LlmClient, String), String> {
-        if let Some((provider, model)) = model_spec.split_once('/') {
-            let client = match provider.to_lowercase().as_str() {
-                "ollama" => {
-                    let url = config.ollama_url.as_deref().unwrap_or("http://localhost:11434");
-                    LlmClient::ollama(url)
-                }
-                "anthropic" => {
-                    // This would need API key - for now return error
-                    // In practice, the Agent passes its own client
-                    return Err(
-                        "Anthropic summarization requires passing main client".to_string()
-                    );
-                }
-                "openai" => {
-                    if let Some(ref api_key) = config.openai_api_key {
-                        LlmClient::openai(api_key)
-                    } else {
-                        return Err("OpenAI summarization requires API key (set openai_api_key)".to_string());
-                    }
-                }
-                "openrouter" => {
-                    if let Some(ref api_key) = config.openrouter_api_key {
-                        LlmClient::openrouter(api_key)
-                    } else {
-                        return Err("OpenRouter summarization requires API key (set openrouter_api_key)".to_string());
-                    }
-                }
-                _ => {
-                    return Err(format!("Unknown provider: {provider}"));
-                }
-            };
-            Ok((client, model.to_string()))
-        } else {
-            // No provider prefix - assume ollama
-            let url = config.ollama_url.as_deref().unwrap_or("http://localhost:11434");
-            Ok((LlmClient::ollama(url), model_spec.to_string()))
-        }
+        crate::summarizer::resolve_summarizer(config.clients.as_ref(), model_spec)
     }
 
     /// Replace summarized content with the summary.
@@ -3113,12 +3084,13 @@ mod tests {
         // walks the latch down rung by rung (3/4 on the 512 quantum, clamped
         // at the caller's floor), and the effective window follows. (An
         // unlatched model starts from the ladder ceiling.)
-        while LlmClient::demote_context(model, Some(4_096)).is_some() {}
-        let live = nanna_llm::effective_context_window(model, claim.context_window);
+        let llm = LlmClient::ollama("http://127.0.0.1:9");
+        while llm.demote_context(model, Some(4_096)).is_some() {}
+        let live = llm.effective_context_window(model, claim.context_window);
         assert_eq!(live, 4_096, "the latch is the live window source");
 
         // The rebind the agent loop performs: every budget re-derives.
-        let live_info = nanna_llm::clamp_model_info_to_effective_window(model, claim);
+        let live_info = llm.clamp_model_info_to_effective_window(model, claim);
         ctx.configure_for_model_with_output(&live_info, 2_048);
         assert!(ctx.hard_limit < old_hard, "hard limit must shrink with the window");
         assert!(ctx.compression_threshold < old_threshold);

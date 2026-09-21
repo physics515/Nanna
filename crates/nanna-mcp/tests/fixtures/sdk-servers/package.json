@@ -1,0 +1,12 @@
+{
+  "name": "nanna-mcp-sdk-servers",
+  "private": true,
+  "type": "module",
+  "description": "Reference MCP SDK servers for crates/nanna-mcp/tests/dual_era_live.rs",
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server-everything": "2026.8.31",
+    "zod": "4.6.5"
+  }
+}

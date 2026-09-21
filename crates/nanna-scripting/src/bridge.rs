@@ -754,58 +754,9 @@ impl NannaBridge {
         #[cfg(windows)]
         let command: &str = drive_normalized.as_ref();
 
-        // Determine shell based on OS.
-        // On Windows, route commands to the appropriate shell:
-        // - `python[3] -c "..."` one-liners → python directly (cmd/quote mangling)
-        // - explicit PowerShell (`$env:`, `Verb-Noun` cmdlets, `powershell`/`pwsh`) → powershell.exe
-        // - everything else → Git Bash (models write POSIX/bash by default), falling
-        //   back to cmd.exe only when Git Bash isn't installed.
+        // Determine shell based on OS (see `windows_shell_command` for the routing).
         #[cfg(windows)]
-        let mut cmd = {
-            let trimmed = command.trim_start();
-
-            // Detect `python[3] -c "..."` one-liners (route directly to avoid quote
-            // mangling). Compound commands (&&, ||) are handled by the shell below.
-            let is_python_c = (trimmed.starts_with("python3 -c") || trimmed.starts_with("python -c"))
-                && !trimmed.contains("&&")
-                && !trimmed.contains("||");
-
-            if is_python_c {
-                // Parse: "python[3] -c 'code'" or 'python[3] -c "code"'
-                let (exe, rest) = if trimmed.starts_with("python3") {
-                    ("python3", trimmed.strip_prefix("python3 -c").unwrap_or("").trim())
-                } else {
-                    ("python", trimmed.strip_prefix("python -c").unwrap_or("").trim())
-                };
-                // Strip outer quotes if present
-                let code = strip_outer_quotes(rest);
-                let mut c = tokio::process::Command::new(exe);
-                c.args(["-c", code]);
-                c
-            } else {
-                match classify_windows_command(trimmed) {
-                    WinShell::PowerShell => {
-                        let mut c = tokio::process::Command::new("powershell.exe");
-                        c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
-                        c
-                    }
-                    WinShell::Bash => {
-                        // The model writes POSIX/bash — run through Git Bash if present
-                        // (handles `[ -f ]`, cat, tail, &&, |, quoting, forward-slash
-                        // paths); fall back to cmd.exe only when Git Bash isn't installed.
-                        if let Some(bash) = git_bash_path() {
-                            let mut c = tokio::process::Command::new(bash);
-                            c.args(["-c", command]);
-                            c
-                        } else {
-                            let mut c = tokio::process::Command::new("cmd");
-                            c.args(["/S", "/C", command]);
-                            c
-                        }
-                    }
-                }
-            }
-        };
+        let mut cmd = windows_shell_command(command);
         #[cfg(not(windows))]
         let mut cmd = {
             let mut c = tokio::process::Command::new("sh");
@@ -1497,6 +1448,63 @@ pub struct LogEntry {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// Build the Windows child for `command`: `python[3] -c` one-liners run
+/// python directly (cmd/quote mangling), explicit PowerShell goes to
+/// `powershell.exe`, and everything else to Git Bash, falling back to
+/// `cmd.exe` only when Git Bash is not installed.
+#[cfg(windows)]
+fn windows_shell_command(command: &str) -> tokio::process::Command {
+    let trimmed = command.trim_start();
+
+    // Detect `python[3] -c "..."` one-liners (route directly to avoid quote
+    // mangling). Compound commands (&&, ||) are handled by the shell below.
+    let is_python_c = (trimmed.starts_with("python3 -c") || trimmed.starts_with("python -c"))
+        && !trimmed.contains("&&")
+        && !trimmed.contains("||");
+
+    if is_python_c {
+        // Parse: "python[3] -c 'code'" or 'python[3] -c "code"'
+        let (exe, rest) = if trimmed.starts_with("python3") {
+            (
+                "python3",
+                trimmed.strip_prefix("python3 -c").unwrap_or("").trim(),
+            )
+        } else {
+            (
+                "python",
+                trimmed.strip_prefix("python -c").unwrap_or("").trim(),
+            )
+        };
+        // Strip outer quotes if present
+        let code = strip_outer_quotes(rest);
+        let mut c = tokio::process::Command::new(exe);
+        c.args(["-c", code]);
+        c
+    } else {
+        match classify_windows_command(trimmed) {
+            WinShell::PowerShell => {
+                let mut c = tokio::process::Command::new("powershell.exe");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+                c
+            }
+            WinShell::Bash => {
+                // The model writes POSIX/bash — run through Git Bash if present
+                // (handles `[ -f ]`, cat, tail, &&, |, quoting, forward-slash
+                // paths); fall back to cmd.exe only when Git Bash isn't installed.
+                if let Some(bash) = git_bash_path() {
+                    let mut c = tokio::process::Command::new(bash);
+                    c.args(["-c", command]);
+                    c
+                } else {
+                    let mut c = tokio::process::Command::new("cmd");
+                    c.args(["/S", "/C", command]);
+                    c
+                }
+            }
+        }
+    }
+}
+
 /// What `scrub_appimage_library_path` decided about the child's
 /// `LD_LIBRARY_PATH`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1544,12 +1552,12 @@ fn scrub_appimage_library_path(
     if kept.is_empty() {
         return ScrubbedLibraryPath::Cleared;
     }
-    match std::env::join_paths(&kept) {
-        Ok(joined) => ScrubbedLibraryPath::Narrowed(joined),
-        // A kept entry contains the separator itself — cannot be re-encoded.
-        // Leave the variable alone rather than hand the child a mangled one.
-        Err(_) => ScrubbedLibraryPath::Unchanged,
-    }
+    // A kept entry that contains the separator itself cannot be re-encoded:
+    // leave the variable alone rather than hand the child a mangled one.
+    std::env::join_paths(&kept).map_or(
+        ScrubbedLibraryPath::Unchanged,
+        ScrubbedLibraryPath::Narrowed,
+    )
 }
 
 #[cfg(test)]
