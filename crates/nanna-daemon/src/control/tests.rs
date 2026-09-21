@@ -630,6 +630,63 @@ async fn a_change_that_brings_in_no_secret_leaves_the_store_alone() {
     );
 }
 
+/// A change that brings one secret in files that one, and none of the others
+/// the running config holds. Those here came from the environment at load:
+/// filed with it, a key outlived its variable — unset or rotated, and the
+/// restarted daemon ran on the stale copy in the keyring — and a secret the
+/// operator only ever exported was on disk.
+#[tokio::test]
+async fn a_change_files_only_the_secrets_it_brings_in() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    {
+        let mut config = cp.config.write().await;
+        config.tools.brave_api_key = Some("brave-from-the-environment".to_string());
+        config.llm.api_key = Some("sk-ant-from-the-environment".to_string());
+        config.memory.ollama_host = "https://gpu.example/ollama".to_string();
+        config.llm.ollama_api_key = Some("ollama-from-the-environment".to_string());
+    }
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.github_token".into(),
+                value: json!("ghp-set-by-config-set"),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(
+        store.get(keys::GITHUB_TOKEN).ok().as_deref(),
+        Some("ghp-set-by-config-set"),
+        "the secret set is filed"
+    );
+    assert_eq!(
+        store.list_keys(),
+        [keys::GITHUB_TOKEN],
+        "and nothing else is"
+    );
+    assert!(!store.exists(keys::OLLAMA_API_KEY_HOST));
+    let config = cp.config.read().await;
+    assert_eq!(
+        config.tools.brave_api_key.as_deref(),
+        Some("brave-from-the-environment"),
+        "the running config keeps what it did not file"
+    );
+    assert_eq!(
+        config.llm.api_key.as_deref(),
+        Some("sk-ant-from-the-environment")
+    );
+    assert_eq!(
+        config.llm.ollama_api_key.as_deref(),
+        Some("ollama-from-the-environment")
+    );
+}
+
 /// A secret the store cannot file would live until the next load and then be
 /// gone. The change is refused instead, with why: nothing is applied or saved.
 #[tokio::test]
