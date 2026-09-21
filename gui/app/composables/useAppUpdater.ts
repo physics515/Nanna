@@ -28,8 +28,10 @@ let started = false
 function announce(version: string) {
   if (announcedThisSession === version) return
   announcedThisSession = version
+  // No "in the footer": the startup splash offers Update too, and a first
+  // check can land while it is the only thing on screen.
   toast.info(`Nanna v${version} is available`, {
-    description: 'Click Update in the footer to install and restart.',
+    description: 'Click Update to install it and restart.',
     duration: 8000,
   })
   let osNotified: string | null = null
@@ -47,7 +49,7 @@ function announce(version: string) {
     const { notify } = useNotifications()
     notify({
       title: `Nanna v${version} is available`,
-      body: 'Open Nanna and click Update in the footer to install.',
+      body: 'Open Nanna and click Update to install it.',
     })
   }
 }

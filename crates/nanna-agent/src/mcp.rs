@@ -4,23 +4,49 @@
 //! with the agent's tool registry.
 
 #[cfg(feature = "mcp")]
-use nanna_mcp::{McpClient, McpToolsManager, StdioTransport};
+use nanna_mcp::{
+    AnyTransport, LegacySseTransport, McpClient, McpToolsManager, StdioTransport,
+    StreamableHttpTransport,
+};
 use nanna_tools::ToolRegistry;
 use tracing::{debug, error, info};
 
 /// MCP server configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpServerConfig {
     /// Unique name for this server
     pub name: String,
-    /// Command to run (e.g., "npx", "python", "node")
+    /// Command to run (e.g., "npx", "python", "node"); empty for a `url` server
     pub command: String,
     /// Arguments to pass to the command
     pub args: Vec<String>,
-    /// Environment variables
+    /// Environment variables (values may be secrets — never logged)
     pub env: Vec<(String, String)>,
+    /// Streamable HTTP endpoint; when set, `command`/`args`/`env` are unused
+    pub url: Option<String>,
+    /// Sent as `Authorization: Bearer` to a `url` server (never logged)
+    pub bearer_token: Option<String>,
     /// Whether to auto-start on agent init
     pub auto_start: bool,
+}
+
+/// Redacts every value that may be a secret: `env` values and the token.
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_names: Vec<&str> = self.env.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &env_names)
+            .field("url", &self.url)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("auto_start", &self.auto_start)
+            .finish()
+    }
 }
 
 impl McpServerConfig {
@@ -31,8 +57,24 @@ impl McpServerConfig {
             command: command.into(),
             args: Vec::new(),
             env: Vec::new(),
+            url: None,
+            bearer_token: None,
             auto_start: true,
         }
+    }
+
+    /// A Streamable HTTP server at `url`.
+    pub fn http(name: impl Into<String>, url: impl Into<String>) -> Self {
+        let mut config = Self::new(name, "");
+        config.url = Some(url.into());
+        config
+    }
+
+    /// The bearer token sent to a `url` server.
+    #[must_use]
+    pub fn bearer_token(mut self, token: Option<String>) -> Self {
+        self.bearer_token = token;
+        self
     }
 
     /// Add arguments
@@ -118,12 +160,25 @@ impl McpServerConfig {
 }
 
 /// MCP integration manager for the agent
+/// What starting one MCP server produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpStarted {
+    /// Tools it registered.
+    pub tools: usize,
+    /// The protocol revision and transport it was reached over, e.g.
+    /// `2026-07-28 over Streamable HTTP` — so a fallback (to the 2024
+    /// handshake, or to HTTP+SSE) is visible rather than silent.
+    pub link: String,
+}
+
 #[cfg(feature = "mcp")]
 pub struct McpIntegration {
     /// Tool manager for MCP servers
-    manager: McpToolsManager<StdioTransport>,
+    manager: McpToolsManager<AnyTransport>,
     /// Server configurations
     configs: Vec<McpServerConfig>,
+    /// Serves servers' elicitation requests; `None` declares none.
+    elicitor: Option<std::sync::Arc<dyn nanna_mcp::Elicitor>>,
 }
 
 #[cfg(feature = "mcp")]
@@ -134,7 +189,14 @@ impl McpIntegration {
         Self {
             manager: McpToolsManager::new(),
             configs: Vec::new(),
+            elicitor: None,
         }
+    }
+
+    /// Put servers' questions (MCP elicitation) to the user through
+    /// `elicitor`. Set before [`Self::start_all`].
+    pub fn set_elicitor(&mut self, elicitor: std::sync::Arc<dyn nanna_mcp::Elicitor>) {
+        self.elicitor = Some(elicitor);
     }
 
     /// Add a server configuration
@@ -155,7 +217,7 @@ impl McpIntegration {
     pub async fn start_all(
         &self,
         registry: &ToolRegistry,
-    ) -> Result<Vec<(String, Result<usize, String>)>, McpStartError> {
+    ) -> Result<Vec<(String, Result<McpStarted, String>)>, McpStartError> {
         let mut outcomes = Vec::with_capacity(self.configs.len());
         for config in &self.configs {
             if !config.auto_start {
@@ -178,25 +240,72 @@ impl McpIntegration {
         Ok(outcomes)
     }
 
-    /// Start a single MCP server
-    async fn start_server(&self, config: &McpServerConfig) -> Result<usize, McpStartError> {
-        info!(server = %config.name, command = %config.command, "Starting MCP server");
-
-        // Convert args and env for spawn
-        let args: Vec<&str> = config.args.iter().map(String::as_str).collect();
-        let env: Vec<(&str, &str)> = config
-            .env
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        // Spawn the MCP client
-        let client = if env.is_empty() {
-            McpClient::spawn(&config.command, &args).await
-        } else {
-            McpClient::spawn_with_env(&config.command, &args, &env).await
+    /// Spawn a `command` server or connect to a `url` one, and run the
+    /// dual-era handshake either way.
+    async fn connect(
+        config: &McpServerConfig,
+        elicitor: Option<std::sync::Arc<dyn nanna_mcp::Elicitor>>,
+    ) -> Result<(McpClient<AnyTransport>, &'static str), nanna_mcp::McpError> {
+        let with_elicitor = |client: McpClient<AnyTransport>| match &elicitor {
+            Some(elicitor) => client.with_elicitor(std::sync::Arc::clone(elicitor)),
+            None => client,
+        };
+        let Some(url) = &config.url else {
+            let args: Vec<&str> = config.args.iter().map(String::as_str).collect();
+            let env: Vec<(&str, &str)> = config
+                .env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let transport = AnyTransport::Stdio(StdioTransport::spawn_with_env(
+                &config.command,
+                &args,
+                &env,
+            )?);
+            let client = with_elicitor(McpClient::new(transport));
+            client.initialize().await?;
+            return Ok((client, "stdio"));
+        };
+        let token = config.bearer_token.clone();
+        let transport =
+            AnyTransport::Http(Box::new(StreamableHttpTransport::new(url, token.clone())?));
+        let client = with_elicitor(McpClient::new(transport));
+        match client.initialize().await {
+            Ok(_) => Ok((client, "Streamable HTTP")),
+            // No Streamable HTTP endpoint here, and no modern error body
+            // either: the binding's cue to try the deprecated HTTP+SSE
+            // transport, which is legacy-only (so no era probe).
+            Err(nanna_mcp::McpError::HttpStatus {
+                status: 400 | 404 | 405,
+                ..
+            }) => {
+                info!(%url, "No Streamable HTTP endpoint; trying the 2024 HTTP+SSE transport");
+                let legacy = LegacySseTransport::connect(url, token).await?;
+                let client = with_elicitor(McpClient::new(AnyTransport::Sse(Box::new(legacy))));
+                client.initialize_legacy().await?;
+                Ok((client, "HTTP+SSE"))
+            }
+            Err(e) => Err(e),
         }
-        .map_err(|e| McpStartError::Spawn(config.name.clone(), e.to_string()))?;
+    }
+
+    /// Start a single MCP server
+    async fn start_server(&self, config: &McpServerConfig) -> Result<McpStarted, McpStartError> {
+        if let Some(url) = &config.url {
+            info!(server = %config.name, %url, "Connecting to MCP server");
+        } else {
+            info!(server = %config.name, command = %config.command, "Starting MCP server");
+        }
+
+        let (client, transport) = Self::connect(config, self.elicitor.clone())
+            .await
+            .map_err(|e| McpStartError::Spawn(config.name.clone(), e.to_string()))?;
+        let link = match client.era().await {
+            nanna_mcp::ProtocolEra::Modern { version } => format!("{version} over {transport}"),
+            nanna_mcp::ProtocolEra::Legacy => {
+                format!("{} over {transport}", nanna_mcp::PROTOCOL_VERSION)
+            }
+        };
 
         // Register with manager
         let tools = self
@@ -208,15 +317,29 @@ impl McpIntegration {
         info!(
             server = %config.name,
             tools = tools.len(),
+            link = %link,
             "MCP server started"
         );
 
-        Ok(tools.len())
+        Ok(McpStarted {
+            tools: tools.len(),
+            link,
+        })
+    }
+
+    /// Keep `registry` in step with every server's tool list until `stop`
+    /// resolves (see [`McpToolsManager::watch_list_changes`]).
+    pub async fn watch(
+        &self,
+        registry: &ToolRegistry,
+        stop: impl std::future::Future<Output = ()>,
+    ) {
+        self.manager.watch_list_changes(registry, stop).await;
     }
 
     /// Get the tool manager
     #[must_use]
-    pub const fn manager(&self) -> &McpToolsManager<StdioTransport> {
+    pub const fn manager(&self) -> &McpToolsManager<AnyTransport> {
         &self.manager
     }
 
@@ -330,6 +453,21 @@ impl Default for McpIntegrationBuilder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_never_prints_a_secret() {
+        let config = super::McpServerConfig::http("notion", "https://x/mcp")
+            .bearer_token(Some("sk-live-123".into()));
+        let stdio = super::McpServerConfig::new("gh", "npx").env([("GITHUB_TOKEN", "ghp_456")]);
+        let printed = format!("{config:?} {stdio:?}");
+        assert!(!printed.contains("sk-live-123"), "{printed}");
+        assert!(!printed.contains("ghp_456"), "{printed}");
+        assert!(
+            printed.contains("GITHUB_TOKEN"),
+            "names stay visible: {printed}"
+        );
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
     use super::*;
 
     #[test]

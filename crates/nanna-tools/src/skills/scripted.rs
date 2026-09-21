@@ -164,8 +164,7 @@ impl ScriptedToolWrapper {
                 let hits = std::thread::spawn(move || {
                     tokio::runtime::Builder::new_current_thread()
                         .build()
-                        .map(|rt| rt.block_on(registry.search_tools(&query, limit)))
-                        .unwrap_or_default()
+                        .map_or_default(|rt| rt.block_on(registry.search_tools(&query, limit)))
                 })
                 .join()
                 .unwrap_or_default();
@@ -360,8 +359,7 @@ fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
     if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
         let required: Vec<&str> = schema.get("required")
             .and_then(|r| r.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
+            .map_or_default(|arr| arr.iter().filter_map(|v| v.as_str()).collect());
         
         for (name, prop) in properties {
             // `string`, and anything absent or unrecognised, reads as a string.

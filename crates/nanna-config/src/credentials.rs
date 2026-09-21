@@ -42,6 +42,13 @@ pub mod keys {
     pub const GITHUB_TOKEN: &str = "github_token";
     pub const BRAVE_API_KEY: &str = "brave_api_key";
     pub const OLLAMA_API_KEY: &str = "ollama_api_key";
+    /// The Ollama server [`OLLAMA_API_KEY`] was saved for (not a secret).
+    ///
+    /// The token is only ever loaded for that server: without the record it
+    /// followed whatever address was configured, so pointing Nanna at another
+    /// server sent it the previous server's token. A token with no record was
+    /// saved by an older build and counts as the current server's.
+    pub const OLLAMA_API_KEY_HOST: &str = "ollama_api_key_host";
     pub const TELEGRAM_BOT_TOKEN: &str = "telegram_bot_token";
     pub const DISCORD_BOT_TOKEN: &str = "discord_bot_token";
     pub const SLACK_BOT_TOKEN: &str = "slack_bot_token";
@@ -154,7 +161,9 @@ impl SecureStore {
         if self.file_only {
             return self.get_from_file(key);
         }
-        let entry = Entry::new(KEYRING_SERVICE, key)?;
+        let Some(entry) = self.open_entry(key)? else {
+            return self.get_from_file(key);
+        };
         match entry.get_password() {
             Ok(value) => {
                 debug!("Retrieved credential '{}' from keyring", key);
@@ -199,7 +208,9 @@ impl SecureStore {
         if self.file_only {
             return self.set_to_file(key, value);
         }
-        let entry = Entry::new(KEYRING_SERVICE, key)?;
+        let Some(entry) = self.open_entry(key)? else {
+            return self.set_to_file(key, value);
+        };
         match entry.set_password(value) {
             Ok(()) => {
                 info!("Stored credential '{}' in keyring", key);
@@ -237,7 +248,9 @@ impl SecureStore {
         if self.file_only {
             return self.delete_from_file(key);
         }
-        let entry = Entry::new(KEYRING_SERVICE, key)?;
+        let Some(entry) = self.open_entry(key)? else {
+            return self.delete_from_file(key);
+        };
         match entry.delete_credential() {
             Ok(()) => {
                 info!("Deleted credential '{}' from keyring", key);
@@ -365,6 +378,159 @@ impl SecureStore {
     }
 
     // =========================================================================
+    // Ollama bearer token, bound to the server it was saved for
+    // =========================================================================
+
+    /// Save the Ollama bearer token for the server at `host`; a blank token
+    /// removes the saved one ([`Self::delete_ollama_token`]).
+    ///
+    /// The steps are ordered so that no failure part-way leaves a token
+    /// recorded for a server it was not saved for: the old token goes first,
+    /// then the server is recorded, then the new token is written. A failure
+    /// leaves no token at all — the error says so and saving again finishes
+    /// the job — never the previous server's token filed under this one.
+    ///
+    /// # Errors
+    /// Returns the backing store's error for the step that failed.
+    pub fn save_ollama_token(&self, token: &str, host: &str) -> Result<(), CredentialError> {
+        let token = token.trim();
+        if token.is_empty() {
+            return self.delete_ollama_token();
+        }
+        let host = crate::ollama::normalize_ollama_host(host);
+        match self.delete(keys::OLLAMA_API_KEY) {
+            Ok(()) | Err(CredentialError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        self.set(keys::OLLAMA_API_KEY_HOST, &host)?;
+        self.set(keys::OLLAMA_API_KEY, token)
+    }
+
+    /// Remove the Ollama bearer token and the record of its server. Absent
+    /// keys are not an error. The token goes first: a record left behind
+    /// without one binds nothing.
+    ///
+    /// # Errors
+    /// Returns the backing store's error when a present key cannot be removed.
+    pub fn delete_ollama_token(&self) -> Result<(), CredentialError> {
+        for key in [keys::OLLAMA_API_KEY, keys::OLLAMA_API_KEY_HOST] {
+            match self.delete(key) {
+                Ok(()) | Err(CredentialError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// The saved Ollama bearer token, trimmed; `None` when there is none or
+    /// it is blank.
+    #[must_use]
+    pub fn ollama_token(&self) -> Option<String> {
+        self.get(keys::OLLAMA_API_KEY)
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    }
+
+    /// The server the saved Ollama token was saved for; `None` when no server
+    /// is recorded (no token, or one saved by an older build).
+    ///
+    /// A blank record is still a record: it was written while the configured
+    /// address was blank, names no server, and so matches none.
+    ///
+    /// # Errors
+    /// Returns the store's error when it cannot say whether a server is
+    /// recorded. That is not the same as none being recorded: a token with no
+    /// record goes to the configured server, so a record that exists but
+    /// could not be read must not pass for an absent one.
+    pub fn ollama_token_host(&self) -> Result<Option<String>, CredentialError> {
+        Ok(self
+            .lookup(keys::OLLAMA_API_KEY_HOST)?
+            .map(|host| crate::ollama::normalize_ollama_host(&host)))
+    }
+
+    /// Record `host` as the saved token's server when the token has none.
+    ///
+    /// Called with the address that is about to be replaced: a token saved by
+    /// an older build counts as the configured server's, and unrecorded it
+    /// would count as the next address's too. Returns whether it recorded.
+    ///
+    /// # Errors
+    /// Returns the backing store's error when the record cannot be written,
+    /// or when the store cannot say whether one is already there — nothing is
+    /// written then, so a record that exists is never overwritten.
+    pub fn bind_unbound_ollama_token(&self, host: &str) -> Result<bool, CredentialError> {
+        if self.ollama_token().is_none() || self.ollama_token_host()?.is_some() {
+            return Ok(false);
+        }
+        self.set(
+            keys::OLLAMA_API_KEY_HOST,
+            &crate::ollama::normalize_ollama_host(host),
+        )?;
+        Ok(true)
+    }
+
+    /// Read `key`, telling "not stored" apart from "could not be read".
+    ///
+    /// [`Self::get`] answers `NotFound` for a keyring that fails (locked, its
+    /// service gone) whenever the file fallback lacks the key too. For a
+    /// credential that is harmless — it is missing either way — but not for
+    /// a record whose absence means something. `Ok(None)` here is only ever
+    /// the definite answer of the store that holds the key.
+    ///
+    /// # Errors
+    /// Returns the keyring's error when it could not answer and the file
+    /// store holds no copy, and the file store's own errors.
+    fn lookup(&self, key: &str) -> Result<Option<String>, CredentialError> {
+        let from_file = || match self.get_from_file(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(CredentialError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        };
+        if self.file_only {
+            return from_file();
+        }
+        let Some(entry) = self.open_entry(key)? else {
+            return from_file();
+        };
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) if self.allow_file_fallback => from_file(),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => match self.allow_file_fallback.then(from_file) {
+                Some(Ok(Some(value))) => Ok(Some(value)),
+                _ => Err(e.into()),
+            },
+        }
+    }
+
+    /// Open the keyring entry for `key`, or `None` when there is no keyring
+    /// to open it in and the file fallback may stand in.
+    ///
+    /// Opening fails *before* any read or write when no keyring backend
+    /// exists at all — measured 2026-09-18: with no Secret Service on the
+    /// session bus, `keyring` 4 answers `NoDefaultStore` from `Entry::new`.
+    /// That is exactly the machine the encrypted file fallback exists for
+    /// (a headless server, a service without a login session), so it must
+    /// not end the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Keyring`] when the entry cannot be opened
+    /// and the store is keyring-only.
+    fn open_entry(&self, key: &str) -> Result<Option<Entry>, CredentialError> {
+        debug_assert!(!self.file_only, "file-only stores never open the keyring");
+        match Entry::new(KEYRING_SERVICE, key) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(e) if self.allow_file_fallback => {
+                debug!("No keyring for '{}' ({}); using the encrypted file", key, e);
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // =========================================================================
     // File Fallback (for systems without keyring support)
     // =========================================================================
 
@@ -482,13 +648,23 @@ impl SecureStore {
         if let Some(parent) = key_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Created 0600 from the first byte: creating it with the default mode
+        // and narrowing afterwards leaves a window where the key is readable.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
         {
-            let mut f = std::fs::File::create(&key_path)?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        {
+            let mut f = options.open(&key_path)?;
             f.write_all(&key)?;
             f.sync_all()?;
         }
         #[cfg(unix)]
         {
+            // A pre-existing file keeps its mode through `open`; narrow it too.
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&key_path)?.permissions();
             perms.set_mode(0o600);
@@ -1553,5 +1729,41 @@ mod tests {
         store_a.set("shared_key", "in_a").unwrap();
         assert_eq!(store_a.get("shared_key").unwrap(), "in_a");
         assert!(matches!(store_b.get("shared_key"), Err(CredentialError::NotFound)));
+    }
+
+    #[test]
+    fn an_unreadable_token_record_is_not_an_absent_one() {
+        // "No server recorded" sends a token to the configured server, so a
+        // store that cannot say must not answer "none" — and must not have a
+        // record written over one it could not read.
+        let dir = TempDir::new().unwrap();
+        let store = SecureStore::file_only_at(dir.path().to_path_buf());
+        assert!(
+            matches!(store.ollama_token_host(), Ok(None)),
+            "nothing stored yet"
+        );
+        store
+            .save_ollama_token("token", "https://a.example")
+            .unwrap();
+        assert_eq!(
+            store.ollama_token_host().unwrap().as_deref(),
+            Some("https://a.example")
+        );
+
+        std::fs::write(dir.path().join("credentials.enc"), b"not an envelope").unwrap();
+        assert!(
+            store.ollama_token_host().is_err(),
+            "unreadable is not absent"
+        );
+        assert!(
+            !store
+                .bind_unbound_ollama_token("https://b.example")
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("credentials.enc")).unwrap(),
+            b"not an envelope",
+            "nothing was written over it"
+        );
     }
 }

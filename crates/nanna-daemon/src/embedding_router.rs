@@ -40,13 +40,30 @@ const BACKOFF_SECS: [u64; 7] = [2, 5, 15, 30, 60, 120, 240];
 ///
 /// A non-rate-limit failure (401 bad key, 402 no credit, 404 wrong model, 422
 /// unprocessable, network down) does not clear on its own — something outside
-/// has to change, and there is no signal for when it does. Retrying per call,
-/// as the 2026-08-02 incident did with a 422ing primary, buys nothing but an
-/// error per write. The only honest recovery is a bounded re-probe horizon,
-/// and the router already has one: the last step of [`BACKOFF_SECS`] is the
-/// longest it is ever willing to assume provider state stays put. Reuse that
-/// rather than invent a second number.
+/// has to change, and in general there is no signal for when it does (the one
+/// there is, a changed credential, lifts the bench at once — see [`Bench`]).
+/// Retrying per call, as the 2026-08-02 incident did with a 422ing primary,
+/// buys nothing but an error per write. The only honest recovery is a bounded
+/// re-probe horizon, and the router already has one: the last step of
+/// [`BACKOFF_SECS`] is the longest it is ever willing to assume provider state
+/// stays put. Reuse that rather than invent a second number.
 const DEMOTION_SECS: u64 = BACKOFF_SECS[BACKOFF_SECS.len() - 1];
+
+/// A provider held out after a deterministic failure.
+#[derive(Debug, Clone, Copy)]
+struct Bench {
+    /// Not called again before this.
+    until: Instant,
+    /// The client's credential generation the failing call was made under.
+    ///
+    /// A refused token is the one deterministic failure whose cause the
+    /// daemon itself can see change: once the user saves a new token, the
+    /// bench stands on a call the provider will never see again, and holding
+    /// the fixed provider out for the rest of the cooldown only stores
+    /// memories without vectors. A bench counts only while the credential is
+    /// still the one it was set under.
+    credential: u64,
+}
 
 /// An embedding provider entry in the router
 struct EmbeddingProviderEntry {
@@ -67,9 +84,10 @@ pub struct EmbeddingRouter {
     /// Generation counter — incremented on every provider switch.
     /// Consumers compare their last-seen generation to detect changes.
     generation: AtomicU64,
-    /// Per-provider bench deadline; `Some(t)` means "do not call before `t`".
-    /// Same length as `providers`. See [`DEMOTION_SECS`].
-    demoted_until: RwLock<Vec<Option<Instant>>>,
+    /// Per-provider bench; `Some` means "do not call before its deadline, while
+    /// its credential is unchanged". Same length as `providers`. See
+    /// [`DEMOTION_SECS`] and [`Bench`].
+    demoted_until: RwLock<Vec<Option<Bench>>>,
     /// Per-provider input window, memoized. Same length as `providers`.
     ///
     /// Three states, and the difference between the last two matters — see
@@ -152,15 +170,21 @@ impl EmbeddingRouter {
     }
 
     /// Whether `idx` is currently benched (deterministic failure, cooldown not
-    /// yet passed).
+    /// yet passed, credential unchanged since).
     async fn is_demoted(&self, idx: usize) -> bool {
-        self.demoted_until.read().await[idx].is_some_and(|until| Instant::now() < until)
+        let credential = self.providers[idx].client.credential_generation();
+        self.demoted_until.read().await[idx]
+            .is_some_and(|bench| Instant::now() < bench.until && bench.credential == credential)
     }
 
-    /// Bench `idx` for `cooldown` — it failed deterministically, so calling it
-    /// again sooner is a guaranteed error per call.
-    async fn demote(&self, idx: usize, cooldown: Duration) {
-        self.demoted_until.write().await[idx] = Some(Instant::now() + cooldown);
+    /// Bench `idx` for `cooldown` — it failed deterministically under
+    /// `credential` (its generation when the call was made), so calling it
+    /// again sooner with that credential is a guaranteed error per call.
+    async fn demote(&self, idx: usize, cooldown: Duration, credential: u64) {
+        self.demoted_until.write().await[idx] = Some(Bench {
+            until: Instant::now() + cooldown,
+            credential,
+        });
     }
 
     /// Record that the caller has just observed a healthy embedding from the
@@ -315,13 +339,17 @@ impl EmbeddingRouter {
                     continue;
                 }
 
+                // Read before the call: a token replaced while it is in flight
+                // must not have the old token's failure benched against it.
+                let credential = entry.client.credential_generation();
                 match entry.client.embed_one(text).await {
                     Ok(embedding) if embedding.is_empty() => {
                         // An empty vector can never be a usable embedding, and
                         // downstream it would rebind the store to width 0.
                         // Treat it as the deterministic fault it is.
                         warn!("Embedding provider {} returned an empty vector", entry.info);
-                        self.demote(idx, Duration::from_secs(DEMOTION_SECS)).await;
+                        self.demote(idx, Duration::from_secs(DEMOTION_SECS), credential)
+                            .await;
                         last_error = format!("{} returned an empty vector", entry.info);
                     }
                     Ok(embedding) => {
@@ -357,7 +385,8 @@ impl EmbeddingRouter {
                                 "Primary {} is still congested; next restore probe in {}s",
                                 entry.info, cooldown
                             );
-                            self.demote(0, Duration::from_secs(cooldown)).await;
+                            self.demote(0, Duration::from_secs(cooldown), credential)
+                                .await;
                         }
                         debug!("Embedding provider {} is congested", entry.info);
                         last_error = e.to_string();
@@ -389,7 +418,8 @@ impl EmbeddingRouter {
                             "Embedding provider {} unavailable (benched {}s): {}",
                             entry.info, DEMOTION_SECS, e
                         );
-                        self.demote(idx, Duration::from_secs(DEMOTION_SECS)).await;
+                        self.demote(idx, Duration::from_secs(DEMOTION_SECS), credential)
+                            .await;
                         last_error = e.to_string();
                     }
                 }
@@ -615,8 +645,11 @@ mod tests {
             .with_fallback(fallback_info, fallback_client);
 
         // Put the router on the fallback the way an outage would: bench the
-        // primary, then embed once so the fallback commits.
-        router.demote(0, Duration::from_secs(DEMOTION_SECS)).await;
+        // primary, then embed once so the fallback commits. (Credential
+        // generation 0: a token never replaced.)
+        router
+            .demote(0, Duration::from_secs(DEMOTION_SECS), 0)
+            .await;
         let (_, switched) = router.embed_one("text").await.expect("the fallback answers");
         assert_eq!(
             switched.expect("the first call flips the active provider").name,
@@ -634,7 +667,7 @@ mod tests {
         );
 
         // The cooldown passes. The very next embed must hand the binding back.
-        router.demote(0, Duration::ZERO).await;
+        router.demote(0, Duration::ZERO, 0).await;
         let (embedding, switched) = router.embed_one("text").await.expect("the primary answers");
         assert_eq!(embedding.len(), 3, "the restore rides a real embedding");
         assert_eq!(
@@ -724,7 +757,7 @@ mod tests {
         let (info, client) = openai_provider("ollama", &url);
         let router = EmbeddingRouter::new(info, client);
 
-        router.demote(0, Duration::ZERO).await;
+        router.demote(0, Duration::ZERO, 0).await;
         assert!(
             !router.is_demoted(0).await,
             "a zero cooldown is already expired — the provider must be eligible"
@@ -732,5 +765,56 @@ mod tests {
         let (embedding, switched) = router.embed_one("text").await.expect("eligible again");
         assert_eq!(embedding.len(), 3);
         assert!(switched.is_none(), "it was the active provider all along");
+    }
+
+    /// A bench stands in for the signal nobody sends: "whatever made this
+    /// provider fail has changed". For a refused token there IS one — the
+    /// token changing — and a bench that outlived it kept the fixed provider
+    /// out for the rest of its cooldown, every memory in between stored
+    /// without a vector. A changed credential lifts the bench; saving the same
+    /// one again does not.
+    #[tokio::test]
+    async fn a_changed_credential_lifts_the_bench() {
+        let (url, seen) =
+            crate::embedding_reload::test_ollama::spawn_token_gated("new-token").await;
+        let bearer = nanna_llm::SharedBearer::new("old-token");
+        let router = EmbeddingRouter::new(
+            EmbeddingProviderInfo {
+                name: "ollama".into(),
+                model: "test-embed".into(),
+            },
+            Arc::new(
+                EmbeddingClient::openai("")
+                    .with_bearer(bearer.clone())
+                    .with_model("test-embed")
+                    .with_base_url(&url),
+            ),
+        );
+
+        router
+            .embed_one("text")
+            .await
+            .expect_err("the server refuses the old token");
+        assert!(!bearer.replace("old-token"), "the same token saved again");
+        router
+            .embed_one("text")
+            .await
+            .expect_err("nothing changed, so the bench holds");
+        assert_eq!(
+            seen.lock().expect("record lock").len(),
+            1,
+            "a benched provider is not called"
+        );
+
+        assert!(bearer.replace("new-token"));
+        let (embedding, _) = router
+            .embed_one("text")
+            .await
+            .expect("the new token is tried at once, and accepted");
+        assert_eq!(embedding.len(), 3);
+        let seen = seen.lock().expect("record lock");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].authorization.as_deref(), Some("Bearer new-token"));
+        drop(seen);
     }
 }

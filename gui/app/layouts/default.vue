@@ -122,6 +122,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { statusBarLabel } from '~/lib/backendLabels'
 import { seedChatModel } from '~/composables/useSessionState'
 import { useAppUpdater } from '~/composables/useAppUpdater'
+import { useStartupGate } from '~/composables/useStartupGate'
 import type { PaletteAction } from '~/lib/commandPalette'
 import { NAV_ACTIONS, QUICK_ACTIONS } from '~/lib/commandPalette'
 import type { NuiRailItem } from '~/components/nui/NuiMainMenu.vue'
@@ -353,6 +354,7 @@ provide('showWorkspacePicker', showWorkspacePicker)
 
 const { checkPermission } = useNotifications()
 const { init: initBackend, status: backendStatus, daemonVersion } = useBackend()
+const { releasedOffline } = useStartupGate()
 const statusBar = computed(() => statusBarLabel(backendStatus.value, apiKeySet.value))
 
 const { bind: bindShortcut } = useShortcuts()
@@ -498,16 +500,29 @@ onMounted(async () => {
       document.documentElement.classList.add('density-compact')
     }
   } catch { /* ignore */ }
-  const mode = await initBackend()
+  // Opened with "Open Nanna anyway", init joins the boot in flight, or starts
+  // a daemon that is not running, and answers only when that boot ends, which
+  // has no deadline. Awaited, it held back everything below (the first load,
+  // the listeners, the close handler) for the whole boot. Start it and go on:
+  // the attach watcher below loads what needs a daemon once one answers.
+  let mode: 'daemon' | 'disconnected' = 'disconnected'
+  if (releasedOffline.value) void initBackend()
+  else mode = await initBackend()
   console.log(`Nanna running in ${mode} mode`)
   loadTabsFromStorage()
-  await loadOpenWorkspaces()
+  // Without a daemon the workspace list comes back empty, and loading it would
+  // wipe the tabs just restored from storage. The attach watcher below loads
+  // it once a daemon answers.
+  if (mode === 'daemon') await loadOpenWorkspaces()
   await loadSessions()
   await loadConfig()
   maybeShowOnboarding()
 
   // Sync restored workspace state with daemon
-  syncDaemonWorkspace(currentTab.value)
+  if (mode === 'daemon') syncDaemonWorkspace(currentTab.value)
+  initialLoadDone = true
+  // Attached between init's answer and here: the watcher skipped it.
+  if (mode !== 'daemon' && backendStatus.value?.connected) void reloadFromDaemon()
 
   const urlSessionId = route.query.session as string | undefined
   if (urlSessionId && sessions.value.some(s => s.id === urlSessionId)) {
@@ -557,6 +572,23 @@ onUnmounted(() => {
   unlistenSessionRenamed?.()
   unlistenWorkspacesChanged?.()
 })
+
+// The backend attaches a daemon that answers late (a slow boot, one started
+// by hand, a restart) without an app restart. This lets the window catch up
+// on what the first load could not get.
+let initialLoadDone = false
+async function reloadFromDaemon() {
+  await loadOpenWorkspaces()
+  await loadSessions()
+  await loadConfig()
+  await syncDaemonWorkspace(currentTab.value)
+}
+watch(
+  () => backendStatus.value?.connected === true,
+  (connected, wasConnected) => {
+    if (connected && !wasConnected && initialLoadDone) void reloadFromDaemon()
+  },
+)
 
 watch(() => route.query.session, (newSessionId) => {
   if (typeof newSessionId === 'string' && sessions.value.some(s => s.id === newSessionId)) {

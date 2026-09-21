@@ -84,7 +84,10 @@ impl TelegramListener {
             .query(&[
                 ("offset", offset.to_string()),
                 ("timeout", LONG_POLL_TIMEOUT.to_string()),
-                ("allowed_updates", r#"["message","edited_message"]"#.to_string()),
+                (
+                    "allowed_updates",
+                    r#"["message","edited_message","stopped_message_generation"]"#.to_string(),
+                ),
             ])
             .send()
             .await
@@ -111,6 +114,9 @@ impl TelegramListener {
 
     /// Convert a Telegram update to an `IncomingMessage`
     fn convert_update(&self, update: &TelegramUpdate) -> Option<IncomingMessage> {
+        if let Some(stopped) = &update.stopped_message_generation {
+            return self.stop_request(stopped);
+        }
         let message = update.message.as_ref().or(update.edited_message.as_ref())?;
 
         // Check if chat is allowed
@@ -136,8 +142,7 @@ impl TelegramListener {
                     sender
                         .last_name
                         .as_ref()
-                        .map(|l| format!(" {l}"))
-                        .unwrap_or_default()
+                        .map_or_default(|l| format!(" {l}"))
                 )),
                 username: sender.username.clone(),
             },
@@ -147,6 +152,35 @@ impl TelegramListener {
                 .reply_to_message
                 .as_ref()
                 .map(|r| format!("{}:{}", message.chat.id, r.message_id)),
+        })
+    }
+
+    /// A press of a draft's stop button, as the `/stop` its user would have
+    /// typed — so it cancels the same turn through the same path. Drafts
+    /// exist only in private chats, where the chat id IS the user's id, which
+    /// makes the synthesized sender the one whose session is running.
+    fn stop_request(&self, stopped: &MessageGenerationStopped) -> Option<IncomingMessage> {
+        let chat_id = stopped.chat.id;
+        if !self.allowed_chats.is_empty() && !self.allowed_chats.contains(&chat_id) {
+            return None;
+        }
+        if chat_id <= 0 {
+            debug!("Ignoring a generation stop from non-private chat {chat_id}");
+            return None;
+        }
+        Some(IncomingMessage {
+            id: format!("{chat_id}:stop:{}", stopped.draft_id),
+            channel: ChannelId::new("telegram", chat_id.to_string()),
+            sender: Sender {
+                id: chat_id.to_string(),
+                name: None,
+                username: None,
+            },
+            content: MessageContent::Text {
+                text: "/stop".to_string(),
+            },
+            timestamp: chrono::Utc::now().timestamp(),
+            reply_to: None,
         })
     }
 
@@ -340,6 +374,15 @@ struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
     edited_message: Option<TelegramMessage>,
+    /// The user pressed the stop button on a streamed draft (Bot API 10.3).
+    stopped_message_generation: Option<MessageGenerationStopped>,
+}
+
+/// `MessageGenerationStopped`: which chat's draft the user stopped.
+#[derive(Debug, Deserialize)]
+struct MessageGenerationStopped {
+    chat: TelegramChat,
+    draft_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -443,6 +486,33 @@ mod tests {
             listener.api_url("getUpdates"),
             "https://api.telegram.org/bot123:ABC/getUpdates"
         );
+    }
+
+    #[test]
+    fn a_pressed_stop_button_arrives_as_the_users_stop() {
+        let listener = TelegramListener::new("123:ABC");
+        let update: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 9,
+            "stopped_message_generation": {
+                "chat": { "id": 4242, "type": "private" },
+                "draft_id": 7
+            }
+        }))
+        .expect("the Bot API 10.3 shape parses");
+        let stop = listener.convert_update(&update).expect("routed");
+        assert_eq!(stop.channel, ChannelId::new("telegram", "4242"));
+        assert_eq!(stop.sender.id, "4242", "the private chat's own user");
+        assert!(matches!(stop.content, MessageContent::Text { ref text } if text == "/stop"));
+
+        // Not from an allowed chat, or not a private chat: ignored.
+        let fenced = TelegramListener::new("t").with_allowed_chats(vec![1]);
+        assert!(fenced.convert_update(&update).is_none());
+        let group: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 10,
+            "stopped_message_generation": { "chat": { "id": -100, "type": "group" }, "draft_id": 1 }
+        }))
+        .expect("parses");
+        assert!(listener.convert_update(&group).is_none());
     }
 
     #[test]

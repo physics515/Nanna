@@ -195,6 +195,12 @@ import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { filterLogs } from '~/lib/logFilters'
 import { ChevronDown, Trash2, Circle, Copy } from '@lucide/vue'
+
+// Works without a daemon (the GUI's own lines, and Live re-reads the daemon's
+// once one answers), and holds the filters: the startup gate's first attach
+// keeps this page instead of remounting it (useStartupGate).
+definePageMeta({ worksOffline: true })
+
 const toastApi = useToast()
 const { confirm } = useConfirm()
 

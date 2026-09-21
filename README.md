@@ -81,7 +81,7 @@ A fully local run needs none.
 | **WhatsApp Channel** | ✅ Stable | WhatsApp Business API |
 | **Cognitive Memory** | ✅ Stable | — |
 | **Tool System (47 tools, all wired)** | ✅ Stable | Some need a model, key, browser or display — see below |
-| **MCP Client** | ✅ Stable (stdio servers) | A server listed under `[mcp]` |
+| **MCP Client** | ✅ Stable (stdio and Streamable HTTP servers) | A server listed under `[mcp]` |
 | **Auto-Update** | ✅ Stable | Internet connection |
 
 ---
@@ -136,10 +136,18 @@ A fully local run needs none.
 - **Undo for file writes** — before `write_file`, `edit_file` or `file_buffer` changes a file, its previous content is saved outside your project (in Nanna's data directory, per conversation), and the `file_history` tool lists those checkpoints and puts a file back — including removing one a write created. A restore is itself undoable. Bounded: the 100 most recent checkpoints per conversation plus each file's first version, 256 MiB per conversation, 1 GiB overall; changes made through `exec` are not tracked.
 - **Per-edit diffs** — every `edit_file` call records a bounded before/after view of what it changed, shown in the run timeline and kept with the session, so you can see what an unattended run did after the fact
 - **Conversation and memory export** — `nanna export <session-id>` writes a session out as a readable Markdown transcript (tool calls, edits and all) or, with `--format json`, as the complete stored session; `nanna export --memories` does the same for everything Nanna remembers, with each memory's provenance and FSRS state
-- **MCP servers** — list stdio MCP servers under `[mcp]` and the daemon starts them at boot, in the
+- **MCP servers** — list MCP servers under `[mcp]` (a `command` to spawn, or a Streamable HTTP
+  `url` with an optional bearer token from the keyring) and the daemon starts them at boot, in the
   background so a slow first `npx` download never delays startup; their tools appear to the model as
   `mcp__<server>__<tool>`. A server that fails to start is logged by name and the rest still start, and
-  the servers are shut down with the daemon. HTTP/SSE servers are not started from config yet.
+  the servers are shut down with the daemon. Both protocol eras work: a current (`2026-07-28`)
+  server is detected with `server/discover` and spoken to without a handshake, an older one falls back
+  to `initialize` — over stdio and over HTTP, verified against the official TypeScript SDK's servers of
+  each kind; a URL that only speaks the deprecated 2024 HTTP+SSE transport is detected and used too.
+- **Nanna's tools for other MCP clients** — `nanna mcp serve` speaks MCP over stdio (for Claude Code,
+  Claude Desktop, editors). With the daemon running it serves the daemon's live tools — memory, files,
+  shell, web, code and the MCP servers Nanna itself is connected to — each call executed by the daemon;
+  without one (or with `--standalone`) it serves the local skills only.
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
@@ -200,10 +208,10 @@ nanna doctor
 
 Checks the configuration and, for anything it finds, prints the fix rather than
 just the verdict — a missing tools directory, a `[infer]` section that names no
-model, a clustering configuration that would merge unrelated memories, chat and
-summarization pointed at two different Ollama servers by accident. Exits
-non-zero when something is actually broken, so it also works from a script or a
-health probe.
+model, a clustering configuration that would merge unrelated memories, a
+hand-edited summarization model with no provider prefix that will be sent to the
+wrong provider (and how to write it, e.g. `ollama/qwen3`). Exits non-zero when
+something is actually broken, so it also works from a script or a health probe.
 
 By default it is **offline**: no provider call, no network probe, no keyring
 read. That makes it fast and safe to run anywhere, and it means a clean report
@@ -213,11 +221,13 @@ says your *configuration* is sound — not that a provider is reachable.
 nanna doctor --online
 ```
 
-Adds the one probe that needs no credential: each Ollama server your
-configuration uses is asked whether it is answering and whether it has the
-models you configured, and a missing one is reported with the `ollama pull`
-that fixes it. It never tests a provider API key — that would mean reading the
-keyring and sending the key off the machine.
+Adds the one probe that needs no credential: your Ollama server
+(`[memory].ollama_host`, the one server chat, embeddings and summaries all use)
+is asked whether it is answering and whether it has every Ollama model you
+configured for any of them — a model counts when chat, the embedders or the
+summarizers would send it there — and a missing one is reported with the
+`ollama pull` that fixes it. It never tests a provider API key — that would mean
+reading the keyring and sending the key off the machine.
 
 ### API Key Invalid
 - Verify the key in **Settings → Models**
@@ -318,6 +328,11 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/notes"]
 # enabled = false         # keep the entry without starting it
 # secret_env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]  # values from the keyring, see below
+
+[[mcp.servers]]           # a remote server: url instead of command
+name = "notion"
+url = "https://mcp.example.com/mcp"
+# bearer_secret = "NOTION_TOKEN"  # sent as Authorization: Bearer; stored like secret_env
 ```
 
 Edits to `config.toml` apply to a running daemon within a couple of seconds (models and
@@ -327,7 +342,9 @@ that does not parse is logged and the running configuration is kept.
 MCP servers inherit the daemon's environment. There is deliberately no `env` table in
 `config.toml`: a token a server needs is named in `secret_env` and stored with
 `nanna mcp secret set <server> <VAR>` (prompted, or read from stdin — never a command-line
-argument). The value lives in the OS keyring and only that server's process receives it; a server
+argument). A `url` server's token works the same way through `bearer_secret`. The value lives in
+the OS keyring (or, with no keyring on the machine, an encrypted `0600` file) and only that server
+receives it; a server
 whose secret is missing is not started, and `system.status` / the Tools page say which command sets it.
 
 **Environment Variables:**

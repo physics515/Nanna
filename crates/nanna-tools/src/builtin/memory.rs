@@ -205,12 +205,11 @@ impl Tool for RememberTool {
         let tags: Vec<String> = params
             .get("tags")
             .and_then(|v| v.as_array())
-            .map(|arr| {
+            .map_or_default(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
 
         let id = self
             .storage
@@ -289,7 +288,7 @@ impl Tool for RecallTool {
             let output = results
                 .iter()
                 .map(|r| {
-                    let score_str = r.score.map(|s| format!(" ({s:.2})")).unwrap_or_default();
+                    let score_str = r.score.map_or_default(|s| format!(" ({s:.2})"));
                     format!("[{}{}] {}", &r.id[..8], score_str, r.content)
                 })
                 .collect::<Vec<_>>()

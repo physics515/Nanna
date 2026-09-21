@@ -19,6 +19,8 @@ declare global {
     __NANNA_E2E__?: {
       emit: (event: string, payload: unknown) => void
       setBackendStatus: (status: Record<string, unknown>) => void
+      /** The daemon answers: connected, running, every boot field cleared. */
+      attach: () => void
       getState: () => unknown
       runStream?: (sessionId: string, reply?: string) => Promise<void>
       forceCrash?: () => void
@@ -44,7 +46,9 @@ function installInPage(options = {}) {
     return prefix + '-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
   }
   const apiKeySet = options.apiKeySet !== false;
-  const connected = options.backendConnected !== false;
+  const boot = options.boot || null;
+  const connected = !boot && options.backendConnected !== false;
+  const bootState = boot ? (boot.daemon_state || 'starting') : null;
   const sessions = Array.isArray(options.sessions)
     ? options.sessions.map((s) => ({
         id: s.id || uid('sess'),
@@ -66,13 +70,26 @@ function installInPage(options = {}) {
       }];
   const state = {
     backend: {
-      mode: 'daemon',
+      mode: boot ? 'disconnected' : 'daemon',
       connected,
       daemon_url: connected ? 'ws://127.0.0.1:5149' : null,
-      daemon_state: connected ? 'running' : 'stopped',
+      daemon_state: boot ? bootState : (connected ? 'running' : 'stopped'),
       version: '0.1.0-e2e',
       message: connected ? null : 'Daemon not reachable on 5149 (e2e mock)',
+      starting_for_s: boot
+        ? (boot.starting_for_s !== undefined ? boot.starting_for_s : (bootState === 'starting' ? 0 : null))
+        : null,
+      retrying: boot ? Boolean(boot.retrying) : false,
+      init_in_progress: boot
+        ? (typeof boot.init_in_progress === 'boolean' ? boot.init_in_progress : bootState === 'starting')
+        : false,
+      last_error: boot ? (boot.last_error || null) : null,
     },
+    // The sidecar's output for get_boot_log: this spawn's lines, oldest first.
+    bootLog: boot && Array.isArray(boot.log)
+      ? boot.log.map((l) => ({ ...l }))
+      : [{ stream: 'stdout', line: 'Daemon ready (e2e mock)' }],
+    restartCalls: 0,
     config: {
       theme: 'palenight',
       model: 'mock-model',
@@ -85,6 +102,9 @@ function installInPage(options = {}) {
       anthropic_api_key: apiKeySet ? 'sk-ant-e2e-mock' : '',
       openai_api_key: '',
       openrouter_api_key: '',
+      ollama_host: 'http://localhost:11434',
+      // The server a saved Ollama token is for; null = no token saved.
+      ollama_token_host: null,
     },
     sessions: sessions.slice(),
     messages: Object.assign(Object.create(null), options.messages || {}),
@@ -261,10 +281,35 @@ function installInPage(options = {}) {
     if (typeof cmd === 'string' && cmd.startsWith('plugin:')) return null;
 
     switch (cmd) {
-      case 'init_backend':
-        return state.backend.mode;
+      case 'init_backend': {
+        // Backend::init joins the init already in flight and answers when it
+        // ends (backend.rs checks every 100 ms). It never attaches by itself
+        // here; a spec says when the daemon answers, with attach().
+        while (!state.backend.connected
+          && (state.backend.daemon_state === 'starting' || state.backend.init_in_progress === true)) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        return state.backend.connected ? 'daemon' : 'disconnected';
+      }
       case 'get_backend_status':
         return { ...state.backend };
+      case 'get_boot_log':
+        return state.bootLog.map((l) => ({ ...l }));
+      case 'restart_daemon':
+        // The old boot is stopped and a fresh init starts in the background;
+        // the command returns at once and the status shows the new boot.
+        state.restartCalls += 1;
+        Object.assign(state.backend, {
+          mode: 'disconnected',
+          connected: false,
+          daemon_url: null,
+          daemon_state: 'starting',
+          starting_for_s: 0,
+          retrying: false,
+          init_in_progress: true,
+        });
+        state.bootLog = [{ stream: 'stdout', line: 'Starting the daemon (e2e mock restart)' }];
+        return null;
 
       case 'list_sessions':
         return state.sessions.map((s) => ({ ...s }));
@@ -415,6 +460,12 @@ function installInPage(options = {}) {
           agent_name: state.config.agent_name,
           max_tokens: state.config.max_tokens,
           api_key_set: state.config.api_key_set,
+          ollama_host: state.config.ollama_host,
+          // Whether an Ollama token is saved and for which server — the
+          // real command never sends the token itself.
+          ollama_token_saved: state.config.ollama_token_host !== null,
+          ollama_token_host: state.config.ollama_token_host,
+          ollama_token_from_env: false,
         };
 
       case 'get_system_prompt':
@@ -560,10 +611,17 @@ function installInPage(options = {}) {
       case 'set_personality_mode':
       case 'set_agent_iteration_policy':
       case 'set_claude_proxy':
-      case 'set_ollama_host':
-      case 'set_ollama_api_key':
       case 'set_use_embedded_ocr':
         return true;
+      case 'set_ollama_host':
+        state.config.ollama_host = String(pick(args, 'host') || '').trim().replace(/\/+$/, '');
+        return 'Ollama host saved: ' + state.config.ollama_host;
+      case 'set_ollama_api_key': {
+        // Saved for the configured server; blank removes it.
+        const key = String(pick(args, 'key') || '').trim();
+        state.config.ollama_token_host = key ? state.config.ollama_host : null;
+        return key ? 'Ollama token saved' : 'Ollama token removed';
+      }
       case 'get_sub_agent_models':
         return [];
       case 'get_use_embedded_ocr':
@@ -628,8 +686,10 @@ function installInPage(options = {}) {
 
       case 'get_close_mode':
         return 'ask';
-      case 'set_close_mode':
       case 'handle_window_close':
+        // What the default close mode answers: the window opens CloseDialog.
+        return 'ask';
+      case 'set_close_mode':
       case 'hide_to_tray':
       case 'perform_quit':
         return true;
@@ -679,12 +739,29 @@ function installInPage(options = {}) {
       if (typeof status?.connected === 'boolean') {
         state.backend.connected = status.connected;
         state.backend.mode = 'daemon'; // mode stays daemon; connected flag drives DISCONNECTED label
-        state.backend.daemon_state = status.connected ? 'running' : 'stopped';
+        // An explicit daemon_state wins: "disconnected and starting again" is
+        // what the health monitor's restart looks like.
+        if (typeof status.daemon_state !== 'string') {
+          state.backend.daemon_state = status.connected ? 'running' : 'stopped';
+        }
         state.backend.daemon_url = status.connected ? (state.backend.daemon_url || 'ws://127.0.0.1:5149') : null;
         state.backend.message = status.connected
           ? null
           : (status.message || 'Daemon not reachable on 5149 (e2e mock)');
       }
+    },
+    attach() {
+      Object.assign(state.backend, {
+        mode: 'daemon',
+        connected: true,
+        daemon_url: 'ws://127.0.0.1:5149',
+        daemon_state: 'running',
+        message: null,
+        starting_for_s: null,
+        retrying: false,
+        init_in_progress: false,
+        last_error: null,
+      });
     },
     getState() {
       return {
@@ -693,6 +770,7 @@ function installInPage(options = {}) {
         sessions: state.sessions.map((s) => ({ ...s })),
         logCount: state.logs.length,
         api_key_set: state.config.api_key_set,
+        restartCalls: state.restartCalls,
       };
     },
     runStream,
@@ -749,6 +827,12 @@ export async function e2eSetBackendStatus(
   await page.evaluate((s) => {
     window.__NANNA_E2E__?.setBackendStatus(s)
   }, status)
+}
+
+export async function e2eAttach(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    window.__NANNA_E2E__?.attach()
+  })
 }
 
 export async function e2eGetState(page: Page): Promise<unknown> {

@@ -510,7 +510,6 @@ impl AppState {
             temperature: 0.7,
             max_iterations: Some(10),
             summarization_priority: vec![],
-            summarization_ollama_url: Some("http://localhost:11434".to_string()),
             ..Default::default()
         };
 
@@ -926,8 +925,7 @@ mod tests {
         assert_eq!(
             sessions
                 .get("new-session")
-                .map(std::vec::Vec::len)
-                .unwrap_or_default(),
+                .map_or_default(std::vec::Vec::len),
             1
         );
     }

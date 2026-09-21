@@ -1,0 +1,18 @@
+# A 2026-07-28 MCP server on the official Rust SDK, for the live interop
+# suite (`tests/dual_era_live.rs` builds and runs it). Not a workspace
+# member and never shipped: its own `[workspace]` keeps it out of the root
+# one, and its own lockfile pins the SDK it tests against.
+[package]
+name = "rmcp-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rmcp = { version = "=3.4.0", default-features = false, features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"

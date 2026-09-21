@@ -675,8 +675,7 @@ impl Scheduler {
         let history = self.history.read().await;
         history
             .get(job_id)
-            .map(|runs| runs.iter().rev().take(limit).cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|runs| runs.iter().rev().take(limit).cloned().collect())
     }
 
     /// Record a job run

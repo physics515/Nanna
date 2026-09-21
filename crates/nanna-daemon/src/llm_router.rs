@@ -37,18 +37,41 @@ impl ProviderId {
         }
     }
 
+    /// Explicit routing prefixes, each with the provider it names.
+    ///
+    /// `openrouter/` comes first: an `OpenRouter` id carries its upstream
+    /// vendor after the prefix (`openrouter/anthropic/claude-haiku-4.5`), and
+    /// that id must stay on `OpenRouter` rather than be read as Anthropic's.
+    /// `anthropic/` and `openai/` are what the Settings summarization picker
+    /// writes; the chat picker writes bare family names instead, which the
+    /// family rules in [`Self::from_model`] route.
+    const PREFIXES: [(&'static str, Self); 5] = [
+        ("openrouter/", Self::OpenRouter),
+        ("github/", Self::GitHubModels),
+        ("ollama/", Self::Ollama),
+        ("anthropic/", Self::Anthropic),
+        ("openai/", Self::OpenAI),
+    ];
+
+    /// The explicit routing prefix `model` starts with, matched without regard
+    /// to case, and the provider it names.
+    fn explicit_prefix(model: &str) -> Option<(&'static str, Self)> {
+        Self::PREFIXES.into_iter().find(|(prefix, _)| {
+            model
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+    }
+
     /// Parse provider from model string prefix
     #[must_use]
     pub fn from_model(model: &str) -> Self {
+        if let Some((_, provider)) = Self::explicit_prefix(model) {
+            return provider;
+        }
         let lower = model.to_lowercase();
 
-        if lower.starts_with("openrouter/") {
-            Self::OpenRouter
-        } else if lower.starts_with("github/") {
-            Self::GitHubModels
-        } else if lower.starts_with("ollama/") {
-            Self::Ollama
-        } else if lower.starts_with("gpt-") || lower.starts_with("o1") || lower.starts_with("o3") {
+        if lower.starts_with("gpt-") || lower.starts_with("o1") || lower.starts_with("o3") {
             Self::OpenAI
         } else if lower.starts_with("claude") {
             Self::Anthropic
@@ -62,13 +85,13 @@ impl ProviderId {
     }
 
     /// Strip provider prefix from model name (e.g., "ollama/deepseek-r1:14b" -> "deepseek-r1:14b")
+    ///
+    /// Exactly the prefix [`Self::from_model`] routed on, in the same case
+    /// rule, so a spec is never sent to a provider under a name that still
+    /// carries the provider's own prefix.
     #[must_use]
     pub fn strip_prefix(model: &str) -> &str {
-        model
-            .strip_prefix("openrouter/")
-            .or_else(|| model.strip_prefix("github/"))
-            .or_else(|| model.strip_prefix("ollama/"))
-            .unwrap_or(model)
+        Self::explicit_prefix(model).map_or(model, |(prefix, _)| &model[prefix.len()..])
     }
 }
 
@@ -161,6 +184,14 @@ impl LlmRouter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&provider)
             .cloned()
+    }
+
+    /// The Ollama client chat is using right now — the configured server and
+    /// its token, as of the last rebuild. Snapshotted per call, so a caller
+    /// that asks again after a config reload gets the new server.
+    #[must_use]
+    pub fn ollama_client(&self) -> Option<Arc<LlmClient>> {
+        self.client_for(ProviderId::Ollama)
     }
 
     /// Rebuild the provider set from resolved credentials, replacing the
@@ -373,6 +404,39 @@ impl LlmRouter {
         ProviderId::strip_prefix(model).to_string()
     }
 
+    /// The client and bare model id a summarization-model spec resolves to,
+    /// through the provider map chat uses right now.
+    ///
+    /// An `ollama/` entry therefore gets chat's server and the token bound to
+    /// it, an `anthropic/` entry chat's Anthropic credential, and so on — one
+    /// grammar ([`ProviderId::from_model`]) and one set of credentials for chat
+    /// and every summarizer. Snapshotted per call, so a caller that asks again
+    /// after a config reload gets the rebuilt provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sentence naming the provider and why it is absent (the
+    /// rebuild's recorded reason when it kept one) when no client is
+    /// registered for the spec's provider, and refuses a blank spec, which
+    /// names no model.
+    pub fn summarizer_client(&self, spec: &str) -> Result<(LlmClient, String), String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("a blank summarization entry names no model".to_string());
+        }
+        let provider = ProviderId::from_model(spec);
+        let client = self.client_for(provider).ok_or_else(|| {
+            let why = self.absent_reason(provider).unwrap_or_else(|| {
+                format!("no {} credential is configured", provider.name())
+            });
+            format!("`{spec}` needs the {} provider, which is not available: {why}", provider.name())
+        })?;
+        // `LlmClient` clones share their HTTP pool; the num_ctx latch is
+        // process-wide and keyed by (server, model), so a summarizer's clone
+        // and chat's own client learn from each other's demotions.
+        Ok(((*client).clone(), ProviderId::strip_prefix(spec).to_string()))
+    }
+
     /// Get the primary LLM client (first available, preferring Anthropic).
     /// Used for sub-agent spawning where we need a client but don't know the model yet.
     pub fn primary_client(&self) -> Option<Arc<LlmClient>> {
@@ -556,6 +620,20 @@ impl Default for LlmRouter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The resolver every agent this process builds summarizes through: each
+/// `summarization_priority` entry becomes a client by
+/// [`LlmRouter::summarizer_client`] on `router`, asked afresh on every use.
+///
+/// Holding the router rather than a client is the point. A config reload
+/// rebuilds the router's providers in place, so a new `[memory].ollama_host`,
+/// a newly saved token or key reaches the very next summarization — even in a
+/// turn that started before the change — with no restart.
+#[must_use]
+pub fn summarizer_clients(router: &Arc<LlmRouter>) -> nanna_agent::SummarizerClients {
+    let router = Arc::clone(router);
+    nanna_agent::SummarizerClients::new(move |spec| router.summarizer_client(spec))
 }
 
 /// The one resolved credential the Anthropic provider will use.
@@ -915,5 +993,98 @@ mod tests {
         // Family-named models keep their name (the family IS the model id).
         assert_eq!(ProviderId::strip_prefix("gpt-4o"), "gpt-4o");
         assert_eq!(ProviderId::strip_prefix("claude-opus-4"), "claude-opus-4");
+    }
+
+    /// The Settings summarization picker writes `anthropic/<id>` and
+    /// `openai/<id>`. Unknown to the router, both went to the Anthropic client
+    /// with the prefix still on: `openai/gpt-4o-mini` was sent to Anthropic,
+    /// and `anthropic/claude-haiku-4-5` named a model Anthropic does not have.
+    /// Every dream cycle, IPC consolidation and `memory.summarize` call walked
+    /// past such an entry as a failure.
+    #[test]
+    fn the_settings_pickers_provider_prefixes_route_and_strip() {
+        assert_eq!(
+            ProviderId::from_model("anthropic/claude-haiku-4-5"),
+            ProviderId::Anthropic
+        );
+        assert_eq!(
+            ProviderId::strip_prefix("anthropic/claude-haiku-4-5"),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(
+            ProviderId::from_model("openai/gpt-4o-mini"),
+            ProviderId::OpenAI
+        );
+        assert_eq!(ProviderId::strip_prefix("openai/gpt-4o-mini"), "gpt-4o-mini");
+
+        // OpenRouter ids carry the upstream vendor after the router prefix;
+        // `openrouter/` is matched first, so they stay on OpenRouter and keep
+        // the vendor half of the id.
+        assert_eq!(
+            ProviderId::from_model("openrouter/anthropic/claude-haiku-4.5"),
+            ProviderId::OpenRouter
+        );
+        assert_eq!(
+            ProviderId::strip_prefix("openrouter/anthropic/claude-haiku-4.5"),
+            "anthropic/claude-haiku-4.5"
+        );
+        assert_eq!(
+            ProviderId::from_model("openrouter/openai/gpt-4o-mini"),
+            ProviderId::OpenRouter
+        );
+    }
+
+    /// A summarizer spec resolves through the provider map chat uses, to the
+    /// bare id that provider knows; an absent provider is explained with the
+    /// reason the rebuild recorded, not reported as a bad model name.
+    #[test]
+    fn a_summarizer_spec_resolves_like_chat_and_explains_an_absence() {
+        let router = LlmRouter::new();
+        router.rebuild(&ProviderCredentials {
+            anthropic: None,
+            anthropic_absent_reason: Some("the stored OAuth credential expired 4h ago".into()),
+            openai_api_key: Some("sk-test".into()),
+            openrouter_api_key: None,
+            github_token: None,
+            ollama_host: "http://gpu-box:11434".into(),
+            ollama_api_key: None,
+        });
+
+        let (client, model) = router
+            .summarizer_client("ollama/qwen3:4b")
+            .expect("Ollama always registers");
+        assert_eq!(model, "qwen3:4b");
+        assert_eq!(client.base_url(), "http://gpu-box:11434");
+        assert_eq!(
+            router.summarizer_client(" openai/gpt-4o-mini ").map(|(_, m)| m),
+            Ok("gpt-4o-mini".to_string())
+        );
+
+        let Err(err) = router.summarizer_client("anthropic/claude-haiku-4-5") else {
+            panic!("no Anthropic credential is registered");
+        };
+        assert!(err.contains("the stored OAuth credential expired 4h ago"), "{err}");
+        let Err(err) = router.summarizer_client("openrouter/meta-llama/llama-3") else {
+            panic!("no OpenRouter key is registered");
+        };
+        assert!(err.contains("openrouter"), "{err}");
+        assert!(router.summarizer_client("  ").is_err(), "a blank entry names no model");
+    }
+
+    /// `from_model` has always matched prefixes without regard to case, and
+    /// `strip_prefix` did not: `Ollama/qwen3:4b` went to Ollama under the name
+    /// `Ollama/qwen3:4b`, which no server has. One grammar means the two agree.
+    #[test]
+    fn a_prefix_strips_in_whatever_case_it_routes_in() {
+        for (spec, provider, bare) in [
+            ("Ollama/qwen3:4b", ProviderId::Ollama, "qwen3:4b"),
+            ("Anthropic/claude-haiku-4-5", ProviderId::Anthropic, "claude-haiku-4-5"),
+            ("OPENAI/gpt-4o-mini", ProviderId::OpenAI, "gpt-4o-mini"),
+            ("OpenRouter/meta-llama/llama-3", ProviderId::OpenRouter, "meta-llama/llama-3"),
+            ("GitHub/gpt-4o", ProviderId::GitHubModels, "gpt-4o"),
+        ] {
+            assert_eq!(ProviderId::from_model(spec), provider, "{spec}");
+            assert_eq!(ProviderId::strip_prefix(spec), bare, "{spec}");
+        }
     }
 }

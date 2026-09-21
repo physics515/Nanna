@@ -913,12 +913,12 @@ async fn seed_minidb_tasks(storage: &Arc<Storage>, workdir: &Path) -> Vec<i64> {
 /// min-viable floor and the eval dies on below-floor stops (2026-08-09: four
 /// orphans held 12.5 of 16 GB, killed two endurance attempts) — see the
 /// regression note on [`nanna_daemon::tasks::restart_ollama_server`].
-async fn restart_ollama_server() -> bool {
+async fn restart_ollama_server(router: &LlmRouter) -> bool {
     if std::env::var("NANNA_EVAL_ALLOW_OLLAMA_RESTART").as_deref() != Ok("1") {
         return false;
     }
     println!("[heal] restarting the Ollama server (degraded runner state)");
-    let healed = nanna_daemon::tasks::restart_ollama_server().await;
+    let healed = nanna_daemon::tasks::restart_ollama_server(router).await;
     println!(
         "[heal] {}",
         if healed { "Ollama is back" } else { "Ollama did not come back within 60s" }
@@ -1284,7 +1284,7 @@ async fn live_endurance_body() {
         // Provider-aware healing: local-server surgery only for Ollama-served
         // models; for cloud models (incl. openrouter/free, where the serving
         // model varies per request) the pause + resume IS the healing.
-        if eval_model_is_ollama() && !restart_ollama_server().await {
+        if eval_model_is_ollama() && !restart_ollama_server(&env.runner.router).await {
             env.runner.reset_ollama_runner().await;
         }
         // A repeated identical failure doubles the pause — if it is about to

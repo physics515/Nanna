@@ -1,0 +1,22 @@
+<!--
+  The window's frame before Vue mounts. Nuxt puts this after #__nuxt and
+  removes it once the app has rendered (app:suspense:resolve), so it covers
+  only the load of the page and its scripts; StartupSplash takes over from
+  there. It draws the same ground, logo and first status line in the same
+  place, so the hand-over does not move anything.
+
+  Static HTML and inline styles only: the CSP allows no inline script. It
+  sits in normal flow rather than over the app, so if the app never gets to
+  resolve, what the app did render (an error, say) is not hidden under it.
+-->
+<div style="box-sizing:border-box;display:grid;grid-template-rows:minmax(0,1fr) auto minmax(0,1fr);height:100vh;width:100%;padding:0 32px;border-radius:32px;overflow:hidden;background:#1e2939;color:#cad5e2;font:450 14px/1.5 'Fira Code','JetBrains Mono',monospace">
+  <div></div>
+  <div style="display:flex;flex-direction:column;align-items:center;gap:16px">
+    <img src="/logo.svg" alt="Nanna" style="display:block;height:40px;width:auto">
+    <p style="display:flex;align-items:center;gap:8px;margin:0">
+      <span style="display:block;width:8px;height:8px;flex-shrink:0;border-radius:9999px;background:#ffb86a"></span>
+      <span>Starting Nanna…</span>
+    </p>
+  </div>
+  <div></div>
+</div>

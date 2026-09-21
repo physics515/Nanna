@@ -27,32 +27,61 @@ use std::sync::Arc;
 /// the byte-budget math meaningful instead of collapsing to zero.
 const MIN_SUMMARIZER_CONTEXT_TOKENS: usize = 8_192;
 
-/// The ordered list of models a dream cycle may summarize with.
+/// The ordered list of models a memory consolidation may summarize with: the
+/// Settings summarization list (`summarization_priority`) in its order, else
+/// the chat models in their configured order.
 ///
-/// Returns `priority` when the user configured one, else `fallback` — the two
-/// callers differ in what "fallback" means (the scheduled cycle falls back to
-/// the agent's single main model, the IPC one to the whole `model_priority`
-/// list), so it is taken as a slice rather than baked in.
+/// The one rule for all three memory consumers — the scheduled dream cycle,
+/// IPC consolidation and the `memory.summarize` script service. In-loop
+/// summarization answers an empty Settings list by cutting to fit, but a
+/// memory fold has nothing to cut, so it needs models from somewhere, and the
+/// three used to take them from three different places (the single chat
+/// model twice, the whole chat priority list once). The chat fallback is the
+/// agent service's `configured_models`: exactly the models a chat walks, in
+/// the order it walks them.
 ///
-/// Pure. The result is empty only when **both** inputs are empty, which is the
-/// genuinely unconfigured case the callers report as such.
+/// Blank entries are not models, in either list. Pure. The result is empty
+/// only when nothing at all is configured, the case callers report as such.
 #[must_use]
-pub fn summarization_models(priority: &[String], fallback: &[String]) -> Vec<String> {
-    let models: Vec<String> = if priority.is_empty() {
-        fallback.to_vec()
+pub fn summarization_models(
+    summarization_priority: &[String],
+    chat_model: &str,
+    chat_priority: &[String],
+) -> Vec<String> {
+    let listed = crate::agent_service::named_models(summarization_priority);
+    let models = if listed.is_empty() {
+        crate::agent_service::configured_models(chat_model, chat_priority)
     } else {
-        priority.to_vec()
+        listed
     };
-
     debug_assert!(
-        !(models.is_empty() && !(priority.is_empty() && fallback.is_empty())),
-        "the list may only be empty when both inputs are empty"
-    );
-    debug_assert!(
-        priority.is_empty() || models.len() == priority.len(),
-        "a configured priority list must be preserved verbatim"
+        models.iter().all(|m| !m.trim().is_empty()),
+        "a blank entry names no model"
     );
     models
+}
+
+/// [`summarization_models`] read from the agent service's live config — the
+/// view the dream cycle and `memory.summarize` hold.
+///
+/// The three fields are read here, once, rather than at each call site: a
+/// site that passed an empty chat list, or no chat model, would still compile
+/// and quietly narrow the fallback, and only this mapping is under test.
+#[must_use]
+pub fn for_agent_service(config: &crate::agent_service::AgentServiceConfig) -> Vec<String> {
+    summarization_models(
+        &config.summarization_priority,
+        &config.model,
+        &config.model_priority,
+    )
+}
+
+/// [`summarization_models`] read from the user config's `[llm]` table — the
+/// view IPC consolidation holds. See [`for_agent_service`] for why the fields
+/// are read here.
+#[must_use]
+pub fn for_llm_config(llm: &nanna_config::LlmConfig) -> Vec<String> {
+    summarization_models(&llm.summarization_priority, &llm.model, &llm.model_priority)
 }
 
 /// The cluster byte budget must hold for **whichever** model actually answers.
@@ -92,10 +121,11 @@ pub async fn summarizer_context_window_tokens(router: &LlmRouter, models: &[Stri
 }
 
 /// Build the `summarize_fn` a dream cycle calls, walking `models` in order and
-/// returning the first success.
+/// returning the first answer that has text.
 ///
 /// Failure of one model is an *expected* operational condition (down,
-/// rate-limited, out of credit), so it is logged and the walk continues; only
+/// rate-limited, out of credit, or answering with no text), so it is logged
+/// and the walk continues; only
 /// exhausting every candidate is an error, and that error names the last real
 /// failure rather than a generic message.
 ///
@@ -149,6 +179,27 @@ pub fn summarize_with_failover(
                         .with_model(model)
                         .with_message(nanna_llm::Message::user(&prompt));
                     match router.complete(model, request).await {
+                        // No text is a failed call, not a summary: a runner
+                        // stuck on a stop token and a reasoning model that
+                        // spent its budget thinking both answer `""`, and a
+                        // consolidation that took it would store an empty
+                        // memory and delete the cluster it replaces. It is
+                        // final for this model, like any non-congestion
+                        // failure, so the next model on the list is asked.
+                        //
+                        // Emptiness is the only content test here. The
+                        // in-loop plausibility floor (`plausible_summary`:
+                        // 64 chars, 0.1% of the source) does not transfer —
+                        // an `Essence` fold asks for "one short line", which
+                        // is legitimately shorter, and each memory path
+                        // already guards its own result (enrichment must
+                        // contain the original).
+                        Ok(summary) if summary.trim().is_empty() => {
+                            tracing::warn!(
+                                "Dream summarization model {model} answered with no text"
+                            );
+                            last_error = format!("{model}: answered with no text");
+                        }
                         Ok(summary) => {
                             if round > 0 {
                                 tracing::info!(
@@ -214,33 +265,162 @@ mod tests {
         // The whole list, in order — this is the fix: the scheduled cycle used
         // to take only the head and make a single attempt.
         let priority = v(&["small-local", "big-cloud"]);
-        let models = summarization_models(&priority, &v(&["main-model"]));
+        let models = summarization_models(&priority, "main-model", &v(&["chat-a", "chat-b"]));
         assert_eq!(models, priority, "order and contents must be preserved");
     }
 
+    /// Memory cannot be "truncated" instead of summarized, so with no
+    /// summarization list the three memory consumers need models from
+    /// somewhere — and used to take them from three different places: the
+    /// dream cycle and `memory.summarize` the single chat model, IPC
+    /// consolidation the whole chat priority list. One rule now: the chat
+    /// models in their configured order, exactly the list a chat walks.
     #[test]
-    fn empty_priority_falls_back() {
-        // Single-model fallback (the scheduled cycle's shape)…
-        assert_eq!(summarization_models(&[], &v(&["main"])), v(&["main"]));
-        // …and a whole fallback list (the IPC path's shape).
-        assert_eq!(summarization_models(&[], &v(&["a", "b"])), v(&["a", "b"]));
+    fn with_no_settings_list_every_memory_consumer_uses_the_chat_models_in_order() {
+        assert_eq!(
+            summarization_models(&[], "main", &v(&["chat-a", "chat-b"])),
+            v(&["chat-a", "chat-b"]),
+            "the whole chat list, in order — not only its head"
+        );
+        assert_eq!(
+            summarization_models(&[], "main", &[]),
+            v(&["main"]),
+            "no chat list: the single chat model"
+        );
     }
 
     #[test]
     fn priority_wins_over_fallback() {
         // Negative space: the fallback must not leak in when a priority exists.
-        let models = summarization_models(&v(&["chosen"]), &v(&["ignored"]));
+        let models = summarization_models(&v(&["chosen"]), "ignored", &v(&["ignored-too"]));
         assert_eq!(models, v(&["chosen"]));
-        assert!(!models.contains(&"ignored".to_string()));
+    }
+
+    /// A blank entry is not a model, in either list: a list of blanks is an
+    /// empty list, and falls back the way an empty one does.
+    #[test]
+    fn blank_entries_are_not_models() {
+        assert_eq!(
+            summarization_models(&v(&["", "  "]), "main", &[]),
+            v(&["main"])
+        );
+        assert_eq!(
+            summarization_models(&v(&["", "chosen"]), "main", &[]),
+            v(&["chosen"])
+        );
+    }
+
+    /// Each consumer's config view feeds all three fields: the chat list
+    /// wins over the single chat model, and the single chat model stands in
+    /// when there is no list — in both views.
+    #[test]
+    fn both_config_views_read_the_settings_list_and_both_chat_fields() {
+        let mut service = crate::agent_service::AgentServiceConfig {
+            model: "main".to_string(),
+            model_priority: v(&["chat-a", "chat-b"]),
+            summarization_priority: Vec::new(),
+            ..crate::agent_service::AgentServiceConfig::default()
+        };
+        let mut llm = nanna_config::LlmConfig {
+            model: "main".to_string(),
+            model_priority: v(&["chat-a", "chat-b"]),
+            summarization_priority: Vec::new(),
+            ..nanna_config::LlmConfig::default()
+        };
+        assert_eq!(for_agent_service(&service), v(&["chat-a", "chat-b"]));
+        assert_eq!(for_llm_config(&llm), v(&["chat-a", "chat-b"]));
+
+        service.model_priority.clear();
+        llm.model_priority.clear();
+        assert_eq!(for_agent_service(&service), v(&["main"]));
+        assert_eq!(for_llm_config(&llm), v(&["main"]));
+
+        service.summarization_priority = v(&["ollama/small:1b"]);
+        llm.summarization_priority = v(&["ollama/small:1b"]);
+        assert_eq!(for_agent_service(&service), v(&["ollama/small:1b"]));
+        assert_eq!(for_llm_config(&llm), v(&["ollama/small:1b"]));
+    }
+
+    /// The `/api/chat` models the fake server was asked for, in order.
+    fn asked(
+        seen: &std::sync::Mutex<Vec<crate::embedding_reload::test_ollama::SeenRequest>>,
+    ) -> Vec<String> {
+        seen.lock()
+            .expect("record lock")
+            .iter()
+            .filter(|request| request.path == "/api/chat")
+            .filter_map(|request| request.model.clone())
+            .collect()
+    }
+
+    /// An empty answer is not a summary. A runner that stops at once, or a
+    /// reasoning model that spends its whole budget thinking, answers with
+    /// no text — and a consolidation that took that as success would fold a
+    /// cluster into an empty memory and delete its sources, while the next
+    /// model on the Settings list was never asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_answer_hands_the_prompt_to_the_next_model() {
+        const SUMMARY: &str = "The user keeps the build green.";
+        let (host, seen) = crate::embedding_reload::test_ollama::spawn_answering(&[
+            ("silent:1b", ""),
+            ("blank:1b", " \n\t "),
+            ("answers:1b", SUMMARY),
+        ])
+        .await;
+        let router = Arc::new(LlmRouter::new().with_ollama(&host));
+        let summarize = summarize_with_failover(
+            router,
+            v(&["ollama/silent:1b", "ollama/blank:1b", "ollama/answers:1b"]),
+        );
+
+        let summary = summarize("fold these memories".to_string())
+            .await
+            .expect("the third model answers");
+
+        assert_eq!(summary, SUMMARY);
+        assert_eq!(
+            asked(&seen),
+            v(&["silent:1b", "blank:1b", "answers:1b"]),
+            "each model is asked once, in the Settings order"
+        );
+    }
+
+    /// When every model answers with nothing, the walk fails — the
+    /// consolidation keeps its sources — and says which model answered
+    /// empty rather than reporting a success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_empty_answers_are_a_failure_that_says_so() {
+        let (host, seen) = crate::embedding_reload::test_ollama::spawn_answering(&[
+            ("silent:1b", ""),
+            ("blank:1b", "   "),
+        ])
+        .await;
+        let router = Arc::new(LlmRouter::new().with_ollama(&host));
+        let summarize =
+            summarize_with_failover(router, v(&["ollama/silent:1b", "ollama/blank:1b"]));
+
+        let error = summarize("fold these memories".to_string())
+            .await
+            .expect_err("no model gave a summary");
+
+        assert!(
+            error.contains("ollama/blank:1b") && error.contains("no text"),
+            "names the last model and why: {error}"
+        );
+        assert_eq!(
+            asked(&seen),
+            v(&["silent:1b", "blank:1b"]),
+            "an empty answer is final for its model — no congestion retry"
+        );
     }
 
     #[test]
     fn empty_only_when_nothing_is_configured() {
         // The single case callers must report as unconfigured.
-        assert_eq!(summarization_models(&[], &[]), Vec::<String>::new());
+        assert_eq!(summarization_models(&[], "", &[]), Vec::<String>::new());
         // …and never otherwise.
-        assert_ne!(summarization_models(&v(&["a"]), &[]), Vec::<String>::new());
-        assert_ne!(summarization_models(&[], &v(&["b"])), Vec::<String>::new());
+        assert_ne!(summarization_models(&v(&["a"]), "", &[]), Vec::<String>::new());
+        assert_ne!(summarization_models(&[], "b", &[]), Vec::<String>::new());
+        assert_ne!(summarization_models(&[], "", &v(&["c"])), Vec::<String>::new());
     }
-
 }

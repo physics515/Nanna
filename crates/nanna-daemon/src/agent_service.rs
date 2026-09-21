@@ -27,11 +27,11 @@ const CHAT_TRANSIENT_RETRIES_MAX: usize = 3;
 /// Escalating backoff before same-model retries `1..=CHAT_TRANSIENT_RETRIES_MAX`.
 const CHAT_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
-/// Bounded waits for a DOWN local Ollama server before falling back to
-/// normal retry accounting. Derivation: a runner-surgery restart is back in
-/// under 60s (tasks.rs polls 20×3s), so one 120s wait covers a restart with
-/// 2× margin; three waits = six minutes of continuous downtime = genuinely
-/// dead, stop stalling the run.
+/// Bounded waits for a DOWN Ollama server (the configured one, wherever it
+/// runs) before falling back to normal retry accounting. Derivation: a
+/// runner-surgery restart is back in under 60s (tasks.rs polls 20×3s), so one
+/// 120s wait covers a restart with 2× margin; three waits = six minutes of
+/// continuous downtime = genuinely dead, stop stalling the run.
 const CHAT_SERVER_DOWN_WAITS_MAX: usize = 3;
 const CHAT_SERVER_DOWN_WAIT_SECS: u64 = 120;
 
@@ -188,10 +188,10 @@ pub struct AgentServiceConfig {
     pub nudge_interval_iterations: usize,
     /// Default thinking mode
     pub thinking_mode: ThinkingMode,
-    /// Model priority list for summarization
+    /// Model priority list for summarization, in the order Settings lists it.
+    /// Resolved through the chat router (`llm_router::summarizer_clients`), so
+    /// it needs no address or key of its own.
     pub summarization_priority: Vec<String>,
-    /// Ollama URL for summarization
-    pub summarization_ollama_url: Option<String>,
     /// Model routing priority for cost optimization.
     /// Format: ["model:tier", ...] where tier is simple|medium|complex.
     pub model_routing: Vec<String>,
@@ -206,10 +206,6 @@ pub struct AgentServiceConfig {
     /// wins). Resolved at config load — empty here means the resolver already
     /// defaulted it to the main chat list, so consumers may use it verbatim.
     pub sub_agent_models: Vec<String>,
-    /// `OpenRouter` API key (passed to agents for summarization/extraction)
-    pub openrouter_api_key: Option<String>,
-    /// `OpenAI` API key (passed to agents for summarization/extraction)
-    pub openai_api_key: Option<String>,
     /// Anthropic prompt-cache lifetime for every breakpoint of a request.
     pub prompt_cache_ttl: CacheTtl,
 }
@@ -238,13 +234,10 @@ impl Default for AgentServiceConfig {
             // `agent.thinking_enabled` config flag is gone.
             thinking_mode: ThinkingMode::default(),
             summarization_priority: vec![],
-            summarization_ollama_url: Some("http://localhost:11434".to_string()),
             model_routing: vec![],
             routing_first_turn_primary: true,
             sub_agent_model: None,
             sub_agent_models: vec![],
-            openrouter_api_key: None,
-            openai_api_key: None,
             prompt_cache_ttl: CacheTtl::FiveMinutes,
         }
     }
@@ -274,9 +267,6 @@ pub fn apply_llm_settings(cfg: &mut AgentServiceConfig, llm: &nanna_config::LlmC
         .cloned()
         .unwrap_or_else(|| llm.model.clone());
     cfg.summarization_priority.clone_from(&llm.summarization_priority);
-    cfg.summarization_ollama_url.clone_from(&llm.ollama_url);
-    cfg.openrouter_api_key.clone_from(&llm.openrouter_api_key);
-    cfg.openai_api_key.clone_from(&llm.openai_api_key);
     cfg.model_routing.clone_from(&llm.model_routing);
     cfg.routing_first_turn_primary = llm.routing_first_turn_primary;
     cfg.sub_agent_model.clone_from(&llm.sub_agent_model);
@@ -301,9 +291,6 @@ pub(crate) fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
         nudge_interval_iterations: config.nudge_interval_iterations,
         thinking_mode: config.thinking_mode,
         summarization_priority: config.summarization_priority.clone(),
-        summarization_ollama_url: config.summarization_ollama_url.clone(),
-        openrouter_api_key: config.openrouter_api_key.clone(),
-        openai_api_key: config.openai_api_key.clone(),
         model_routing: config.model_routing.iter().map(|s| ModelTier::parse(s)).collect(),
         routing_first_turn_primary: config.routing_first_turn_primary,
         prompt_cache_ttl: config.prompt_cache_ttl,
@@ -323,9 +310,9 @@ pub(crate) fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
 /// would run the user's pinned chat on globally-configured models from step 2
 /// onward, silently.
 ///
-/// Nothing else moves. `summarization_priority`, `summarization_ollama_url`,
-/// `sub_agent_model`, the provider keys and the whole iteration/nudge policy
-/// stay as `agent_config_from` produced them, because the pin names the CHAT
+/// Nothing else moves. `summarization_priority`, `sub_agent_model` and the
+/// whole iteration/nudge policy stay as `agent_config_from` produced them,
+/// because the pin names the CHAT
 /// model only. Embedding settings are not reachable from here at all — they
 /// live in `[embedding]` and nothing on the chat-turn path reads them.
 ///
@@ -1360,12 +1347,15 @@ impl AgentService {
             context.messages.push(anthropic_msg);
         }
 
+        // Summarizers resolve through the chat router, per call: the same
+        // grammar and credentials as chat, and a reload reaches a running turn.
         let mut agent = Agent::new(
             agent_config,
             llm_client,
             self.tools.clone(),
         )
-        .with_context(context);
+        .with_context(context)
+        .with_summarizer_clients(crate::llm_router::summarizer_clients(&self.router));
         // Record per-model request stats into the shared tracker so the
         // control plane persists them and the router can route on them.
         if let Some(ref tracker) = self.model_stats {
@@ -1782,7 +1772,7 @@ impl AgentService {
     }
 
     /// A failed attempt: journal the fault, then decide between waiting out a
-    /// down local server, retrying the same model, or moving down the list —
+    /// down Ollama server, retrying the same model, or moving down the list —
     /// recording the decision in `walk`.
     async fn handle_attempt_failure(
         &self,
@@ -1813,17 +1803,18 @@ impl AgentService {
             at: chrono::Utc::now().to_rfc3339(),
         });
 
-        // A DOWN local server (connection refused — e.g. our own
+        // A DOWN server (connection refused — e.g. our own
         // runner-surgery restart window, observed live killing a
         // 4h55m mission two minutes after the surgery cured its
         // fault storm) is a WAIT condition, not a fault to
         // retry-count: attempts against a down server complete
         // zero tool calls, so progress-based replenishment can
         // never refill the budget, and the 2/5/10s backoffs burn
-        // out inside a ~20-60s restart. Wait for readiness
-        // (bounded) and resume the same model with the budget
-        // untouched; if the server never comes back, fall
-        // through to normal retry accounting and exhaust.
+        // out inside a ~20-60s restart. Wait (bounded) for the
+        // configured server, wherever it runs, to answer, and
+        // resume the same model with the budget untouched; if
+        // the server never comes back, fall through to normal
+        // retry accounting and exhaust.
         if provider == crate::llm_router::ProviderId::Ollama
             && Self::is_server_down_error(error_str)
             && walk.server_down_waits < CHAT_SERVER_DOWN_WAITS_MAX
@@ -1834,7 +1825,18 @@ impl AgentService {
             warn!(
                 "Ollama unreachable (server down or restarting) — waiting for readiness instead of spending retry budget (wait {server_down_waits}/{CHAT_SERVER_DOWN_WAITS_MAX})"
             );
-            if crate::tasks::wait_for_ollama_ready(CHAT_SERVER_DOWN_WAIT_SECS).await {
+            // Stop ends the wait. Returning leaves the walk on this model, and
+            // the next attempt sees the cancel before its first request and
+            // ends the turn as stopped, as it does after a backoff.
+            let ready = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    info!("chat stopped while waiting for the Ollama server — no longer waiting");
+                    return;
+                }
+                ready = crate::tasks::wait_for_ollama_ready(&self.router, CHAT_SERVER_DOWN_WAIT_SECS) => ready,
+            };
+            if ready {
                 info!("Ollama is reachable again — resuming the run");
                 return;
             }
@@ -1848,7 +1850,8 @@ impl AgentService {
         // otherwise dies on the first hiccup and heartbeats fail
         // for hours. Mirrors the task harness's step-retry
         // ladder; Ollama-served models additionally get runner
-        // surgery (provider-gated — never fires for cloud models).
+        // surgery (provider-gated — never fires for cloud models,
+        // and declined for an Ollama server on another machine).
         // Rate-limit/overload errors (429/529) are excluded: the
         // branch below honors the provider's Retry-After and the
         // shared-bucket skip instead of hammering it. A cancelled
@@ -1905,12 +1908,12 @@ impl AgentService {
                 // server — the sticky degraded state survives
                 // unloads (verified live in the endurance runs).
                 if same_model_retries == 2 {
-                    crate::tasks::reset_ollama_runner_for(model).await;
+                    crate::tasks::reset_ollama_runner_for(&self.router, model).await;
                 }
                 if same_model_retries == CHAT_TRANSIENT_RETRIES_MAX
                     && crate::tasks::ollama_restart_allowed()
                 {
-                    crate::tasks::restart_ollama_server().await;
+                    crate::tasks::restart_ollama_server(&self.router).await;
                 }
             }
             return;
@@ -2066,10 +2069,14 @@ impl AgentService {
         })
     }
 
-    /// Connection-class failure against the local server: the server is DOWN
-    /// (or restarting), as opposed to a mid-stream fault from a live server.
-    /// Over-matching is safe — the caller's readiness wait returns instantly
-    /// when the server is actually up, and the wait count is bounded.
+    /// Connection-class failure against the configured server: the server is
+    /// DOWN (or restarting), as opposed to a mid-stream fault from a live
+    /// server. Over-matching costs time, not correctness: the caller's
+    /// readiness wait returns as soon as the server answers, the wait count
+    /// is bounded, and Stop ends a wait. It does match more than a refused
+    /// connection. reqwest reports a remote address that does not resolve,
+    /// or whose certificate is refused, as "error sending request" too, and
+    /// such a server waits out the bound like one that is down.
     fn is_server_down_error(error: &str) -> bool {
         let lower = error.to_lowercase();
         lower.contains("connection refused")
@@ -2670,9 +2677,7 @@ mod tests {
         let llm = nanna_config::LlmConfig {
             model: "fallback-model".to_string(),
             model_priority: vec!["primary".to_string(), "secondary".to_string()],
-            ollama_url: Some("http://127.0.0.1:11434".to_string()),
-            openrouter_api_key: Some("or-key".to_string()),
-            openai_api_key: Some("oa-key".to_string()),
+            summarization_priority: vec!["ollama/summarizer".to_string()],
             model_routing: vec!["cheap:simple".to_string()],
             routing_first_turn_primary: false,
             sub_agent_models: vec!["sub".to_string()],
@@ -2683,9 +2688,9 @@ mod tests {
         // Head of the priority list wins, exactly as at boot.
         assert_eq!(cfg.model, "primary");
         assert_eq!(cfg.model_priority, vec!["primary".to_string(), "secondary".to_string()]);
-        assert_eq!(cfg.summarization_ollama_url.as_deref(), Some("http://127.0.0.1:11434"));
-        assert_eq!(cfg.openrouter_api_key.as_deref(), Some("or-key"));
-        assert_eq!(cfg.openai_api_key.as_deref(), Some("oa-key"));
+        // The summarization list is the whole of what summaries take from
+        // `[llm]`: its server, token and keys are chat's, through the router.
+        assert_eq!(cfg.summarization_priority, vec!["ollama/summarizer".to_string()]);
         assert_eq!(cfg.model_routing, vec!["cheap:simple".to_string()]);
         assert!(!cfg.routing_first_turn_primary);
         assert_eq!(cfg.sub_agent_models, vec!["sub".to_string()]);
@@ -2734,7 +2739,6 @@ mod tests {
             model: "claude-sonnet-4".to_string(),
             model_priority: vec!["claude-sonnet-4".to_string()],
             summarization_priority: vec!["ollama/lfm2.5".to_string()],
-            summarization_ollama_url: Some("http://127.0.0.1:11434".to_string()),
             sub_agent_models: vec!["ollama/qwen3:4b".to_string()],
             model_routing: vec!["cheap:simple".to_string()],
             ..Default::default()
@@ -2747,10 +2751,6 @@ mod tests {
         assert_eq!(turn.model, "ollama/qwen3:14b");
         // Summarization stays global — the pin names the CHAT model only.
         assert_eq!(turn.summarization_priority, vec!["ollama/lfm2.5".to_string()]);
-        assert_eq!(
-            turn.summarization_ollama_url.as_deref(),
-            Some("http://127.0.0.1:11434")
-        );
         assert_eq!(turn.sub_agent_model, None, "sub-agents are not re-pointed by a chat pin");
 
         // The shared config every other consumer reads is untouched, so the
@@ -2782,8 +2782,6 @@ mod tests {
             nudge_after_iterations: 7,
             nudge_interval_iterations: 3,
             summarization_priority: vec!["ollama/lfm2.5".to_string()],
-            openrouter_api_key: Some("or-key".to_string()),
-            openai_api_key: Some("oa-key".to_string()),
             routing_first_turn_primary: false,
             ..Default::default()
         };
@@ -2799,9 +2797,6 @@ mod tests {
         assert_eq!(turn.nudge_interval_iterations, before.nudge_interval_iterations);
         assert_eq!(turn.thinking_mode, before.thinking_mode);
         assert_eq!(turn.summarization_priority, before.summarization_priority);
-        assert_eq!(turn.summarization_ollama_url, before.summarization_ollama_url);
-        assert_eq!(turn.openrouter_api_key, before.openrouter_api_key);
-        assert_eq!(turn.openai_api_key, before.openai_api_key);
         assert_eq!(turn.context_result_threshold, before.context_result_threshold);
         assert_eq!(turn.distillation_interval, before.distillation_interval);
         assert_eq!(turn.routing_first_turn_primary, before.routing_first_turn_primary);
@@ -3150,6 +3145,133 @@ mod tests {
                 assert!(output.is_some(), "…and carried its output");
             }
             other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// Stop ends a server-down wait. One wait lasts up to
+    /// `CHAT_SERVER_DOWN_WAIT_SECS` and a message gets three, so a chat
+    /// stopped during one sat out the rest of it: six minutes for a remote
+    /// address with a typo, which fails the same way as a server that is down.
+    /// The walk stays on the same model with its budget untouched, and the
+    /// attempt that follows sees the cancel before its first request and ends
+    /// the turn as stopped.
+    #[tokio::test]
+    async fn stop_ends_a_server_down_wait() {
+        // Port 9 on this machine: refused, so the wait never ends by itself.
+        let router = Arc::new(LlmRouter::new().with_ollama("http://127.0.0.1:9"));
+        let (event_tx, _events) = broadcast::channel::<Event>(16);
+        let service = AgentService::new(
+            AgentServiceConfig::default(),
+            router,
+            Arc::new(ToolRegistry::new()),
+            None,
+            event_tx,
+        );
+        let model = "ollama/qwen3:8b";
+        let run = ChatRunBuffers::new();
+        let mut walk = ModelWalk::new(&[model.to_string()]);
+        let stop = run.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            stop.cancel();
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            service.handle_attempt_failure(
+                "s",
+                model,
+                crate::llm_router::ProviderId::Ollama,
+                "HTTP error: error sending request for url (http://127.0.0.1:9/api/chat)",
+                &run,
+                &mut walk,
+            ),
+        )
+        .await
+        .expect("Stop must end the wait, not the wait's own deadline");
+        assert_eq!(
+            (walk.index, walk.same_model_retries, walk.server_down_waits),
+            (0, 0, 1),
+            "the same model is tried again, with its retry budget untouched"
+        );
+    }
+
+    /// The owner's case: chat on a remote Ollama that wants a token, and a
+    /// summarization list naming a model there. The in-loop summarizers read
+    /// `[llm].ollama_url` (localhost) and sent no token, so every one was
+    /// refused while chat worked. A turn's summarizer must reach the server
+    /// chat uses, with the bound bearer — and when the server moves, the SAME
+    /// agent's next summarization must follow it, with no restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turns_summarizer_goes_where_chat_goes_and_follows_a_move() {
+        use crate::embedding_reload::test_ollama::{
+            CHAT_MEMORY, ollama_credentials, spawn_token_gated,
+        };
+        let (first_host, first_seen) = spawn_token_gated("bound-token").await;
+        let (moved_host, moved_seen) = spawn_token_gated("bound-token").await;
+        let router = Arc::new(LlmRouter::new());
+        router.rebuild(&ollama_credentials(&first_host, "bound-token"));
+
+        let chat_model = "ollama/nanna-test-chat:1b";
+        let (event_tx, _events) = broadcast::channel::<Event>(16);
+        let service = AgentService::new(
+            AgentServiceConfig {
+                model: chat_model.to_string(),
+                summarization_priority: vec!["ollama/nanna-test-summarizer:1b".to_string()],
+                ..AgentServiceConfig::default()
+            },
+            Arc::clone(&router),
+            Arc::new(ToolRegistry::new()),
+            None,
+            event_tx,
+        );
+        let history = [
+            test_message(
+                MessageRole::User,
+                "Please keep the build green on every commit; that is the one rule here.",
+            ),
+            test_message(MessageRole::Assistant, "Understood: every commit keeps the build green."),
+        ];
+        let chat_client = router.client_for_model(chat_model).expect("Ollama always registers");
+        let agent = service
+            .attempt_agent("s", chat_model, chat_client, None, &history)
+            .await;
+
+        let memories = agent.extract_memories().await.expect("the summarizer answers");
+        assert_eq!(
+            memories.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec![CHAT_MEMORY]
+        );
+        let reached = first_seen.lock().expect("record lock").clone();
+        assert!(
+            reached.iter().any(|r| r.path == "/api/chat"
+                && r.authorization.as_deref() == Some("Bearer bound-token")
+                && r.model.as_deref() == Some("nanna-test-summarizer:1b")),
+            "the summarizer reached chat's server with the bound token: {reached:?}"
+        );
+
+        // A config reload moves the server; the agent built before it follows.
+        router.rebuild(&ollama_credentials(&moved_host, "bound-token"));
+        agent.extract_memories().await.expect("the moved server answers");
+        let reached = moved_seen.lock().expect("record lock").clone();
+        assert!(
+            reached.iter().any(|r| r.path == "/api/chat"
+                && r.authorization.as_deref() == Some("Bearer bound-token")),
+            "the next summarization went to the new server: {reached:?}"
+        );
+    }
+
+    fn test_message(role: MessageRole, content: &str) -> SessionMessage {
+        SessionMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            role,
+            content: content.to_string(),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            reasoning: None,
+            timeline: Vec::new(),
+            usage: None,
         }
     }
 }

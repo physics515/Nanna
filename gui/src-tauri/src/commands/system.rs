@@ -1,6 +1,7 @@
 //! Window, notification, stats, and lifecycle commands.
 
 use crate::backend::{BackendMode, BackendStatus};
+use crate::daemon_manager::BootLine;
 use crate::state::{backend_handle, AppState, CloseMode, ModelStatusEvent};
 use nanna_core::log_buffer::LogEntry;
 use std::sync::Arc;
@@ -470,6 +471,39 @@ pub async fn init_backend(
         BackendMode::Daemon => "daemon".to_string(),
         BackendMode::Disconnected => "disconnected".to_string(),
     })
+}
+
+/// Restart the daemon, a live but hung boot included, and return once a
+/// fresh start has begun; poll `get_backend_status` for its progress (see
+/// `Backend::restart`).
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`. A start that fails shows in the status's
+/// `last_error`.
+#[tauri::command]
+pub async fn restart_daemon(
+    app: AppHandle,
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<(), String> {
+    backend_handle(&state).await.restart(app).await;
+    Ok(())
+}
+
+/// The output lines of the current (or most recent) daemon sidecar, oldest
+/// first: what the daemon printed while it booted, up to its exit or its
+/// newest line. Works before any daemon answers.
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
+#[tauri::command]
+pub async fn get_boot_log(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<BootLine>, String> {
+    Ok(backend_handle(&state).await.boot_log().await)
 }
 
 /// How many lines a single `get_daemon_logs` call may return.

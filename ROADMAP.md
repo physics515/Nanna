@@ -674,13 +674,20 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       and `componentResolution` / `packageComponentExports` prove every component and lucide import
       on the new page really exists. `pnpm typecheck` 0 errors with its canary confirming it reads
       `app/`; 251 vitest; nanna-tools 153 and nanna-daemon 367 tests green.
-      - [ ] **One defect found while driving this, left unfixed as out of scope.** A `tool.execute`
+      - [x] **One defect found while driving this, left unfixed as out of scope.** A `tool.execute`
             request missing the non-optional `input` field gets **silence** — the client times out
             rather than being told the request was malformed. Measured: the same call *with*
             `input: {}` answers correctly with a `not_found` outcome, so this is the request-decode
             path, not the tool path. A control plane that drops an undeserializable request without
             answering is the same honesty failure the audit work was about; it deserves its own
             increment.
+            *(2026-09-18)* Correction and fix: the daemon *did* answer — under id `"unknown"`, which
+            no client can match to its request, so to the caller it was silence until its timeout.
+            A request that fails to decode is now answered under its own `id` (string, or a number's
+            decimal form; bounded at 256 bytes) whenever the raw JSON carries one. Verified on the
+            real daemon: `missing field \`input\``, `unknown variant \`teleport\`` and an unknown
+            action type each come back correlated, naming the problem; text with no id (or not JSON)
+            still gets the `"unknown"` error, which is all that can be done for it.
 - [x] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
       *(2026-07-20)* Disabled-tools-execute closed by the `ToolPolicy` gate above (`[tools] disabled` now
       denies at `execute()`, post-resolution). Deleted-tools-callable was closed 2026-07-17 via
@@ -941,13 +948,39 @@ health checks). **Shipped**, except:
       contents — with **stdout containing exactly the 2/2 protocol lines and every log on stderr**.
       Remaining: memory/agent-backed tools (`remember`/`recall`/`reflect`/`task`) need the daemon's script
       services, which this standalone path does not build — see the new item below.
-- [ ] *(2026-07-23)* **Give `nanna mcp serve` the memory/agent-backed tools.** It loads skills via
+- [x] *(2026-07-23)* **Give `nanna mcp serve` the memory/agent-backed tools.** It loads skills via
       `ToolRegistry::load_skills` (no services), so the tools that need `build_script_services` —
       `remember`, `recall`, `reflect`, `task` — load but cannot reach memory or spawn sub-agents. Options:
       (a) build the script services in the CLI path (needs storage + an embedding provider), or
       (b) add a daemon IPC action so `mcp serve` proxies to the running daemon and inherits its live
       store — (b) matches the "channels as control-plane clients" architecture and avoids a second
       process owning `nanna.db`. Until then, document the standalone surface as filesystem/shell/web only.
+      *(2026-09-18)* Done as (b). `nanna mcp serve` connects to the daemon (2 s budget) and serves its
+      live registry: `tool.list` for the enabled names, `tool.get` for each definition (the same
+      parameter → schema conversion `tools_bridge` uses), every call a `tool.execute` over IPC, the
+      reply mapped to a tool result (`isError` on failure, never an empty success). No daemon →
+      a stderr warning and the standalone surface; `--standalone` forces it; `--daemon <url>`
+      names one and makes its absence an error. Verified on the real CLI + debug daemon over
+      stdio: 43 tools listed, `remember` stored a memory through the daemon — the same call
+      `--standalone` fails with `Service not found: memory.store`. Found on the way and fixed: the
+      MCP **server** logged every notification (`notifications/initialized`) as a failed parse, and
+      silently dropped a request it could not read; notifications are now accepted quietly, and an
+      unreadable line is answered `-32700` (`id: null`) or `-32600` (its id echoed).
+      *(2026-09-18, same night)* **The server side is dual-era too.** It answered only the 2024
+      handshake, so a modern-only client could not use it: the real `@modelcontextprotocol/client`
+      2.0 pinned to 2026-07-28 failed with *"the server did not offer pinned protocol version
+      2026-07-28 via server/discover"*, and in `auto` mode fell back to legacy. Now `server/discover`
+      is answered (supported `["2026-07-28", "2024-11-05"]`, capabilities, `serverInfo` in `_meta`),
+      a request naming an unknown revision in `_meta` gets `-32022` with the supported list, modern
+      results carry `resultType` and — for discover, the lists and `resources/read` — the required
+      caching hints (`ttlMs: 0`: the daemon's registry changes at runtime; `cacheScope: private`),
+      and errors use the spec's codes (`-32601` unknown method, `-32602` unknown tool/resource/bad
+      params, `-32603` otherwise) instead of the catch-all `-32000`. Legacy answers are byte-for-
+      byte as before. The caching-hint requirement was caught by the real client (it rejected
+      `tools/list` without `ttlMs`), not by reading. Verified with that client
+      (`tests/fixtures/sdk-servers/client-probe.mjs`) against `nanna mcp serve`: `legacy` →
+      2024-11-05, `auto` → **2026-07-28**, `pin` → 2026-07-28 (was a hard failure), 47 tools and a
+      call in each; an unknown tool → `Tool not found`.
 - [~] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
       *(2026-08-23)* **Half of this was already stale, and the half that was true hid a real bug.**
       `perform_health_check` does run a genuine agent loop — `Agent::run(probe_prompt)` under a
@@ -1021,6 +1054,13 @@ health checks). **Shipped**, except:
       reads a flat top-level `properties`, so a composed schema silently yields zero params. Handle composition
       (at least surface the union of branch properties). Source:
       [MCP 2026-07-28 RC](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
+      *(2026-09-18 — superseded by the dual-era client, see P18's MCP entry.)* Rather than moving the
+      one handshake version, the client now speaks **2026-07-28** to every server that answers
+      `server/discover` (stateless, per-request `_meta`, routable headers on HTTP) and keeps
+      `initialize` at `2024-11-05` only as the legacy fallback, where it is the widest-compatible
+      offer. Of the capability commitments listed: roots and sampling are simply not declared (and
+      `roots` was dropped from the legacy handshake too), logging notifications are routed, MRTR
+      `input_required` is refused with a clear error (serving elicitation is its own `[ ]`).
       *(2026-07-21)* **Point (3) shipped** — `schema_to_parameters` is now composition-aware: it folds the
       `properties` of each `allOf`/`anyOf`/`oneOf` branch (one level deep) into the parameter list on top of the
       top-level `properties`, so a 2020-12 composed tool no longer yields **zero** params (which would make the
@@ -1053,7 +1093,7 @@ health checks). **Shipped**, except:
       net new clippy warnings (44 lib / 42 lib-test, unchanged).
       Remaining on the RC: nested/conditional composition (`if`/`then`/`$defs`) in `schema_to_parameters`,
       and the client still advertises `PROTOCOL_VERSION = "2024-11-05"` — see the new item below.
-- [ ] *(2026-07-23)* **Bump `McpClient::PROTOCOL_VERSION` off `2024-11-05`.** The client still negotiates
+- [x] *(2026-07-23)* **Bump `McpClient::PROTOCOL_VERSION` off `2024-11-05`.** The client still negotiates
       the Nov-2024 revision, so a 2026-07-28 server may legitimately answer `-32022
       UnsupportedProtocolVersion` (constant now defined) or fall back to legacy behaviour. Bumping it is a
       capability commitment, not a string edit — it requires the Roots/Sampling/Logging deprecation
@@ -1850,6 +1890,13 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             class where one tool's description steers another tool's parameters. Applies to MCP-discovered
             tools and `discover_tools` activation. Source:
             [CrowdStrike agentic tool-chain attacks](https://www.crowdstrike.com/en-us/blog/how-agentic-tool-chain-attacks-threaten-ai-agent-security/).
+            *(2026-09-18, context for whoever decides this)* Tool definitions now **change at
+            runtime**: an MCP server's `list_changed` resyncs the registry (see P18's MCP entry), so
+            a server that swaps a tool's description mid-session is live on the next turn, silently.
+            The owner's no-gates rule rules out "re-prompt on drift"; the 2026-08-24 note under P3
+            already names the shape that fits it — a *filter*, like `schema_guard`: a drifted tool is
+            dropped and announced, and re-pinned out of band, never in-turn. That note's precondition
+            ("wire the client first") is now met; this is the next MCP security increment.
 - [x] **Log rotation** — `tracing-appender` daily rotation, max ~7 files (logs currently accumulate unbounded).
       *(2026-07-09)* New `nanna-daemon::log_file` builds a `RollingFileAppender` (DAILY rotation,
       `filename_prefix="nanna-daemon"`, `.log` suffix, `max_log_files(7)`) wrapped in `tracing_appender::non_blocking`;
@@ -3254,6 +3301,41 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      **(2026-09-20) A constant-factor pass landed, and it is mostly useful for what it rules
+      out.** `cluster_memories` now hoists each memory's L2 norm out of the O(N^2) loop — the
+      cosine kernel re-derived both magnitudes on every pair (three FMAs per element) and now
+      does one dot product against two cached scalars. Bit-identical, asserted as exact `f32`
+      equality across seven widths, with the `pairs` column unchanged at every N. Worth
+      **11-18%** on the sparse arm (16k: 4,206.6 ms -> ~3,730 ms), two runs agreeing.
+      **But it was estimated at 2-3x and delivered 13%, and that gap is the finding**: the
+      kernel is **memory-bandwidth bound, not FMA bound** — each pair streams two 384-float
+      vectors and a wide core absorbs the extra multiply-adds nearly free. So no further
+      arithmetic tuning of this loop is worth scheduling; 35 ns/pair -> 29 ns/pair moves 500k
+      from ~73 min to ~60 min, which is not a fix. **Fewer pairs is the only lever**, which is
+      what this item already proposes — now supported by a measurement instead of an
+      assumption.
+      **(2026-09-20, same run) Then took the other cheap win: prune pairs before the cosine.**
+      `score_or_prune` evaluates the three scalar terms first and skips the embedding entirely
+      when the pair's **ceiling** — its score with a perfect cosine of 1.0 — is already below
+      `cluster_threshold`. Every cheap term is bounded above by 1.0 by construction, so this is
+      an exact upper bound and the skipped pairs are precisely the ones that would have been
+      rejected; `pruning_never_changes_a_cluster` clusters a randomized corpus with and without
+      it and requires identical output. Worth **16-22%** on the new `aged` arm, where it rejects
+      **21.9%** of all pairs before touching an embedding.
+      **Two caveats, both load-bearing.** (1) It does *nothing* on the dense and sparse arms —
+      there every cheap term is 1.0 and the ceiling never falls below threshold. The gain is
+      real only for a store spread across time with varying FSRS state, i.e. the long-lived one.
+      (2) It is still a constant factor on a quadratic: ~60 min -> ~47 min at 500k.
+      **Together the two 2026-09-20 passes are the argument for the index**: they took every
+      cheap win available without one — a third of the arithmetic, a fifth of the pairs — and
+      the wall is still standing.
+      **A fixture correction went with it.** The dense and sparse arms space memories one second
+      apart and leave `time_span_minutes` at its 1440-minute default, and they give every memory
+      `FsrsState::default()`. Production does neither: `with_store_timescale` sets the span from
+      the store's own oldest-to-newest gap, and real memories differ in access count and
+      importance. So those arms hold all three non-semantic terms pinned at 1.0 — the exact
+      degeneracy behind the 2026-09-09 similarity-veto bug — and cannot show any effect that
+      depends on them. The new `aged` arm fixes both.
       **(2026-09-09) Baselined first — `bench/BASELINE.md` Suite 3b — and the two regimes are
       the finding.** Cost is governed by **match density**, not by N. *Dense* (clusters fill, so
       `max_cluster_memories` breaks the inner loop): **N^1.45**, 16k memories in 39 ms. *Sparse*
@@ -3315,6 +3397,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   index earns nothing at today's corpus size. The real trigger is the **O(N^2)
                   clustering in dreaming**, not recall. Source:
                   [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+                  *(2026-09-20 — **the trigger now has a number, from Suite 2c.**)* This item
+                  already said "do not schedule this on recall grounds"; what it lacked was the N
+                  at which it *should* be scheduled. The recall-path measurement supplies both
+                  halves. On latency there is no case at all — the in-RAM exact scan costs 10.89 ms
+                  at 50k and the SQL alternative 98.3 ms, so an index would not be competing with
+                  anything slow. On **residency** it becomes real at ~350k memories (1.43 GiB of
+                  f32 at 768-dim by 500k), roughly **7x** today's ceiling, and there SQL k-NN's
+                  ~2 µs/element extrapolates to ~690 ms per query — i.e. the escape hatch stops
+                  being an escape. So the schedule is: **the O(N^2) dreaming clustering first** (the
+                  trigger this shortlist was always keyed to), and recall-side ANN only if the
+                  corpus approaches ~350k. Shortlist re-checked 2026-09-20, unchanged —
+                  `hnswlib-rs` still decouples the graph from vector storage (the property that
+                  keeps Turso owning the f32 BLOBs), with `usearch` and the shadow-table
+                  `sqlite-vector-rs` as the references beside it.
                   - [ ] *(research 2026-09-07)* **Recall is now measured across the shortlist, and it
                         confirms the "do not schedule on recall grounds" call rather than
                         challenging it.** Published comparisons put `usearch` at 0.987 recall /
@@ -3340,7 +3436,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   crate — so adopting it means a second on-disk structure beside the f32 BLOBs, which
                   is exactly the mirroring `hnswlib-rs` was shortlisted for avoiding. Record the
                   option, keep the shortlist as-is.
-            - [ ] *(research 2026-08-26)* **The FSRS default weight table is not FSRS-6's, despite
+            - [x] *(research 2026-08-26)* **The FSRS default weight table is not FSRS-6's, despite
                   saying it is.** `crates/nanna-memory/src/fsrs.rs` is headed "Default FSRS-6
                   parameters", but `w0..w18` are FSRS-**5** values (`0.4072, 1.1829, 3.1262, 15.4722,
                   7.2102, 0.5316, ...` against FSRS-6's `0.212, 1.2931, 2.3065, 8.2956, 6.4133,
@@ -3361,6 +3457,30 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   `0.0658` at index 19 and `0.1542` at index 20) — settle that against `rs-fsrs`
                   source before touching anything. Source:
                   [FSRS algorithm wiki](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
+                  *(2026-09-20)* **Decided, and it is the second option — with the missing fact
+                  that makes it the right one: 13 of the 21 weights are not read by anything.**
+                  The item offered "adopt FSRS-6's table with an A/B" or "rename the constant and
+                  its doc to say what the table actually is", and an A/B is meaningless for a
+                  parameter nothing consumes. Measured rather than grepped: new
+                  `only_the_live_weights_change_any_fsrs_output` sets each slot in turn to a probe
+                  value and fingerprints every number `FsrsParameters` can influence — the five
+                  read-only scores plus the stability and difficulty `record_access` produces for
+                  all four ratings. Exactly **`w6..=w12` and `w20`** move anything; `w0..=w5` and
+                  `w13..=w19` move nothing, including the non-zero `w0 = 0.4072` and
+                  `w16 = 2.2035` that make the table look live. So the six zeroed entries were
+                  never the anomaly — they sit in the same dead range as six non-zero ones.
+                  Fixed the honest way: the module heading no longer claims to be "an FSRS-6
+                  implementation" (what is borrowed is FSRS-6's **power-law forgetting curve**,
+                  which is precisely why `w20`'s published constant transfers and the rest do not —
+                  the stability/difficulty updates are Nanna's own, because FSRS schedules graded
+                  study reviews and this schedules decay under incidental recall), and the struct
+                  doc now states the dead set and points at the test. Deliberately **not** deleted:
+                  the slot *numbering* is FSRS's, and renumbering would make every reference to
+                  "w20" ambiguous against the published algorithm.
+                  Verified the guard bites — claiming `w16` is live makes it fail and print both
+                  the live and dead sets. Same class as the "dead fields that look like features"
+                  ledger below: a public, serializable surface that reads as configuration and
+                  configures nothing.
             *(2026-07-24)* **Proven, not just read — `crates/nanna-storage/tests/vector_functions.rs`.**
             A registered SQL function is not a working one, and this decision is too load-bearing to rest
             on a source grep, so 3 tests now assert it end to end through the pinned dependency:
@@ -3394,10 +3514,57 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             the same generator the recall harness uses), persists it to Turso, and asserts for every centroid
             probe that SQL k-NN's nearest neighbour is the **same memory** an independent in-RAM cosine scan
             picks **and** is in the probe's own topic cluster. So exact SQL k-NN is a faithful drop-in for the
-            in-RAM scan on realistic embeddings, not just a hand-built spread. **Still the remaining work:** the
+            in-RAM scan on realistic embeddings, not just a hand-built spread. ~~**Still the remaining work:** the
             *latency/RAM comparison* (wall-clock trade; needs the not-yet-built `nanna-bench` harness, release
             profile), and the **decision to wire it into the live recall path** vs the current `bulk_load`+SIMD
-            scan — only after that measurement does the ANN-crate question reopen.
+            scan — only after that measurement does the ANN-crate question reopen.~~
+            *(2026-09-20)* **MEASURED, and the decision is: keep the in-RAM scan; do NOT wire SQL k-NN into
+            the live recall path.** `nanna-bench` exists now, so the blocker is gone. New criterion body
+            `crates/nanna-bench/benches/recall_path.rs` runs three arms against a **file-backed** Turso
+            database (not `Storage::in_memory()`, which would hand the SQL arm the very residency the
+            comparison is about) at 768-dim, `LIMIT = 10`, fixed seed, quiet host — full table in
+            `bench/BASELINE.md` Suite 2c. Per-query, SQL k-NN is **12.0x / 10.7x / 7.7x slower** at
+            1k / 10k / 50k (541.5 µs vs 44.94 µs · 16.21 ms vs 1.521 ms · 89.54 ms vs 11.64 ms), and the
+            residency that buys the in-RAM arm its speed is cheap: `bulk_load` amortizes after **3 queries
+            at 1k and 2 at 10k and 50k**. There is no N in the practical range where SQL k-NN wins on
+            latency, so its value is only ever the O(1) RAM — it stays a tested, documented escape hatch
+            for a store too large to hold, off the turn's critical path.
+            **The ANN question reopens, and now at a measured N.** Embeddings cost `N x dim x 4` bytes —
+            146 MiB @ 50k, **1.43 GiB @ 500k** at 768-dim — so residency binds around **~350k** under a
+            1 GB embedding budget. SQL k-NN is asymptotically linear at ~1.8 µs/element there, i.e.
+            **~630 ms per query**, which is not a recall path. So at the scale where the in-RAM ceiling
+            actually bites, the answer is an index and not SQL, and the `hnswlib-rs` shortlist above
+            becomes live at roughly **7x** today's ceiling — not before. That is the trigger to schedule
+            it on, alongside the O(N^2) dreaming clustering the shortlist was already keyed to.
+      - [x] *(2026-09-20, found by the bench above)* **Suite 2's `simd_batch` row is not the recall
+            path's latency, and the gap is a real cost the shipped code pays.** `simd_batch/50000`
+            measures 4.08 ms; `ram_scan/50000` — same N, dim, seed and host — measures **11.64 ms**,
+            2.8x more. The difference is the work `VectorStore::search_with_coverage` does around the
+            cosine map: the comparable-width count, and **a full `sort_by` of all N similarities before
+            `truncate(top_k)`**, O(N log N) on top of the O(N) cosine, for a `top_k` that is 10.
+            `remember_scoped` runs a search on **every ingest**, so this is on the write path too.
+            **Fixed the same run:** `VectorStore::rank_top_k` selects with `select_nth_unstable_by`
+            and sorts only the kept prefix. Measured end to end against the literal prior ranking,
+            all arms in one run — **-13.6% / -18.4% / -5.6%** off the *whole* recall path (cosine
+            included) at 1k / 10k / 50k; holding the comparator fixed to isolate the algorithm alone
+            it is -20.4% / -24.4% / -22.7%. The smaller figure is the one to quote: the new
+            comparator is deliberately *more* work per comparison, so crediting the predecessor with
+            it would overstate the win. Two honest caveats are recorded with the table — the 10k row
+            has a ~±5% CI, and the 50k saving does not scale the way an O(N log N) → O(N) change
+            alone predicts (cache behaviour, not comparison count, sets the pace at 400 KB of
+            similarities). Also a correctness fix, tested rather than measured: ties now resolve
+            deterministically by ascending index instead of leaning on sort stability (selection is
+            unstable), and a **NaN similarity now ranks last instead of anywhere**. NaN was
+            reachable — a zero-magnitude embedding of the right width gives cosine `0/0`, which the
+            width check cannot catch — and the old comparator handed it to `partial_cmp`, got
+            `None`, and treated it as `Equal`, which is intransitive and could seat it in the
+            returned results. 4 new tests, one of which pins the new ranking against the old stable
+            sort element-for-element on a deliberately tie-heavy fixture, plus two that drive the
+            **shipped** `VectorStore::search` rather than the ranking function in isolation (an
+            all-ties store must return the same five rows in the same order across repeated calls;
+            a zero-magnitude row must never outrank a real, if weak, match). **The suite was checked
+            against the defect, not just against the fix**: regressing `rank_order` back to the
+            similarity-only comparator makes all five fail, the two end-to-end ones included.
       - [x] *(2026-07-25)* **`MemoryRepository::delete`/`bulk_delete` now destroy the embedding on disk — the
             "today, before any HNSW" half of Ghost Vectors is closed.** Proven, not assumed: the negative
             control test (`raw_delete_leaves_embedding_on_disk`) confirms a plain `DELETE` **does** leave the
@@ -4986,7 +5153,7 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       command and a duplicate name each logged and skipped while the good server started, and on
       SIGTERM the daemon exited `clean_shutdown` with the fixture child reaped. Not verified: a
       model actually choosing the tool (no model on this host), and a real `npx` server.
-      - [ ] *(research 2026-09-17 — raises the priority of everything below)* **nanna-mcp is a
+      - [x] *(research 2026-09-17 — raises the priority of everything below)* **nanna-mcp is a
             "legacy" client, and the current spec cannot talk to it.** MCP's current revision is
             **`2026-07-28`**, which removes the `initialize` handshake: every request carries
             `_meta["io.modelcontextprotocol/protocolVersion"]`, servers MUST implement
@@ -5008,7 +5175,54 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             [versioning](https://modelcontextprotocol.io/specification/versioning),
             [2026-07-28 compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
             [stdio backward compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio).
-      - [ ] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
+            *(2026-09-18) The stdio half landed — built and verified against the REAL reference
+            servers, not a fixture.* `crates/nanna-mcp/src/era.rs` holds the whole decision table
+            as pure functions: `DiscoverResult` → modern (mutual version, OUR preference order);
+            `-32022` with a mutual version → modern, with only our legacy revision → `initialize`,
+            with nothing in common → a named error and **no** fallback; `-32021`/`-32020` → error,
+            no fallback; any other code, a timeout, or a non-discover answer → legacy; a dead
+            process → the transport error (never a handshake into a corpse). Modern requests carry
+            `_meta` (`protocolVersion`, empty `clientCapabilities`, `clientInfo`); no
+            `notifications/initialized`; `resultType: input_required` becomes an error instead of an
+            empty success. The era is cached per client. `tests/dual_era_live.rs` (ignored; needs
+            `npm install` in `tests/fixtures/sdk-servers`, pinned `@modelcontextprotocol/server`
+            2.0.0 + `server-everything` 2026.8.31) drives a modern-only, a dual-era and a legacy
+            server end to end: 3/3. Then through the **real debug daemon** with all three in
+            `[[mcp.servers]]`: `mcp__modern__shout` → `HELLO FROM NANNA`, `mcp__dual__shout`,
+            `mcp__everything__echo` → `Echo: legacy ok`, all `started`. Before this, the modern-only
+            server answers our `initialize` with `-32022` — the failure the matrix predicts.
+            **Found on the way (fixed in the same commit):** the stdio reader parsed every line as
+            a *response* first, and a server→client *request* (`{"id":0,"method":"roots/list"}`)
+            deserializes as one — so it could be handed to whichever pending call shared its id,
+            and was never answered. The legacy handshake also advertised a `roots` capability the
+            client does not serve, which is what invited the request. Measured: server-everything
+            holding that unanswered `roots/list` **did not exit on stdin EOF and outlived the
+            daemon** (orphaned to the subreaper). Lines are now classified by shape; `ping` gets
+            `{}`, every other request `-32601`; `roots` is no longer declared. Re-run: no survivor,
+            `clean_shutdown`.
+      - [x] **The daemon's MCP shutdown is never awaited.** `spawn_mcp_servers` closes the clients
+            in a detached task on the shutdown broadcast, but the daemon returns (`Daemon stopped`)
+            without waiting for it, so the `kill()` in `StdioTransport::close` does not run — the
+            orphan above survived a SIGKILL-capable close path, which is the proof. Today every
+            well-behaved server still exits on stdin EOF when the process dies; a server that
+            ignores EOF (the spec says SHOULD, not MUST) is orphaned. Shape: return the task's
+            `JoinHandle` and await it under a bounded deadline in the shutdown sequence, and follow
+            the spec's escalation (close stdin → wait → SIGTERM → SIGKILL) instead of an immediate
+            kill.
+            *(2026-09-18, same night)* Done in that shape, minus SIGTERM (tokio's `Child` only
+            offers SIGKILL, and a new `nix`/`libc` dep for one signal is not worth it when EOF is
+            the spec's *primary* signal). `StdioTransport::close` now drops stdin, waits
+            `MCP_EXIT_GRACE` (2 s — the SDK servers exit in <100 ms) and only then kills;
+            `close_all` closes every server concurrently and no longer stops at the first error;
+            `spawn_mcp_servers` returns its task and `finish_shutdown` awaits it under
+            `MCP_SHUTDOWN_DEADLINE` (grace + 1 s), aborting past it so `kill_on_drop` still fires.
+            Also: a failed request write no longer leaks its pending slot. Proof on the real debug
+            daemon with an SDK server wrapped to ignore EOF: `MCP server exited on stdin EOF` for
+            the well-behaved one, `ignored stdin EOF; killing it grace_ms=2000` for the stubborn
+            one 2.0 s later, `MCP servers closed` **before** `Daemon stopped`, no node process left.
+            Unit tests pin both paths (`cat` exits inside the grace; `sleep 30` is killed after it,
+            within 2× grace) and that a closed transport refuses to write.
+      - [x] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
             speaks the 2024-11-05 SSE transport; add `url` entries with bearer tokens read from the
             keyring (not `config.toml`), then Streamable HTTP.
             *(2026-09-17, found while scoping this)* **`HttpTransport::connect` had undefined
@@ -5042,6 +5256,164 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             Consequence for this item: build the modern POST client first and keep the SSE transport
             only as the last fallback — or drop it, since it is deprecated and eligible for removal.
             Source: [Streamable HTTP, 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
+            *(2026-09-18) The transport half landed: `StreamableHttpTransport`
+            (`crates/nanna-mcp/src/streamable_http.rs`), driven by the same dual-era client.* One
+            `POST` per message with `Accept: application/json, text/event-stream`; answers read as
+            JSON **or** a per-request SSE stream (bounded parser, 16 MiB per message, comments and
+            `event:`/`id:` ignored); `MCP-Protocol-Version` mirrored from the body's `_meta`,
+            `Mcp-Method` always, `Mcp-Name` for `tools/call`/`prompts/get`/`resources/read`, the
+            Base64 sentinel for non-header-safe values (the spec's own five encoding examples are a
+            unit test); `x-mcp-header` parameters validated at `tools/list` (token, case-insensitive
+            unique, string/integer/boolean only, reachable through `properties` alone — an invalid
+            tool is dropped, the rest kept) and mirrored as `Mcp-Param-*` on `tools/call`; bearer
+            token on every request. Era: a JSON-RPC body is returned whatever the HTTP status (modern
+            servers put their era-identifying errors in 400/404 bodies), anything else is the new
+            `McpError::HttpStatus`, which the probe reads as legacy — except 401/403, which surface as
+            the auth failure they are instead of being retried as a handshake. Legacy (2025-era)
+            servers get `initialize`, their `Mcp-Session-Id` echoed, the negotiated version as the
+            header, a best-effort `DELETE` on close, and any mid-stream server request answered.
+            Live against the REAL servers (`tests/dual_era_live.rs`, now 6/6): `createMcpHandler`
+            from `@modelcontextprotocol/server` 2.0 in both `json` and `sse` response modes (modern
+            era, `shout` + an `x-mcp-header` tool, including a base64-wrapped `Zürich ` value), the
+            same behind a bearer check (right token works; wrong token → `HttpStatus 401`, not a
+            fallback), and server-everything's legacy `streamableHttp` mode (probe answered `400`
+            + `-32000` → `initialize` → session → `echo`). **Negative control:** with the
+            `Mcp-Param-*` mirroring disabled the real server refuses the call with `-32020 … the
+            Mcp-Param-Region header is absent` — so the test has teeth.
+      *(2026-09-18, closing this item)* Streamable HTTP (both eras) and config wiring landed tonight
+      (entries below). The last piece — a URL whose server only speaks the **deprecated 2024
+      HTTP+SSE** transport — is `LegacySseTransport` (`crates/nanna-mcp/src/sse_legacy.rs`): `GET`
+      the URL, wait (bounded, 10 s) for the `endpoint` event, `POST` messages there, route every
+      answer from the one stream (bounded parser, bearer token, server requests answered, pending
+      requests capped at 256). The daemon uses it exactly as the binding says: when the Streamable
+      HTTP attempt gets `400`/`404`/`405` with no modern error body. The old `HttpTransport`
+      (assumed `<url>/sse`, "waited" for the endpoint with a 100 ms sleep) is left for its one
+      caller, `McpClient::connect`. Verified against server-everything's real `sse` mode (live test
+      10/10) and on the real daemon: `url = "…/sse"` → *"No Streamable HTTP endpoint; trying the
+      2024 HTTP+SSE transport"* → 13 tools → `mcp__oldsse__echo` answered over IPC.
+      - [x] *(2026-09-18)* **A `-32020 HeaderMismatch` re-lists tools and retries once**, as the
+            binding asks (the usual cause: a parameter gained `x-mcp-header` since our cached
+            `tools/list`, so we sent no `Mcp-Param-*` for it). One retry only — a second mismatch
+            is the server's problem, not a stale cache. Test: scripted server refusing once →
+            `tools/call, tools/list, tools/call`; refusing always → the error after 3 requests.
+      - [x] **Wire Streamable HTTP servers into `[[mcp.servers]]`** — a `url` form of the entry
+            (mutually exclusive with `command`), its bearer token from the secure store the way
+            `secret_env` already works for stdio (`nanna mcp secret set`), and the daemon's MCP
+            manager holding both transports. Not done with the transport because the manager and
+            `McpIntegration` are generic over ONE transport type (`StdioTransport`), so this needs
+            an either-transport type first.
+            *(2026-09-18, same night)* Done: `url` and `bearer_secret` on `McpServerEntry` (exactly
+            one of `command`/`url`; non-http URLs, `secret_env` on a url server and `bearer_secret`
+            on a command server are each named and skipped, and `doctor` reports them the same way);
+            the bearer resolves from the secure store all-or-nothing like `secret_env`; `nanna mcp
+            secret set` recognises a `bearer_secret` name; `nanna_mcp::AnyTransport` lets one
+            manager hold both kinds. `McpServerConfig`'s derived `Debug` printed `env` values —
+            secrets — and would have printed the token, so it is now hand-written and redacts both
+            (tested). Verified on the real debug daemon with the bearer stored through the real CLI
+            into a scratch file store: `mcp__remote__shout` (modern, bearer, SSE),
+            `mcp__remote__regional` (`x-mcp-header` → `region=eu-north-1`), `mcp__legacyhttp__echo`
+            (2025 session) and `mcp__local__shout` (stdio) all answered over IPC; the `ftp://` entry
+            was skipped by name in the log, `system.status` and `doctor`; `MCP servers closed` then
+            `Daemon stopped`.
+      - [x] *(found 2026-09-18)* **A modern HTTP server's tool list never refreshes.** Revision
+            2026-07-28 has no GET stream: change notifications (`notifications/tools/list_changed`)
+            arrive only on a `subscriptions/listen` request's SSE stream, which nanna-mcp never
+            opens — so `StreamableHttpTransport::list_changed_flags` is `None` and the cached tool
+            list is whatever `tools/list` said at connect. (Stdio still gets the notifications
+            inline.) Shape: one long-lived `subscriptions/listen` per HTTP server (it is a request
+            like any other; its response stream stays open), feeding the same `ListChangedFlags`,
+            re-opened with backoff when the stream drops; the discover result's `ttlMs` is the
+            fallback refresh interval for servers that do not support it.
+            Source: [subscriptions](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions).
+            *(2026-09-18, same night — and the gap was wider than filed.)* Nothing ever re-read a
+            server's tools after boot on **either** transport: `McpIntegration::refresh` had no
+            caller, so even a legacy stdio server's inline `list_changed` only dirtied a flag
+            nobody read, and the registry kept the boot-time tools for the daemon's lifetime. Now:
+            `ListChangedFlags` wakes a waiter (`Notify`, permit-stored so a mark is never lost); a
+            modern connect opens `subscriptions/listen` for the lists the server says can change
+            (stdio: written on the shared channel; HTTP: its own task and client, idle-reopened
+            after 5 min, reconnect backoff 1 s → 60 s, a reopened stream marks every list dirty, a
+            server without the method is left alone); `McpToolsManager::resync_server` unregisters
+            tools a server dropped and registers new ones; `watch_list_changes` runs in the
+            daemon's MCP task until shutdown, resyncs at most once a second. Live (8/8 in
+            `dual_era_live.rs`): a real SDK server that registers a tool 1.5 s after connect — over
+            stdio, and over HTTP via its `toolsChanged()` notifier — reaches a real `ToolRegistry`;
+            **negative control**: with the listen request disabled both tests fail. Real debug
+            daemon: `mcp__grow__late` registered at +1.5 s and answered over IPC
+            (`late tool answered`).
+      - [x] *(found 2026-09-18)* **Serve MRTR elicitation through `ask_user` instead of refusing it.**
+            A modern server that needs input returns `resultType: "input_required"` with
+            `inputRequests` (elicitation/sampling/roots), and the client retries the original
+            request with `inputResponses`. Today nanna-mcp turns that into an error (no capability
+            is declared, so a conforming server should not ask). Elicitation maps directly onto the
+            `ask_user` question the owner wants kept: declare `elicitation` (form mode only),
+            surface the server's message + schema as an `ask_user` question, retry with the answer,
+            bounded rounds. Sampling stays undeclared. Source:
+            [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr).
+            *(2026-09-18, same night)* Done in that shape. `nanna_mcp::Elicitor` (one method: ask a
+            question, get the reply or nothing); a client given one declares
+            `{"elicitation":{"form":{}}}` and serves `input_required` on `tools/call`: each form
+            request becomes one question naming the server (multi-field forms list their fields),
+            the free-text reply is mapped onto the requested schema (one field takes the whole
+            reply; several take `name: value` lines or JSON; values coerced to the field's type,
+            enums matched case-insensitively, anything that does not fit left for the server to
+            re-ask), and the call is retried with `inputResponses`, a new request id and the
+            server's `requestState` echoed verbatim. Bounded at 3 rounds; a round with no answer at
+            all is sent as `cancel` once, and a repeat ask ends the call saying no answer came.
+            URL-mode elicitation, sampling and roots are refused (never declared). The daemon's
+            elicitor is `ask_user` itself (`McpAskUser`): the question lands in the conversation
+            whose turn made the tool call — found through the run's task-local session — and the
+            user's next message is the answer. Verified: against the real SDK server (a `favorite`
+            tool built with the SDK's own `inputRequired`/`acceptedContent`) the question reaches a
+            scripted user and the retry returns `favorite=teal`; the same server, with no elicitor
+            declared, refuses with `-32021` exactly as the spec requires; `McpAskUser` inside a live
+            turn posts the question and returns the queued reply, outside one returns nothing; the
+            real daemon, calling the tool with no conversation, ends with the clear no-answer error
+            instead of `-32021`. **Not verified: a full chat turn where a model calls the tool and a
+            person types the answer** — there is no model on this host. While hardening the live
+            suite: its HTTP fixtures raced (1 run in 20) because the readiness probe was a TCP
+            connect, which on loopback can self-connect to a not-yet-bound ephemeral port and then
+            squat it; the fixtures now announce readiness on stderr and the suite ran 25/25 clean.
+      - [x] *(2026-09-18)* **Each MCP server's status says how it was reached.** After tonight a
+            server can land on three transports and two protocol eras, and every fallback (to the
+            2024 handshake, to HTTP+SSE) was visible only as one log line. `system.status` →
+            `mcp_servers[].link` (`2026-07-28 over stdio`, `2024-11-05 over HTTP+SSE`, …), shown on
+            the Tools page after the tool count. Verified: the real daemon reported
+            `2026-07-28 over stdio` / `2024-11-05 over stdio` / `2024-11-05 over HTTP+SSE` for the
+            SDK modern server, server-everything on stdio and on SSE; 277/277 vitest, `vue-tsc`
+            clean, `nuxt dev` served a 200 `__nuxt` shell. Not WebDriver-verified (no
+            `WebKitWebDriver` on this host).
+      - [x] *(2026-09-18)* **The live interop suite runs in CI.** `dual_era_live.rs` is `#[ignore]`
+            locally (it needs Node and an `npm ci`), so nothing ran it. New `mcp-interop.yml`
+            (path-filtered to `nanna-mcp`, the agent's MCP glue and itself): Node 22, `npm ci` from
+            the fixture's committed lockfile, `cargo test -p nanna-mcp --test dual_era_live --locked
+            -- --ignored`. The exact command passes locally (10/10); `npm ci` from the lockfile alone
+            reproduces the fixture. Runner time not yet measured — its first run sets the bound.
+      - [ ] *(research 2026-09-18; (a) done the same night)* **The official Rust SDK (`rmcp` 3.4.0, 2026-09-15) speaks
+            2026-07-28** — stateless serving by default, a `ClientLifecycleMode::Discover` that
+            skips `initialized`, and version negotiation on connect. Two uses: (a) a second,
+            independent implementation for `dual_era_live.rs` — today every modern fixture is the
+            TypeScript SDK, so a bug the two ends share cannot be seen; a tiny `rmcp` example server
+            as a dev-only fixture would close that; (b) the standing question of whether nanna-mcp
+            should be `rmcp` underneath. Not urgent now that nanna-mcp is spec-current on both
+            transports, but decide by diffing what each covers (MRTR, subscriptions, tasks,
+            x-mcp-header) rather than by LOC. Sources: [crates.io/rmcp](https://crates.io/crates/rmcp),
+            [modelcontextprotocol/rust-sdk](https://github.com/modelcontextprotocol/rust-sdk).
+            *(2026-09-18, same night)* **(a) is done.** `tests/fixtures/rmcp-server` is a standalone
+            crate (its own `[workspace]` and lockfile, `rmcp` pinned `=3.4.0`, never shipped) with
+            `add` and an MRTR `greet` that elicits a name. `dual_era_live.rs` builds it into
+            `CARGO_TARGET_TMPDIR` and drives it: `server/discover` → 2026-07-28, `tools/list`, a
+            call, and the full `input_required` → `ask_user`-style answer → retry round. It passed
+            first time — so nothing we share with the TypeScript SDK misreads the spec where rmcp
+            reads it differently, at least on these paths. Live suite 11/11; runs in `mcp-interop`.
+            (b), whether nanna-mcp should sit on `rmcp`, stays open.
+      - [x] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
+            warns on two unused imports (`adapter.rs` `RwLock`, `server.rs` `ToolContent`) — the
+            feature-gated build nobody gates. Trivial; gate the imports on their features.
+            *(same night)* Done, and the sweep over every subset found more: no-features also left
+            `McpError`/`Mutex` unused in `transport.rs`, `uuid` was a non-optional dependency used
+            only by `tools-integration`, and the live test did not build with `stdio` alone. All
+            five subsets (none, stdio, http, tools-integration, stdio+http) are now 0 warnings.
       - [x] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
             need a token, so a GitHub/Calendar server does not require exporting the token into the
             daemon's own environment (where every `exec` child also inherits it).
@@ -5081,6 +5453,8 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             `McpServerList` shows each server with a state dot and its tool count or failure reason
             on the Tools landing panel (hidden when none are configured). 6 vitest incl. the exact
             payload captured from the live daemon. Not WebDriver-verified (Linux harness blocked).
+            *(2026-09-18 — verified in the real app over WebDriver:* the Tools landing panel rendered
+            `MCP SERVERS · modern — 2 tools · 2026-07-28 over stdio` for an isolated sidecar.)
 - [ ] **Fan-out pipelines** — spawn_swarm + TaskDecomposer (crates/nanna-agent/src/multi.rs) are real but
       never constructed outside the crate. Wire the coordinator or expose a pipeline skill; deterministic
       "research N sources, digest each, merge" is a multiplier for small local models.
@@ -5164,6 +5538,12 @@ asks permission or restricts her.)*:
             the panel with 4 vitest (parser, wording, restore sends the clicked checkpoint of the
             open chat only after confirming). Placed in the header rather than the run timeline —
             the timeline is per message, and a restore is per chat. Not WebDriver-verified.
+            *(2026-09-18 — now WebDriver-verified on Linux.)* In the isolated GUI, `write_file` ran
+            twice through its sidecar under the open chat's session (14 B, then 37 B); the real
+            header's **Files** button listed `plan.md 14 B · Restore` and `plan.md new file ·
+            Restore`; **Restore** raised the in-app confirmation *"This will put plan.md back to its
+            14-byte version. Its current content is saved first, so you can undo this."*; confirming
+            put the file on disk back to `first version`.
 - [x] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
       before/after. Per-edit diffs let the user *see* what she did while they were away — observability,
       not approval.
@@ -5257,7 +5637,7 @@ asks permission or restricts her.)*:
             send hangs while chat B's turn streams 64 events into a 16-slot bus — B's answer arrives
             and A's is sent once released; **against the previous forwarder the same test loses B's
             reply** (`[]`). 5/5 reruns.
-      - [ ] *(research 2026-09-17)* **Stream the answer into Telegram, not just "typing…".** Bot API
+      - [x] *(research 2026-09-17)* **Stream the answer into Telegram, not just "typing…".** Bot API
             now has `sendMessageDraft` (private chats only; `chat_id`, non-zero `draft_id` — repeated
             calls with one id animate in place; text ≤4096; a draft is an ephemeral ~30 s preview
             that disappears when the bot sends the real message with `sendMessage`), and Bot API
@@ -5271,11 +5651,55 @@ asks permission or restricts her.)*:
             lifetime needs a refresh during long tool calls, and the update's exact payload (not
             confirmed in the docs read). Sources: [Bot API changelog](https://core.telegram.org/bots/api-changelog),
             [sendMessageDraft reference (GramIO mirror)](https://gramio.dev/telegram/methods/sendmessagedraft),
-            [aiogram sendMessageDraft](https://docs.aiogram.dev/en/latest/api/methods/send_message_draft.html). Follow-up the same day: a clear —
+            [aiogram sendMessageDraft](https://docs.aiogram.dev/en/latest/api/methods/send_message_draft.html).
+            *(research 2026-09-18 — the open payload question, answered from the changelog)* Bot API
+            10.3 (2026-08-24) names it: the Update field is **`stopped_message_generation`**, of the new
+            class **`MessageGenerationStopped`**; `can_stop`/`keep_on_stop` exist on both
+            `sendMessageDraft` and **`sendRichMessageDraft`** (Bot API 10.1, 2026-06-11, "streaming
+            AI-generated replies" with the Rich Messages formatting). The class's field table was
+            not retrievable this run — read it from the full API page before writing the parser.
+            Source: [Bot API changelog](https://core.telegram.org/bots/api-changelog).
+            *(2026-09-18) Streaming landed; the stop button did not.* `Channel::supports_drafts` /
+            `send_draft` (default: not supported); Telegram implements them with `sendMessageDraft`
+            for private chats (positive chat id), the text tail-truncated to 4096 characters behind
+            `…`. The reply forwarder keeps a per-turn draft (buffer bounded at 8192 chars, one
+            non-zero id per turn): the first words go at once, then at most one update per 1.5 s
+            (Telegram's ~1 message/s per chat, with headroom for the final `sendMessage`), an
+            unchanged draft is re-sent every 20 s so it outlives a long tool call (drafts live ~30 s),
+            "typing…" stops once a draft shows, and `message_end` drops it as the real message
+            replaces it. Groups keep "typing…". Tests: the request captured on a local HTTP double is
+            exactly `{chat_id, draft_id, text}` at `/bot<token>/sendMessageDraft`; a paused-clock
+            forwarder test pins first-words-at-once, throttling, keepalive, one id per turn, typing
+            only before the first words, and the real message last. `TelegramChannel::with_api_base`
+            (also usable for a self-hosted Bot API server) makes that possible. **Not verified with a
+            real bot** — no bot token on this host.
+      - [~] **Telegram: the stop button, and a live check of the drafts.** Bot API 10.3's `can_stop` /
+            `keep_on_stop` on `sendMessageDraft`, and the `stopped_message_generation` update routed
+            to the same arm as `/stop` (add it to `allowed_updates`; read `MessageGenerationStopped`'s
+            fields from the full API page first). Then one live round-trip with a real bot: a streamed
+            answer, a stop mid-answer.
+            *(2026-09-18, same night — the button is wired; the live check is still open.)*
+            `MessageGenerationStopped` is `{chat, message_thread_id?, draft_id}` (read from the
+            GramIO mirror of the API page). Drafts are sent with `can_stop: true, keep_on_stop:
+            true`; the listener asks for `stopped_message_generation` and turns a press into the
+            `/stop` its user would have typed — drafts exist only in private chats, where the chat
+            id is the user's id, so the synthesized sender lands on the running session and the
+            existing stop path does the rest. Allowed-chats and non-private stops are ignored. Also
+            learned: `sendMessageDraft` with empty text shows a "Thinking…" placeholder — a candidate
+            to replace "typing…" in private chats. Still open: the live round-trip.
+            *(same night)* Taken: a chat that shows drafts now gets that placeholder at the start of
+            a turn instead of "typing…" (and never "typing…" at all), kept alive through silent
+            stretches by the draft keepalive, and the first words replace it at once rather than
+            waiting out the 1.5 s throttle. Paused-clock forwarder test pins the sequence
+            (placeholder → first words → throttled rest → keepalive → the real message, no typing).
+            Unverified against a real bot, like the rest of the draft work. Follow-up the same day: a clear —
       `/new` or IPC `session.clear`, one `ControlPlane::clear_session` path — now broadcasts
       `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
       daemon instead of showing a conversation the next turn no longer sees (daemon event test,
       Tauri parse test, 2 vitest; not WebDriver-verified).
+      *(2026-09-18 — verified in the real app over WebDriver:* with the chat open, an `ask_user`
+      question posted through the sidecar appeared live; `session.clear` sent over IPC from outside
+      the GUI made the open chat reload and the question disappear.)
 - [~] **Doctor probes** — health checks report availability, not root cause. Our own history (loopback
       stream faults misread as provider 502s → restart spirals) is exactly the failure class a
       self-diagnosing always-on daemon must catch.
@@ -5330,7 +5754,7 @@ asks permission or restricts her.)*:
             - [ ] **`enabled`:** owner call. It cannot gate an explicit `nanna server`
                   command without surprising whoever typed it; delete it, or define it as
                   "the daemon starts the HTTP surface" and wire that.
-      - [ ] *(found 2026-09-11, in a real-binary smoke run)* **Two keys configure one Ollama
+      - [x] *(found 2026-09-11, in a real-binary smoke run)* **Two keys configure one Ollama
             server.** Chat and embeddings reach Ollama through `[memory].ollama_host`;
             summarization (dreaming, context compression) through `[llm].ollama_url`, which
             defaults to localhost — so pointing the first at a GPU box leaves summaries on
@@ -5339,6 +5763,50 @@ asks permission or restricts her.)*:
             cannot tell a deliberate split from an untouched one (the `[server].host` trap
             again). Meanwhile `nanna doctor` warns when both are in use and differ
             (`ollama.servers`), folding `localhost`/`127.0.0.1`/`[::1]` and the default port.
+            *(2026-09-18 — decided and done. Owner: "summarization should follow the
+            summarization model selection in settings, with fallbacks." `[llm].ollama_url` is
+            retired: every summarizer resolves each `[llm].summarization_priority` entry through
+            the chat router (one grammar, `anthropic/` and `openai/` now included; chat's
+            server, token and keys), per call, so a config change reaches a running turn. Each
+            consumer walks the list in Settings order and moves on when a model cannot be
+            reached or answers unusably; in-loop summaries cut to fit only when none answers or
+            the list is empty, and memory consolidation falls back to the chat models in order.
+            An old config carrying `ollama_url` still loads. The `ollama.servers` check and the
+            second-server probe are gone: `--online` probes the one server for chat, embedding
+            and summary models, and a new `llm.summarization` check warns on a hand-edited entry
+            the router misplaces (a bare untagged name or an unknown `vendor/` namespace sent to
+            Anthropic, a `gpt-…:tag` Ollama model sent to OpenAI). `config.set llm.ollama_url`
+            is refused by name. The CLI's router gives `[llm].api_key` only to `[llm].provider`,
+            since there that key is the chat provider's, not Anthropic's. Lost on purpose:
+            summarizing on a second Ollama server; that needs a per-spec syntax, not a global
+            key; loading warns when a leftover `ollama_url` named a server other than
+            `[memory].ollama_host`, since the first save drops the key. Review follow-ups, same
+            day: the memory consumers pass over an empty answer; tool-result compression passes
+            over one that does not score every sentence, and falls back to the whole-line cut
+            only when no listed model scores; compacting one tool result (compression plus
+            summary) and each Tier-1 pass have one deadline each (one un-streamed call's
+            transport tolerance); the Anthropic-shaped Ollama completion takes the per-server
+            generation slot, so a summary cannot cancel another session's stream; `--online`
+            expects each model on Ollama by its own router's rule. Still unbounded but for the
+            transport: the Tier 2/3 chunk walk, where one conversation can legitimately need
+            many calls.)*
+      - [ ] *(found 2026-09-18, reviewing the CLI's summarizer router)* **`[llm].api_key` means
+            two things.** The CLI (`nanna init`, the missing-key prompt, `init_components`) reads
+            it as the key of `[llm].provider` and files it in the keyring under the *Anthropic*
+            entry; the daemon's `LlmConfig::from_nanna` reads it as the Anthropic key whatever
+            `[llm].provider` says. The CLI's own router now follows the CLI's meaning
+            (`commands::cli::summarizer_credentials`), but a config written by `nanna init` for
+            OpenRouter or OpenAI and then served by the daemon still registers that key as the
+            Anthropic credential, where a `claude-*` chat or an `anthropic/` summary would send
+            it. Fix at the source: `nanna init` should write the key to the provider's own slot
+            (`openrouter_api_key`, `openai_api_key`) and keyring entry, with a one-time
+            migration of the existing ones keyed on `[llm].provider`. The same writer offers
+            OpenRouter users vendor-namespaced chat models (`anthropic/claude-sonnet-4`,
+            `openai/gpt-4o`, `google/gemini-pro`), which the daemon copies into its chat model:
+            since `anthropic/` and `openai/` became provider prefixes (2026-09-18) the first two
+            go to Anthropic and OpenAI directly — before, all three went to Anthropic unstripped
+            and failed. `nanna init` should write `openrouter/<id>`, and the migration should
+            prefix existing ones when `[llm].provider` is `openrouter`.
       - [~] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet
@@ -7230,6 +7698,19 @@ keep the phases readable; promote individual items into a phase when they become
 
 ### Linux host blockers (found 2026-09-09)
 
+- [x] *(2026-09-18)* **With no keyring backend, every secret operation failed instead of using the
+      encrypted file store it documents.** `SecureStore::{get,set,delete}` opened the keyring entry
+      with `Entry::new(..)?` *before* their fallback logic, and on a Linux session with no Secret
+      Service (a headless box, a service without a login session) `keyring` 4 fails right there
+      with `NoDefaultStore`. So `nanna mcp secret set` died with `Keyring error: No default store
+      has been set` and the daemon could read no stored credential at all — on exactly the machine
+      the `credentials.enc` fallback exists for. An entry that cannot be opened now means "no
+      keyring here" and falls to the file (keyring-only stores still fail). Verified on the real
+      CLI with `DBUS_SESSION_BUS_ADDRESS` pointed at a dead socket and a scratch `HOME`: before,
+      the error above; after, `Stored credential … in file fallback`. Same pass: the file store's
+      key file was created with the default mode and chmodded to `0600` afterwards — a window where
+      the key was readable; it is now created `0600`.
+
 - [x] *(2026-09-11 — fixed by the 2026-09-10 run, which reached master only through this
       stacked PR: `vendor/tauri-build` carries upstream tauri#15831; see the P11 Linux entry.
       Both sub-items below were settled by that run too.)*
@@ -7294,6 +7775,26 @@ keep the phases readable; promote individual items into a phase when they become
       remove the toggle — not guessed at in a nightly run. Precedence note: an `OPENAI_API_KEY`
       exported before launch now wins over a key typed into Settings in the GUI process, as it
       already did in the daemon (`load_secrets_from_store` prefers env).
+- [ ] *(found 2026-09-20, during the nightly smoke run)* **This host cannot embed at all, so no
+      unattended run can verify recall through the real binary — and the three candidates fail for
+      three different reasons.** Checked rather than assumed, from an isolated scratch daemon
+      (`HOME`/`XDG_DATA_HOME`/`NANNA_CONFIG_PATH` redirected, ports 5248/5249):
+      - **OpenAI:** no key. The daemon says so precisely and then says what it means — *"No
+        embedding provider available — memory runs WITHOUT vectors: writes persist and queue for
+        backfill, recall is unavailable"*. That message is doing its job; the gap is the host, not
+        the code.
+      - **Local Ollama:** not installed (`command -v ollama` empty, nothing on `localhost:11434`).
+      - **The remote Ollama IS reachable and has exactly one model, which cannot embed.**
+        `https://mummu.basicautomation.io/ollama/api/tags` answers 200 anonymously and lists a
+        single entry, `qwen3.8-27b-ud-q4ks` (15.4 GB, qwen35). `POST /api/embed` against it returns
+        **`{"error":"embeddings are not supported by the mummu-serve shim"}`** — a shim limitation,
+        not a model one, and worth knowing before someone adds an embedding model there and expects
+        it to serve.
+      Consequence for every future run: a memory/recall change can be verified by unit tests, by
+      the Suite 2c criterion body, and by a daemon boot — but **not** by a live recall turn, and no
+      run should imply otherwise. Cheapest fixes, in order: teach `mummu-serve` the `/api/embed`
+      route (it is Mummu's, and Mummu already ships a MiniLM-class CPU embedder — file it there),
+      or pull a small embedding model onto a local Ollama once one is installed.
 - [ ] *(found 2026-09-17)* **The AppImage does not bundle on this Arch host — two host-tool causes,
       neither in our code.** `pnpm tauri build` produced `nanna-gui` and `Nanna_0.3.21_amd64.deb`, then
       `failed to run linuxdeploy`. Run by hand: (1) linuxdeploy's bundled `strip` rejects Arch's system
@@ -7339,7 +7840,7 @@ keep the phases readable; promote individual items into a phase when they become
             or WebdriverIO's `@wdio/tauri-service`, whose docs list other Linux providers).
             Until one lands **the Linux WebDriver harness stays UNVALIDATED** and no run may claim
             GUI verification passed.
-      - [ ] *(research 2026-09-17 — option (c) above has matured into the cheapest route)*
+      - [x] *(research 2026-09-17 — option (c) above has matured into the cheapest route)*
             **`tauri-plugin-webdriver` 0.2.3 + `tauri-webdriver` 0.2.0 (both 2026-09-01, MIT; the
             plugin has ~119k downloads)** embed a W3C WebDriver server *inside the Tauri app*, so on
             Linux they drive WebKitGTK without any `WebKitWebDriver` binary — which removes the
@@ -7351,6 +7852,87 @@ keep the phases readable; promote individual items into a phase when they become
             `tauri-webdriver` instead of `tauri-driver`. Source:
             [Choochmeque/tauri-webdriver](https://github.com/Choochmeque/tauri-webdriver),
             crates.io `tauri-plugin-webdriver` / `tauri-webdriver`.
+            *(2026-09-18) **Done — the first GUI verification on this Linux host.** Feature
+            `e2e-webdriver` on `nanna-gui` (off by default, never enabled by `release.yml`, and a
+            `WARN` at startup whenever it is on) adds `tauri-plugin-webdriver`; `cargo install
+            tauri-webdriver` provides the intermediary — no `WebKitWebDriver`, no `sudo`. A GUI
+            started with defaults attaches to whatever daemon holds :5149 (on this machine, the
+            operator's own, with their data), so the GUI now honours **`NANNA_DAEMON_PORT`**
+            (≥1024) for its sidecar, alongside the existing `NANNA_DEV_DATA_DIR`. Working recipe,
+            all state in scratch: `env -u XDG_CONFIG_HOME -u XDG_DATA_HOME HOME=<s>/home
+            NANNA_CONFIG_PATH=<s>/cfg.toml NANNA_DEV_DATA_DIR=<s>/data NANNA_DAEMON_PORT=51990
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent GDK_BACKEND=x11 tauri-webdriver --port 4444`,
+            then W3C `POST /session` with `{"tauri:options":{"application":"<target>/debug/nanna-gui"}}`.
+            **`GDK_BACKEND=x11` is required here**: on native Wayland the app dies at once with
+            `Gdk Error 71 (Protocol error) dispatching to Wayland display` (NVIDIA; the operator's
+            own GUI runs with the same variable). Driven: `document.title = "Nanna"`,
+            `tauri://localhost/`, `#__nuxt` mounted, `__TAURI_INTERNALS__.invoke("get_mcp_servers")`
+            returned the isolated sidecar's `[{link:"2026-07-28 over stdio",name:"modern",…}]`, and
+            the Tools page — reached through the app's own router — rendered `MCP SERVERS · modern
+            2 tools · 2026-07-28 over stdio` with `mcp__modern__*` in the tool list; screenshots
+            taken over WebDriver. Build: `pnpm generate`, the daemon copied to
+            `gui/src-tauri/binaries/nanna-daemon-x86_64-unknown-linux-gnu`, `cargo build -p
+            nanna-gui --features e2e-webdriver` (54 s warm).
+      - [x] *(2026-09-18, first use of the harness)* **Yesterday's onboarding → Ollama probe wiring
+            (#343), verified in the real app.** Scratch config with `provider = "ollama"`, two
+            models in `model_priority`, and `[memory].ollama_host` pointed at a mock Ollama whose
+            `/api/tags` lists only one of them. `invoke("probe_ollama")` through the GUI returned
+            `reachable: true, missing: [{name: "gemma4:12b", pull: "ollama pull gemma4:12b"}]`; the
+            wizard, walked Welcome → Connect a model (provider set to Ollama) → Ready check, showed
+            *"Ollama is running at http://127.0.0.1:51980, but a configured model is not pulled yet.
+            Run this in a terminal, then recheck: `ollama pull gemma4:12b`"* with Recheck.
+            **Harness caveat learned on the way:** in the automated window `requestAnimationFrame`
+            delivers **0 frames/s** (the timeline clock runs; rendering frames do not), so every CSS
+            transition sits at t=0 — the wizard's progress bar looked stuck on step 1 while its
+            classes said step 3, and computed styles flipped to the right color the moment
+            `transition` was disabled. That is the environment, not the product: do not "fix"
+            animation state from harness screenshots; read classes / DOM state instead.
+      - [ ] **Point the shared harness at `tauri-webdriver`** (`~/.claude/scheduled-tasks/_shared/
+            tauri-webdriver.sh`, outside this repo and shared with other routines — not edited
+            unattended): its `ensure` should check `tauri-webdriver` instead of `tauri-driver` +
+            `WebKitWebDriver` on Linux, its `start` should set `GDK_BACKEND=x11` and the isolating
+            variables above, and the app must be built with `--features e2e-webdriver`.
+            *(2026-09-18)* The recipe now lives in the repo as **`gui/scripts/webdriver-smoke.sh
+            <nanna-gui> <out dir>`**: isolated HOME/config/data/daemon port, `GDK_BACKEND=x11`, a
+            session, waits for `#__nuxt` + the Tauri bridge, one `invoke` that must reach the
+            sidecar, a screenshot, and a trap that stops what it started by PID (and reports a
+            sidecar that outlived its GUI). Ran PASS on this host. The shared harness can wrap it.
+      - [x] *(found 2026-09-18, driving the GUI)* **A GUI that is killed leaves its daemon sidecar
+            running on Linux.** Ending the WebDriver session terminated `nanna-gui`, and its sidecar
+            (`nanna-daemon --port 51990 …`) stayed up, holding its port and store lock, until
+            stopped by hand. `kill_sidecar_tree` is a deliberate no-op on Unix and the graceful stop
+            path never runs when the GUI itself is killed. Shape: have the sidecar watch its parent
+            (Linux `prctl(PR_SET_PDEATHSIG)` at spawn, or the daemon exiting when stdin — the pipe
+            the shell plugin holds — reaches EOF) so an abrupt GUI death still ends it.
+            *(same night)* Fixed with an opt-in daemon flag, **`--exit-with-parent`**, which the
+            GUI now passes to its sidecar (a standalone daemon never gets it): on Unix the daemon
+            polls its parent PID once a second and, once re-parented, records `parent_exited` and
+            runs the same drain a signal does. Proven with the WebDriver harness: after the session
+            ended, the sidecar logged *"Parent process … exited (now re-parented to 1329); shutting
+            down"* → *"MCP servers closed"* → *"Daemon stopped"* within **1 s**, exit reason
+            `clean_shutdown`, no process left — where the run before it had to stop the orphan by
+            hand. Windows is unchanged (its Job Object already covers this; the flag is accepted
+            and ignored).
+      - [ ] *(found 2026-09-18, on the operator's machine)* **In the AppImage, closing the GUI
+            crashes its daemon (SIGBUS) instead of stopping it.** Seen live, not reproduced:
+            the installed `Nanna_0.3.19_amd64.AppImage` daemon dumped core **twice**, each time in
+            the same second its GUI's launch scope ended. `nanna-daemon` 342632 died at 09:05:09
+            with its 10 h 50 min GUI; 4138924 died at 09:12:34 with the GUI started at 09:08:40.
+            Both were `SIGBUS / BUS_ADRERR` with `/tmp/.mount_Nanna_*/usr/bin/nanna-daemon` as the
+            command. /tmp was at 44 %, and the AppImage file was unchanged since 22:15 the night
+            before. The mechanism fits the AppImage runtime: the sidecar executes from the
+            runtime's FUSE mount, the mount goes when the GUI process exits, and the daemon's next
+            page fault is a SIGBUS. So whenever `ExitRequested` → `backend.shutdown()` does not run
+            (the window killed by the compositor, a crash, SIGTERM), the daemon is not orphaned. It
+            crashes: no drain, no exit-reason file, MCP children and turso writes cut mid-flight.
+            `--exit-with-parent` (above) cannot help, because its 1 s poll loses to the unmount.
+            Shape: (1) when the daemon runs from an AppImage (`$APPIMAGE` / `$APPDIR` set), the
+            GUI should copy the sidecar out of the mount (e.g. `$XDG_RUNTIME_DIR/nanna/`, keyed by
+            version) and spawn the copy, so it outlives the mount and `--exit-with-parent` drains
+            it; or (2) on Linux, stop the sidecar from a `SIGTERM` handler in the GUI as well as
+            from `ExitRequested`. First, reproduce it deliberately: launch the AppImage, `kill
+            -TERM` the GUI, and read `coredumpctl`. Note also that the operator's desktop entry
+            still launches **0.3.19**, while beta.30 is published.
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
@@ -7534,6 +8116,31 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-09-20 sweep)* `cargo update` → 8 compatible bumps (`cc 1.4.7`, `find-msvc-tools 0.1.13`,
+     `generator 0.8.10`, `rand 0.10.3`, `tauri 2.11.6`, `tauri-plugin-updater 2.12.0`,
+     `unicode-id-start 1.5.0`). `cargo upgrade --incompatible` offered **nothing** — 79 non-local
+     packages already sit at their latest req, and for the first time in three sweeps neither
+     downgrade trap (`criterion 0.8 → "0.7"`, `lopdf 0.45 → "0.42"`) was reported at all, so those
+     rows are a registry artifact that comes and goes rather than a standing offer. Both pin-backs
+     were needed again and the `malachite` one arrived at a **third** version: `cargo update` pulled
+     in `malachite-bigint 0.12.0` beside the pinned 0.9.2 (0.10.0 on 2026-08-25, 0.11.0 on
+     2026-09-14), so the disambiguated spec is version-specific every run —
+     `cargo update -p malachite-bigint@<whatever-it-added> --precise 0.9.2`. Read the version out of
+     `cargo update`'s own "Adding" lines rather than assuming last run's number. `libc` walked to
+     0.2.189 as always and was pinned back to 0.2.186. Sweep order `update → upgrade → pin-backs →
+     verify` held.
+     GUI: only two real rows, both applied — `@tauri-apps/cli 2.11.4 → 2.11.5` and
+     `@tauri-apps/plugin-updater 2.11.0 → 2.12.0` (the latter in lockstep with the Rust
+     `tauri-plugin-updater 2.12.0` the same sweep produced). TypeScript 7 still blocked and the
+     cheap gate still answers it without a migration attempt: npm `typescript` latest is **still
+     7.0.2** and `vue-tsc` **still 3.3.11**, byte-identical to the state that failed on 2026-08-27.
+     Verified green: 2167 Rust tests (80 binaries, 0 failures), clippy 0 errors, 282 vitest,
+     `vue-tsc --noEmit` clean, `pnpm build` clean, and — the gate that matters for `malachite`, which
+     is release-only — `cargo build --release -p nanna-daemon` green in **8m14s**.
+   - *(2026-09-20)* **`rustpython` re-checked on crates.io: still nothing after 0.5.0 (2026-03-31)** —
+     just under six months, queried from `/api/v1/crates/rustpython-vm/versions` (next_page null,
+     0.5.0 is the newest of seven). Both holds it forces — `malachite-bigint =0.9.2` and the
+     `libc <= 0.2.186` ceiling — stay, and both are enforced by `dep_version_unification.rs`.
    - *(2026-09-13 sweep)* `cargo update` → 29 compatible bumps (`jiff 0.2.37`, `reqwest 0.13.5`,
      `tantivy 0.26.2`, `uuid 1.26.1`, `zerocopy 0.8.57`, `cc 1.4.6`, `bitflags 2.13.2`,
      `console 0.16.6`, `encoding_rs 0.8.41`, `multiversion 0.9`, `smallvec 1.16.1`, `toml 1.1.6`, …)
@@ -7563,6 +8170,20 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      Vulkan is the backend `wgpu` already picks, so a CubeCL-Vulkan Mummu would land on a path Nanna
      has bench numbers for. File the actual port in Mummu.
      Source: [tracel-ai/burn](https://github.com/tracel-ai/burn).
+   - *(2026-09-20 re-check)* `turso` is **still** `0.8.0-pre.11` — now **nine days** unchanged
+     (published 2026-09-11), still no stable 0.8.0, still no changelog past 0.7.0. The exact
+     `=0.7.2` pin holds; never a pre-release on an exact pin.
+     **And the "no dense ANN" fact is now confirmed by the vendor, not just by our source grep.**
+     Turso's own post [*Indexing sparse vectors with Turso*](https://turso.tech/blog/indexing-sparse-vectors-with-turso)
+     describes what their indexing work actually shipped: a **sparse** inverted index
+     (`toy_vector_sparse_ivf`, Weighted Jaccard, with adaptive length filtering and frequency-based
+     component selection) as of 0.3.0 — while **dense** vectors got *"SIMD acceleration, allowing
+     for faster exact search"* and **no ANN index at all**. That is exactly the split the
+     2026-07-24 note inferred from reading `index_method/`, so the roadmap's load-bearing claim is
+     now corroborated by the people who wrote the engine. Two consequences worth stating: waiting
+     for a Turso release to supply dense ANN is waiting for something nobody has announced, and
+     Turso's dense answer (SIMD exact search) is the *same* answer Nanna already runs in RAM —
+     which is consistent with Suite 2c finding SQL k-NN 9-14x slower rather than faster.
    - *(2026-09-14 re-check)* `turso` is **still** `0.8.0-pre.11` — unchanged since 2026-09-11, no new
      pre-release in three days, still no changelog past 0.7.0. The exact `=0.7.2` pin holds; nothing
      to re-evaluate until 0.8.0 goes stable. `fsrs 6.6.2`, `boa_engine 0.22.0` and `tantivy 0.26.2`
@@ -7648,6 +8269,25 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            remembered pin would have missed. Re-checked both retirement conditions: rustpython-
            {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
            GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [x] *(2026-09-20)* **Toolchain pin moved `nightly-2026-09-08` → `nightly-2026-09-20`**
+           (rustc `feaadeeac`, cargo `495c385d0`). Release-built `-p nanna-daemon` green from a
+           cold, isolated target dir in **9m06s** — no tokio ICE, no `turso_core` depth overflow —
+           and the full gate re-run under the new channel: **2173 tests, 0 failures, clippy 11
+           warnings / 0 errors**. The mirrored `toolchain:` inputs in `budget-gate.yml`,
+           `test-compile.yml` (4 sites) and `release-check.yml` moved with it.
+           **What the move actually cost, and what it was not:** the newer clippy first reported
+           **58** warnings against the old channel's 21. That looked like a regression and was not
+           — it is one newly-pedantic lint, `clippy::map_unwrap_or`, firing on
+           `map(f).unwrap_or_default()` at 22 sites across 19 files. Taking the machine-applicable
+           `map_or_default` rewrites cleared it and left **11 warnings on both channels**, i.e. the
+           cleanup also improved the old pin by 10. Two of clippy's auto-fixes were reverted by
+           hand: its suggestion for `assert!(x.is_empty())` is
+           `assert_eq!(x, [] as [std::string::String; 0])`, which reads worse than what it
+           replaces. Both rewrites were verified to compile on the **old** channel too, so the
+           style commit does not depend on the pin move landing.
+           The caveat from the previous pin still holds verbatim: the channel does not control
+           cargo's build-script output layout, so it neither caused nor fixes anything about the
+           Tauri GUI build on Linux.
      - [x] *(2026-09-09)* **Toolchain pin moved `nightly-2026-08-27` → `nightly-2026-09-08`**
            (rustc `cea272fa3`). Both candidates release-built `-p nanna-daemon` green from cold
            target dirs — `nightly-2026-08-29` in 8m37s, `nightly-2026-09-08` in 8m33s — with no
@@ -8001,9 +8641,12 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      run** and a single debug `cargo build -p nanna-tools -p nanna-daemon` took **~40 minutes**.
      Spending the run on one speculative release build would have shipped nothing else. Left for
      the next run on a quiet host.
-     - [ ] **Try `nightly-2026-09-07` (or later) on a quiet host**, gated on a green
+     - [x] **Try `nightly-2026-09-07` (or later) on a quiet host**, gated on a green
            `cargo build --release -p nanna-daemon`, and move the pin plus the mirrored `toolchain:`
            inputs in `.github/workflows/{budget-gate,release-check,test-compile}.yml` together.
+           *(2026-09-18)* Moved to **`nightly-2026-09-17`** (`923c95cdf`): cold release build
+           **7m35s** on tmpfs on a quiet host (load ~2), then clippy 0 warnings and
+           **2181 passed / 0 failed** under it. rust-toolchain.toml + all three workflows moved together.
      - [ ] **The nightly routines contend on DISK, not CPU, and it distorts every run's timings.**
            Three Rust routines were live at once on 2026-09-08 — `nanna`, `mummu`
            (`cargo test --workspace -j 6`) and `eggersmann/eas2` (`cargo build --workspace`) — all
@@ -8037,6 +8680,15 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      class as the `@formkit/drag-and-drop` removal. Typecheck 0 errors (canary proved), 251/251
      vitest, `pnpm build` green. TypeScript 7 not re-tried: npm `typescript` is still 7.0.2 and
      `vue-tsc` still 3.3.11, the two numbers the 2026-09-09 note says to check first.
+   - *(2026-09-18 sweep)* `cargo update` -> one real bump (`generator 0.8.9 -> 0.8.10`, which also
+     moves its `windows-sys`/`itertools`/`libloading` edges forward); `cargo upgrade --incompatible`
+     offered **no rows at all** this time - the `criterion`/`lopdf` downgrade traps did not appear.
+     Both guarded pins fired as usual and went back last (`libc 0.2.189 -> 0.2.186`,
+     `malachite-bigint@0.11.0 -> 0.9.2`). GUI: `pnpm outdated` lists only `typescript 7.0.2`
+     (still blocked, see above). **Master itself was red on arrival**: `cargo test --workspace` did
+     not compile `nanna-daemon`'s lib tests (a probe_ollama test named an un-imported `Action`,
+     from #343), and clippy was back to 14 warnings after #340 had reached zero - fixed first, in
+     its own commit.
    - *(research 2026-09-17)* **Correction to the 2026-09-14 note below: `burn 0.22.0` is NOT a shipped
      release.** crates.io on 2026-09-17: `max_stable_version` **0.21.0**, newest `0.22.0-pre.3`
      (2026-08-25); `cubecl` likewise `0.10.0` stable / `0.11.0-pre.3`. The LibTorch deprecation is on
@@ -8428,9 +9080,36 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  Stated tradeoffs in the issue: dependency count 153 → 276, Turso is WAL-only
                  (`PRAGMA wal_checkpoint(TRUNCATE)` folds the WAL for shipping), and no
                  URI/immutable read-only mode.
+                 *(re-checked 2026-09-20 — **it has moved from "In Progress" to reviewable code**,
+                 which is the first time this watch has had something concrete to point at.)*
+                 #1608 is still open, but its timeline now carries the work rather than the intent,
+                 all by the same assignee (**jwric**), all verified through the GitHub API rather
+                 than a search snippet:
+                 - **[cubecl#1643 "Refactor/async turso storage"](https://github.com/tracel-ai/cubecl/pull/1643)
+                   — OPEN**, created 2026-09-14, last updated **2026-09-18**. Switches the SQLite
+                   backend from `rusqlite` to `turso` and unifies the store API across web and
+                   native. Note precisely what it does and does not claim: the description says the
+                   *backend* changes, **not** that `rusqlite` leaves `cubecl-environment`'s manifest.
+                   Nanna's guard fails on the **lockfile**, so "the backend now uses turso" is not
+                   yet the same as "the dependency is gone" — re-check the resolved lockfile, not
+                   the PR title, before declaring this unblocked.
+                 - **[cubecl#1645 "refactor(bundle): drop the SQLite bundle format"](https://github.com/tracel-ai/cubecl/pull/1645)
+                   — closed**, removing `BundleFormat`/`SqliteBundle` and with them the journal-mode
+                   and attach complexity the WAL-only tradeoff created.
+                 - **The precedent landed**: [burn#5546](https://github.com/tracel-ai/burn/pull/5546),
+                   **merged 2026-09-09**, replaced `rusqlite` + `r2d2_sqlite` + `serde_rusqlite`
+                   with Turso in `burn-dataset` and took its dependency count **153 → 44**. That is
+                   the "a similar migration was completed in the burn project" line in #1608, now
+                   with a number attached.
+                 - The root issue is **[cubecl#1488](https://github.com/tracel-ai/cubecl/issues/1488)**:
+                   `cubecl-environment`'s unconditional SQLite cache forces `libsqlite3-sys` on
+                   every consumer. Worth having the issue number too — #1608 is the remedy, #1488 is
+                   the defect, and a future run may find one closed without the other.
                  **So: watch #1608 before spending the owner's decision on the two options below.**
                  Re-check it at the top of each run — this is now the cheapest thing standing
-                 between P12 and its first real consumer.
+                 between P12 and its first real consumer. The concrete check is one command once
+                 #1643 merges: add `mummu` and see whether `no_banned_database_crates_in_lockfile`
+                 still fails.
            - [ ] ~~Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
                  clear.~~ **Superseded by #1608 above** — removing the C engine beats gating it.
            - [ ] Narrow `dep_guard`'s ban to Nanna's *own* storage path, explicitly permitting a

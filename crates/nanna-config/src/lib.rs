@@ -15,6 +15,9 @@ pub mod bind;
 /// MCP servers started at boot (`[mcp]`).
 pub mod mcp;
 pub use mcp::{MCP_SERVERS_MAX, McpConfig, McpServerEntry, mcp_secret_key};
+/// Which Ollama server an address names — what the bearer token is bound to.
+pub mod ollama;
+pub use ollama::{normalize_ollama_host, ollama_server_changed, same_ollama_server};
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
@@ -57,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -185,12 +188,22 @@ pub struct LlmConfig {
     pub anthropic_oauth_token: Option<String>,
     /// Whether to use OAuth token instead of API key for Anthropic
     pub anthropic_use_oauth: bool,
-    /// Model priority list for summarization (first working model is used)
-    /// Format: `["ollama/llama3.2", "ollama/mistral", "claude-haiku"]`
+    /// Model priority list for summarization, tried in order: the next model
+    /// answers when one cannot. Each entry is routed like a chat model, with
+    /// chat's credentials — `ollama/<model>` goes to `[memory].ollama_host`
+    /// with its bound token.
+    /// Format: `["ollama/llama3.2", "openrouter/<vendor>/<model>", "anthropic/claude-haiku-4-5"]`
     /// If empty, truncates instead of summarizing
     pub summarization_priority: Vec<String>,
-    /// Ollama server URL for summarization (if using ollama model)
-    pub ollama_url: Option<String>,
+    // NOTE: `ollama_url` was retired 2026-09-18 (owner decision: "summarization
+    // should follow the summarization model selection in settings, with
+    // fallbacks"). It was the summarizers' own Ollama address — localhost by
+    // default, with no token — so summaries went to a different server than
+    // chat whenever chat moved. Summaries now reach Ollama through chat's
+    // router. Existing config.toml files still carrying it load unchanged:
+    // nothing here uses `#[serde(deny_unknown_fields)]`, so serde ignores the
+    // stale key and the next save drops it. Covered by
+    // `legacy_llm_ollama_url_key_still_loads`.
     /// Ollama API key (optional — for remote/authenticated Ollama instances)
     pub ollama_api_key: Option<String>,
     /// Model routing priority for cost optimization.
@@ -289,7 +302,6 @@ impl Default for LlmConfig {
             anthropic_oauth_token: None,
             anthropic_use_oauth: false,
             summarization_priority: vec![], // Empty = truncate instead of summarize
-            ollama_url: Some("http://localhost:11434".to_string()),
             ollama_api_key: None,
             model_routing: vec![], // Empty = disabled (always use primary model)
             routing_first_turn_primary: true,
@@ -690,6 +702,55 @@ impl Default for MemoryConfig {
     }
 }
 
+/// Whose a stored Ollama token with no recorded server is — one saved by a
+/// build that recorded none.
+#[derive(Debug, Clone, Copy)]
+enum UnboundOllamaToken<'a> {
+    /// The configured server's: a process's first load, where it goes where
+    /// the older build sent it.
+    Configured,
+    /// The server a running configuration was sending it to, which the one
+    /// being loaded replaces. Without this a reload after the address was
+    /// edited would read the token as the edited address's.
+    RunningServer(&'a str),
+}
+
+/// The process environment, as the hydration seams take it.
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// What to tell someone whose `config.toml` still carries the retired
+/// `[llm].ollama_url` pointed at another server than `config` uses; `None`
+/// when it is absent or names the same server.
+///
+/// Read from the raw text because serde drops the key on the way in, and the
+/// next save drops it from disk — so this load is the last moment anything
+/// can see that summaries used to go somewhere else. The shipped default
+/// (this machine, like `[memory].ollama_host`'s) moves nothing and says
+/// nothing.
+fn retired_ollama_url_notice(content: &str, config: &Config) -> Option<String> {
+    let raw: toml::Table = content.parse().ok()?;
+    let retired = raw.get("llm")?.get("ollama_url")?.as_str()?.trim();
+    let host = config.memory.ollama_host.trim();
+    if retired.is_empty() || same_ollama_server(retired, host) {
+        return None;
+    }
+    // Redacted as every other Ollama address in the log is: a URL can carry a
+    // password in its user info or a token in its query.
+    let (retired, host) = (
+        ollama::redacted_ollama_host(retired),
+        ollama::redacted_ollama_host(host),
+    );
+    Some(format!(
+        "config.toml still sets [llm].ollama_url = \"{retired}\", which is no longer read: \
+         summaries now reach Ollama through chat's server, [memory].ollama_host = \"{host}\". \
+         If your summarization models are on {retired}, set it as the Ollama server in \
+         Settings -> Models (it is then chat's and the embedders' server too); otherwise \
+         delete the key."
+    ))
+}
+
 impl Config {
     /// Load config from default location.
     ///
@@ -717,6 +778,9 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&content)?;
         info!("Loaded config from {path:?}");
+        if let Some(notice) = retired_ollama_url_notice(&content, &config) {
+            warn!("{notice}");
+        }
         config.load_secrets_from_store();
         Ok(config)
     }
@@ -776,8 +840,15 @@ impl Config {
     /// secret and those already stored are gone from this `Config`; later ones
     /// are left in place.
     pub fn migrate_secrets_to_keyring(&mut self) -> Result<(), crate::credentials::CredentialError> {
-        use crate::credentials::{keys, SecureStore};
-        let store = SecureStore::new();
+        self.migrate_secrets_to(&crate::credentials::SecureStore::new())
+    }
+
+    /// [`Self::migrate_secrets_to_keyring`] into a given store.
+    fn migrate_secrets_to(
+        &mut self,
+        store: &crate::credentials::SecureStore,
+    ) -> Result<(), crate::credentials::CredentialError> {
+        use crate::credentials::keys;
         let put = |key: &str, val: &mut Option<String>| -> Result<(), crate::credentials::CredentialError> {
             if let Some(v) = val.take() {
                 let trimmed = v.trim();
@@ -799,10 +870,17 @@ impl Config {
                 store.set(keys::ANTHROPIC_OAUTH_TOKEN, trimmed)?;
             }
         }
+        // The Ollama token held here is the configured server's (see
+        // `hydrate_ollama_token`), and is stored bound to it: written bare, it
+        // would be filed under whichever server the store last recorded. The
+        // stored token itself (loaded from there) is left as it is filed —
+        // re-saving it would re-file it under this copy's address, which in a
+        // long-lived process need not be the server it was loaded for.
         if let Some(v) = self.llm.ollama_api_key.take() {
             let trimmed = v.trim();
-            if !trimmed.is_empty() {
-                store.set(keys::OLLAMA_API_KEY, trimmed)?;
+            let already_stored = store.ollama_token().as_deref() == Some(trimmed);
+            if !trimmed.is_empty() && !already_stored {
+                store.save_ollama_token(trimmed, &self.memory.ollama_host)?;
             }
         }
         Ok(())
@@ -811,13 +889,34 @@ impl Config {
     /// Hydrate secret fields from `SecureStore` + environment if they are unset.
     /// Safe to call repeatedly; never overwrites a value already present.
     pub fn load_secrets_from_store(&mut self) {
-        use crate::credentials::{keys, SecureStore};
-        let store = SecureStore::new();
-        let fill = |slot: &mut Option<String>, key: &str, env: &str| {
+        self.load_secrets_from(&crate::credentials::SecureStore::new(), process_env);
+    }
+
+    /// [`Self::load_secrets_from_store`] against a given store and environment,
+    /// so the hydration rules are testable without the OS keyring or the
+    /// process environment.
+    fn load_secrets_from(
+        &mut self,
+        store: &crate::credentials::SecureStore,
+        env: impl Fn(&str) -> Option<String>,
+    ) {
+        self.load_secrets_with(store, &env, UnboundOllamaToken::Configured);
+    }
+
+    /// Fill every unset secret from `env`, then `store`; `unbound` says whose
+    /// a stored Ollama token with no recorded server is.
+    fn load_secrets_with(
+        &mut self,
+        store: &crate::credentials::SecureStore,
+        env: &impl Fn(&str) -> Option<String>,
+        unbound: UnboundOllamaToken<'_>,
+    ) {
+        use crate::credentials::keys;
+        let fill = |slot: &mut Option<String>, key: &str, env_name: &str| {
             if slot.as_ref().is_some_and(|s| !s.trim().is_empty()) {
                 return;
             }
-            if let Ok(v) = std::env::var(env)
+            if let Some(v) = env(env_name)
                 && !v.trim().is_empty() {
                     *slot = Some(v);
                     return;
@@ -832,8 +931,167 @@ impl Config {
         fill(&mut self.llm.openrouter_api_key, keys::OPENROUTER_API_KEY, "OPENROUTER_API_KEY");
         fill(&mut self.llm.github_token, keys::GITHUB_TOKEN, "GITHUB_TOKEN");
         fill(&mut self.tools.brave_api_key, keys::BRAVE_API_KEY, "BRAVE_API_KEY");
-        fill(&mut self.llm.ollama_api_key, keys::OLLAMA_API_KEY, "OLLAMA_API_KEY");
         fill(&mut self.llm.anthropic_oauth_token, keys::ANTHROPIC_OAUTH_TOKEN, "ANTHROPIC_OAUTH_TOKEN");
+        self.hydrate_ollama_token(store, env, unbound);
+    }
+
+    /// Fill `llm.ollama_api_key` for the configured Ollama server.
+    ///
+    /// Unlike the other secrets, the stored token is bound to a server — the
+    /// one it was saved for ([`keys::OLLAMA_API_KEY_HOST`](crate::credentials::keys::OLLAMA_API_KEY_HOST)).
+    /// Loaded for any other `[memory].ollama_host` it would be handed to
+    /// whatever address the config names next: a new Server URL, or a hand
+    /// edit of `config.toml` (which the daemon applies live, and which the
+    /// agent can make). A token saved with no server recorded (an older
+    /// build) is `unbound`'s. A record that cannot be read binds the token to
+    /// no server: it is not sent until the store answers.
+    ///
+    /// Not bound: `OLLAMA_API_KEY` from the environment, and a token already
+    /// present (written into `config.toml` itself). Both are the operator
+    /// naming a token for this configuration outright.
+    fn hydrate_ollama_token(
+        &mut self,
+        store: &crate::credentials::SecureStore,
+        env: &impl Fn(&str) -> Option<String>,
+        unbound: UnboundOllamaToken<'_>,
+    ) {
+        if self.llm.ollama_api_key.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+            return;
+        }
+        if let Some(token) = env("OLLAMA_API_KEY")
+            && !token.trim().is_empty()
+        {
+            self.llm.ollama_api_key = Some(token);
+            return;
+        }
+        let Some(token) = store.ollama_token() else {
+            return;
+        };
+        let bound = match (store.ollama_token_host(), unbound) {
+            (Ok(Some(bound)), _) => bound,
+            (Ok(None), UnboundOllamaToken::Configured) => {
+                self.llm.ollama_api_key = Some(token);
+                return;
+            }
+            (Ok(None), UnboundOllamaToken::RunningServer(running)) => {
+                // Recorded, so that later loads (a restart, the GUI) agree it
+                // is that server's. Attributed here whether or not the write
+                // lands: a store that refuses it must not free the token.
+                if let Err(e) = store.bind_unbound_ollama_token(running) {
+                    tracing::warn!(
+                        "Could not record {} as the server the saved Ollama token belongs to ({e})",
+                        ollama::redacted_ollama_host(running)
+                    );
+                }
+                normalize_ollama_host(running)
+            }
+            (Err(e), _) => {
+                tracing::warn!(
+                    "Cannot read which server the saved Ollama token belongs to ({e}); \
+                     it is not sent until that can be read"
+                );
+                return;
+            }
+        };
+        if !same_ollama_server(&bound, &self.memory.ollama_host) {
+            ollama::report_withheld_token(&bound, &self.memory.ollama_host);
+            return;
+        }
+        self.llm.ollama_api_key = Some(token);
+    }
+
+    /// Re-derive `llm.ollama_api_key` when `[memory].ollama_host` was changed
+    /// in memory (not through a load) away from `previous_host`: the token
+    /// held was loaded for that server, and is dropped unless it is also this
+    /// one's. A stored token with no recorded server was `previous_host`'s,
+    /// and is recorded as such. The same server keeps what it holds, and the
+    /// store is not read.
+    pub fn rebind_ollama_token_if_moved(
+        &mut self,
+        previous_host: &str,
+        store: &crate::credentials::SecureStore,
+    ) {
+        self.rebind_ollama_token_if_moved_with(previous_host, store, process_env);
+    }
+
+    /// [`Self::rebind_ollama_token_if_moved`] against a given store and
+    /// environment.
+    fn rebind_ollama_token_if_moved_with(
+        &mut self,
+        previous_host: &str,
+        store: &crate::credentials::SecureStore,
+        env: impl Fn(&str) -> Option<String>,
+    ) {
+        if !ollama_server_changed(previous_host, &self.memory.ollama_host) {
+            return;
+        }
+        self.llm.ollama_api_key = None;
+        self.hydrate_ollama_token(
+            store,
+            &env,
+            UnboundOllamaToken::RunningServer(previous_host),
+        );
+    }
+
+    /// Load config from the default location to replace a configuration that
+    /// is running with Ollama server `running_ollama_host`: a reload.
+    ///
+    /// [`Self::load`] reads a stored Ollama token with no recorded server (an
+    /// older build's) as the configured server's — right for a process's
+    /// first load, wrong for a reload after the address was edited, which
+    /// would hand the running server's token to the edited address. Here that
+    /// token stays the running server's and is recorded as such.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`].
+    pub fn load_replacing(
+        running_ollama_host: &str,
+        store: &crate::credentials::SecureStore,
+    ) -> Result<Self, ConfigError> {
+        let path = Self::default_config_path()?;
+        if path.exists() {
+            Self::load_from_replacing(&path, running_ollama_host, store)
+        } else {
+            let mut cfg = Self::default();
+            cfg.load_secrets_with(
+                store,
+                &process_env,
+                UnboundOllamaToken::RunningServer(running_ollama_host),
+            );
+            Ok(cfg)
+        }
+    }
+
+    /// [`Self::load_replacing`] from a specific path.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_from`].
+    pub fn load_from_replacing(
+        path: &Path,
+        running_ollama_host: &str,
+        store: &crate::credentials::SecureStore,
+    ) -> Result<Self, ConfigError> {
+        Self::load_from_replacing_with(path, running_ollama_host, store, process_env)
+    }
+
+    /// [`Self::load_from_replacing`] against a given environment.
+    fn load_from_replacing_with(
+        path: &Path,
+        running_ollama_host: &str,
+        store: &crate::credentials::SecureStore,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path)?;
+        let mut config: Self = toml::from_str(&content)?;
+        info!("Loaded config from {path:?}");
+        config.load_secrets_with(
+            store,
+            &env,
+            UnboundOllamaToken::RunningServer(running_ollama_host),
+        );
+        Ok(config)
     }
 
     /// Environment variable that redirects config resolution to an explicit file.
@@ -1378,6 +1636,91 @@ webhook_secret = "s3cret"
         assert!(!server.contains("host"), "no host key is written: {server}");
     }
 
+    #[test]
+    fn legacy_llm_ollama_url_key_still_loads() {
+        // `[llm].ollama_url` was retired 2026-09-18 (owner decision: summaries
+        // follow the Settings list through chat's providers). It was the
+        // summarizers' own Ollama address — localhost by default, no token —
+        // so every config ever saved carries it, and a config that refuses to
+        // parse is a dead app. The stale key must be ignored, and the keys
+        // beside it must still land.
+        let legacy = r#"
+[llm]
+summarization_priority = ["ollama/qwen3:4b"]
+ollama_url = "http://localhost:11434"
+model = "qwen3.5:9b"
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        assert_eq!(config.llm.summarization_priority, vec!["ollama/qwen3:4b"]);
+        assert_eq!(config.llm.model, "qwen3.5:9b", "the keys beside it still land");
+
+        // And it is gone for good: a saved config no longer carries a key
+        // that looks like it points the summarizer somewhere.
+        let written = toml::to_string(&config).expect("config serializes");
+        assert!(!written.contains("ollama_url"), "no ollama_url is written: {written}");
+    }
+
+    /// A leftover `[llm].ollama_url` that named another server than chat's is
+    /// the one case where the retirement moves summaries somewhere new, and
+    /// serde drops the key before anything else could see it. Loading says
+    /// so, naming both servers and what to do.
+    #[test]
+    fn a_leftover_ollama_url_naming_another_server_is_announced() {
+        let legacy = r#"
+[llm]
+ollama_url = "http://gpu-box:11434"
+
+[memory]
+ollama_host = "http://localhost:11434"
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        let notice =
+            retired_ollama_url_notice(legacy, &config).expect("a moved summarizer is announced");
+        assert!(
+            notice.contains("http://gpu-box:11434") && notice.contains("http://localhost:11434"),
+            "names both servers: {notice}"
+        );
+        assert!(notice.contains("Settings"), "says where to set it: {notice}");
+    }
+
+    /// The notice goes to the log, so a password or token in either address
+    /// must not.
+    #[test]
+    fn a_leftover_ollama_url_notice_carries_no_credentials() {
+        let legacy = r#"
+[llm]
+ollama_url = "https://user:hunter2@gpu-box/ollama?token=abc"
+
+[memory]
+ollama_host = "https://me:pw@remote.example/ollama"
+"#;
+        let config: Config = toml::from_str(legacy).expect("parses");
+        let notice = retired_ollama_url_notice(legacy, &config).expect("announced");
+        for secret in ["hunter2", "user:", "token=abc", "me:pw"] {
+            assert!(!notice.contains(secret), "{secret} leaked: {notice}");
+        }
+        assert!(notice.contains("gpu-box") && notice.contains("remote.example"), "{notice}");
+    }
+
+    /// The same server, however it is spelled, moves nothing — the shipped
+    /// default case — and neither does a config without the key.
+    #[test]
+    fn a_leftover_ollama_url_naming_the_same_server_is_quiet() {
+        let same = r#"
+[llm]
+ollama_url = "http://127.0.0.1:11434/"
+
+[memory]
+ollama_host = "http://localhost:11434"
+"#;
+        let config: Config = toml::from_str(same).expect("parses");
+        assert_eq!(retired_ollama_url_notice(same, &config), None);
+
+        let without = "[memory]\nollama_host = \"http://gpu-box:11434\"\n";
+        let config: Config = toml::from_str(without).expect("parses");
+        assert_eq!(retired_ollama_url_notice(without, &config), None);
+    }
+
     // -----------------------------------------------------------------
     // Data storage location (`[general] data_dir`)
     // -----------------------------------------------------------------
@@ -1787,5 +2130,317 @@ mod prompt_cache_ttl_tests {
         );
         assert!(message.contains("5m"), "and the accepted ones: {message}");
         assert!(message.contains("1h"), "and the accepted ones: {message}");
+    }
+}
+
+#[cfg(test)]
+mod ollama_token_binding_tests {
+    use super::Config;
+    use crate::credentials::{SecureStore, keys};
+
+    /// A hermetic store: its own directory, never the OS keyring.
+    fn store() -> (tempfile::TempDir, SecureStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecureStore::file_only_at(dir.path().to_path_buf());
+        (dir, store)
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    /// The server the store records for its token; the test store always answers.
+    fn recorded_server(store: &SecureStore) -> Option<String> {
+        store.ollama_token_host().expect("a file store answers")
+    }
+
+    fn configured_for(host: &str) -> Config {
+        let mut config = Config::default();
+        config.memory.ollama_host = host.to_string();
+        config
+    }
+
+    #[test]
+    fn a_token_saved_for_another_server_is_not_loaded() {
+        let (_dir, store) = store();
+        store.set(keys::OLLAMA_API_KEY, "token-for-a").expect("set");
+        store
+            .set(keys::OLLAMA_API_KEY_HOST, "https://a.example/ollama")
+            .expect("set");
+
+        let mut config = configured_for("https://b.example/ollama");
+        config.load_secrets_from(&store, no_env);
+        assert_eq!(
+            config.llm.ollama_api_key, None,
+            "server B must never be handed server A's token"
+        );
+
+        // The server it was saved for, however it is spelled, still gets it.
+        let mut config = configured_for("https://A.example:443/ollama/");
+        config.load_secrets_from(&store, no_env);
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("token-for-a"));
+    }
+
+    #[test]
+    fn a_legacy_token_with_no_recorded_server_still_loads() {
+        // Saved by a build that recorded no server: it was being sent to the
+        // configured one, and keeps being sent there.
+        let (_dir, store) = store();
+        store.set(keys::OLLAMA_API_KEY, "legacy-token").expect("set");
+
+        let mut config = configured_for("https://b.example/ollama");
+        config.load_secrets_from(&store, no_env);
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("legacy-token"));
+    }
+
+    #[test]
+    fn the_environment_token_is_not_bound_to_a_server() {
+        // `OLLAMA_API_KEY` is the operator saying "use this", wherever the
+        // config points; a stored token bound elsewhere does not veto it.
+        let (_dir, store) = store();
+        store.set(keys::OLLAMA_API_KEY, "token-for-a").expect("set");
+        store
+            .set(keys::OLLAMA_API_KEY_HOST, "https://a.example/ollama")
+            .expect("set");
+
+        let mut config = configured_for("https://b.example/ollama");
+        config.load_secrets_from(&store, |name| {
+            (name == "OLLAMA_API_KEY").then(|| "env-token".to_string())
+        });
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn a_saved_token_records_its_server_and_a_blank_one_removes_both() {
+        let (_dir, store) = store();
+        store
+            .save_ollama_token("  s3cret ", " https://a.example/ollama/ ")
+            .expect("save");
+        assert_eq!(store.ollama_token().as_deref(), Some("s3cret"));
+        assert_eq!(
+            recorded_server(&store).as_deref(),
+            Some("https://a.example/ollama")
+        );
+
+        // Whitespace is no token: it clears, it does not keep the old one.
+        store.save_ollama_token("   ", "https://a.example/ollama").expect("clear");
+        assert_eq!(store.ollama_token(), None);
+        assert_eq!(recorded_server(&store), None);
+        assert!(!store.exists(keys::OLLAMA_API_KEY));
+        assert!(!store.exists(keys::OLLAMA_API_KEY_HOST));
+    }
+
+    #[test]
+    fn switching_servers_does_not_take_an_unbound_token_along() {
+        // A legacy token, loaded for server A as its own.
+        let (_dir, store) = store();
+        store.set(keys::OLLAMA_API_KEY, "legacy-token").expect("set");
+        let mut config = configured_for("https://a.example/ollama");
+        config.load_secrets_from(&store, no_env);
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("legacy-token"));
+
+        // Settings binds it to A before the address changes to B.
+        assert!(store.bind_unbound_ollama_token(&config.memory.ollama_host).expect("bind"));
+        assert!(
+            !store.bind_unbound_ollama_token("https://b.example").expect("bind"),
+            "a bound token is never rebound"
+        );
+        config.memory.ollama_host = "https://b.example/ollama".to_string();
+        config.rebind_ollama_token_if_moved_with("https://a.example/ollama", &store, no_env);
+        assert_eq!(config.llm.ollama_api_key, None, "B must not get A's token");
+
+        // A fresh load (the daemon's) agrees; and A still gets it.
+        let mut reloaded = configured_for("https://b.example/ollama");
+        reloaded.load_secrets_from(&store, no_env);
+        assert_eq!(reloaded.llm.ollama_api_key, None);
+        config.memory.ollama_host = "https://a.example/ollama".to_string();
+        config.rebind_ollama_token_if_moved_with("https://b.example/ollama", &store, no_env);
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("legacy-token"));
+    }
+
+    #[test]
+    fn an_in_memory_address_change_drops_the_old_servers_token() {
+        // The daemon's `config.set memory.ollama_host`: the running config
+        // holds A's token and is edited in place to point at B.
+        let (_dir, store) = store();
+        store
+            .save_ollama_token("token-for-a", "https://a.example/ollama")
+            .expect("save");
+        let mut config = configured_for("https://a.example/ollama");
+        config.load_secrets_from(&store, no_env);
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("token-for-a"));
+
+        // Re-spelling the same server is not a move: the token stays.
+        config.memory.ollama_host = "https://A.example:443/ollama/".to_string();
+        config.rebind_ollama_token_if_moved_with("https://a.example/ollama", &store, no_env);
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("token-for-a"));
+
+        config.memory.ollama_host = "https://b.example/ollama".to_string();
+        config.rebind_ollama_token_if_moved_with("https://a.example/ollama", &store, no_env);
+        assert_eq!(config.llm.ollama_api_key, None);
+    }
+
+    #[test]
+    fn a_legacy_token_does_not_follow_an_in_memory_move() {
+        // The daemon's `config.set memory.ollama_host` with a token saved by
+        // an older build: nothing has recorded yet that it was A's, and no
+        // Settings page bound it first.
+        let (_dir, store) = store();
+        store
+            .set(keys::OLLAMA_API_KEY, "legacy-token")
+            .expect("set");
+        let mut config = configured_for("https://a.example/ollama");
+        config.load_secrets_from(&store, no_env);
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("legacy-token"));
+
+        config.memory.ollama_host = "https://b.example/ollama".to_string();
+        config.rebind_ollama_token_if_moved_with("https://a.example/ollama", &store, no_env);
+        assert_eq!(
+            config.llm.ollama_api_key, None,
+            "B must not get the token that was going to A"
+        );
+        assert_eq!(
+            recorded_server(&store).as_deref(),
+            Some("https://a.example/ollama")
+        );
+
+        // It is A's from now on: a restart configured for B agrees, and
+        // moving back to A gets it again.
+        let mut restarted = configured_for("https://b.example/ollama");
+        restarted.load_secrets_from(&store, no_env);
+        assert_eq!(restarted.llm.ollama_api_key, None);
+        config.memory.ollama_host = "https://a.example/ollama".to_string();
+        config.rebind_ollama_token_if_moved_with("https://b.example/ollama", &store, no_env);
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("legacy-token"));
+    }
+
+    #[test]
+    fn a_reload_does_not_hand_a_legacy_token_to_the_edited_address() {
+        // A hand edit of `config.toml` (config_watch) or `config.reload`: the
+        // file now names B while the running config was sending a token
+        // saved by an older build to A.
+        let (dir, store) = store();
+        store
+            .set(keys::OLLAMA_API_KEY, "legacy-token")
+            .expect("set");
+        let path = dir.path().join("config.toml");
+        configured_for("https://b.example/ollama")
+            .save_to(&path)
+            .expect("save");
+
+        let loaded =
+            Config::load_from_replacing_with(&path, "https://a.example/ollama", &store, no_env)
+                .expect("load");
+        assert_eq!(
+            loaded.llm.ollama_api_key, None,
+            "the edited address must not get the running server's token"
+        );
+
+        // The running server, however the file spells it, keeps it.
+        configured_for("https://A.example:443/ollama/")
+            .save_to(&path)
+            .expect("save");
+        let loaded =
+            Config::load_from_replacing_with(&path, "https://a.example/ollama", &store, no_env)
+                .expect("load");
+        assert_eq!(loaded.llm.ollama_api_key.as_deref(), Some("legacy-token"));
+    }
+
+    #[test]
+    fn an_unrelated_write_moves_no_token() {
+        // An address that names no server matches none — but a config write
+        // that leaves it as it is must not count as a move, or it would file
+        // a legacy token under that non-address for good.
+        let (_dir, store) = store();
+        store
+            .set(keys::OLLAMA_API_KEY, "legacy-token")
+            .expect("set");
+        let mut config = configured_for("");
+        config.load_secrets_from(&store, no_env);
+        config.rebind_ollama_token_if_moved_with("", &store, no_env);
+        assert_eq!(config.llm.ollama_api_key.as_deref(), Some("legacy-token"));
+        assert_eq!(recorded_server(&store), None, "nothing recorded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_token_stays_home_when_its_server_cannot_be_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = store();
+        store
+            .set(keys::OLLAMA_API_KEY, "legacy-token")
+            .expect("set");
+        let mut config = configured_for("https://a.example/ollama");
+        config.load_secrets_from(&store, no_env);
+
+        // A store that reads but refuses writes.
+        let read_only = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(dir.path(), read_only).expect("chmod");
+        let writable = store.set("probe", "x").is_ok();
+        config.memory.ollama_host = "https://b.example/ollama".to_string();
+        config.rebind_ollama_token_if_moved_with("https://a.example/ollama", &store, no_env);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod back");
+        if writable {
+            // Permissions are not enforced for this user (root): nothing to show.
+            return;
+        }
+        assert_eq!(recorded_server(&store), None, "the write was refused");
+        assert_eq!(
+            config.llm.ollama_api_key, None,
+            "unrecorded, the token is still A's and not B's"
+        );
+    }
+
+    #[test]
+    fn migrating_leaves_the_stored_token_filed_where_it_is() {
+        // The copy held is the stored token itself, loaded from there. An API
+        // key save elsewhere in Settings migrates every secret; it must not
+        // re-file this one under the copy's address, which in a long-lived
+        // GUI can be stale after a hand edit the daemon has applied.
+        let (_dir, store) = store();
+        store
+            .set(keys::OLLAMA_API_KEY, "legacy-token")
+            .expect("set");
+        let mut config = configured_for("https://stale.example/ollama");
+        config.llm.ollama_api_key = Some("legacy-token".to_string());
+        config.migrate_secrets_to(&store).expect("migrate");
+        assert_eq!(store.ollama_token().as_deref(), Some("legacy-token"));
+        assert_eq!(
+            recorded_server(&store),
+            None,
+            "not filed under the copy's address"
+        );
+    }
+
+    #[test]
+    fn a_token_recorded_for_a_blank_address_goes_nowhere() {
+        let (_dir, store) = store();
+        store.set(keys::OLLAMA_API_KEY, "token").expect("set");
+        store.set(keys::OLLAMA_API_KEY_HOST, "").expect("set");
+        let mut config = configured_for("http://localhost:11434");
+        config.load_secrets_from(&store, no_env);
+        assert_eq!(config.llm.ollama_api_key, None);
+    }
+
+    #[test]
+    fn migrating_secrets_files_the_token_under_the_configured_server() {
+        // The store holds another server's token; the one in memory is this
+        // server's (typed in, or from the environment) and must not inherit
+        // the other's record.
+        let (_dir, store) = store();
+        store
+            .save_ollama_token("token-for-a", "https://a.example/ollama")
+            .expect("save");
+        let mut config = configured_for("https://b.example/ollama");
+        config.llm.ollama_api_key = Some(" token-for-b ".to_string());
+        config.migrate_secrets_to(&store).expect("migrate");
+
+        assert_eq!(config.llm.ollama_api_key, None, "blanked once stored");
+        assert_eq!(store.ollama_token().as_deref(), Some("token-for-b"));
+        assert_eq!(
+            recorded_server(&store).as_deref(),
+            Some("https://b.example/ollama")
+        );
     }
 }

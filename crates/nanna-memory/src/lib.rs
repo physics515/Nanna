@@ -92,7 +92,7 @@ pub use chunking::{chunk_text, derive_chunk_params, Chunk, ChunkParams, CHUNKER_
 pub use consolidation::{
     ConsolidationConfig, ConsolidationResult, CompressionLevel,
     WeightThresholds, ClusteringWeights, MemoryCluster, cluster_memories,
-    create_consolidated_entry, composite_cluster_score,
+    create_consolidated_entry, composite_cluster_score, cluster_score_ceiling,
     cluster_content_bytes_for_context, FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS,
     is_verbatim_pinned, FACT_TYPE_METADATA_KEY,
 };
@@ -906,6 +906,80 @@ impl VectorStore {
         }
     }
 
+    /// Order two `(index, similarity)` candidates: higher similarity first,
+    /// and — when two score the same — lower index first.
+    ///
+    /// The index tiebreak is what makes this a **total** order, and that is
+    /// load-bearing rather than tidy. The ranking below used to be a stable
+    /// `sort_by` on similarity alone, which resolved ties by original position
+    /// implicitly; selection is unstable, so without an explicit tiebreak two
+    /// equally-similar memories could swap places between runs. Equal
+    /// similarities are ordinary here, not exotic: every stale-width row scores
+    /// exactly the floor, and duplicate embeddings score exactly alike.
+    ///
+    /// NaN is mapped to below the floor instead of being handed to
+    /// `partial_cmp`, which reports it as `None`. A NaN score is not a low
+    /// score, it is an *incomparable* one — it makes the comparator
+    /// intransitive, so it could previously sort anywhere, including into the
+    /// returned results. It is reachable: a zero-magnitude embedding of the
+    /// right width (a row queued for backfill after an embedder rebind) gives
+    /// cosine `0/0`, which the width check in [`cosine_or_stale`] cannot catch.
+    /// Sorting it last is the same verdict a stale row gets, and it is
+    /// deterministic.
+    fn rank_order(a: &(usize, f32), b: &(usize, f32)) -> std::cmp::Ordering {
+        let sa = if a.1.is_finite() { a.1 } else { f32::NEG_INFINITY };
+        let sb = if b.1.is_finite() { b.1 } else { f32::NEG_INFINITY };
+        // Not `is_finite`: the sanitized value is deliberately -inf, which is
+        // ordered but not finite. What the total order needs is that neither
+        // side is NaN, which is exactly what the two lines above guarantee.
+        debug_assert!(
+            !sa.is_nan() && !sb.is_nan(),
+            "NaN must have been mapped to -inf above"
+        );
+        sb.partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    }
+
+    /// Reduce `ranked` to its best `top_k` entries, in [`rank_order`].
+    ///
+    /// This used to `sort_by` all N and then `truncate` to `top_k` — ranking
+    /// fifty thousand candidates to keep ten, O(N log N) where the answer needs
+    /// only O(N). `select_nth_unstable_by` partitions in linear time and only
+    /// the kept prefix is then sorted. At N = `50_000` with `top_k` = 10 that is
+    /// roughly 50k comparisons instead of ~780k, and `remember_scoped` runs a
+    /// search on **every** ingest, so it is on the write path as well as the
+    /// read one.
+    ///
+    /// Results are identical to the old stable sort element for element
+    /// wherever the scores are finite, which [`rank_order`] is what guarantees.
+    fn rank_top_k(ranked: &mut Vec<(usize, f32)>, top_k: usize) {
+        let before = ranked.len();
+
+        if top_k == 0 {
+            ranked.clear();
+            return;
+        }
+        // When `top_k` reaches the end there is nothing to discard and the
+        // partition pass would be pure overhead before the same sort.
+        if top_k < ranked.len() {
+            // After this, everything before index `top_k` orders at or ahead of
+            // everything from it on — i.e. the prefix IS the top k, unordered.
+            ranked.select_nth_unstable_by(top_k, Self::rank_order);
+            ranked.truncate(top_k);
+        }
+        ranked.sort_by(Self::rank_order);
+
+        debug_assert!(ranked.len() <= top_k, "kept more than top_k");
+        debug_assert!(ranked.len() <= before, "ranking must not invent entries");
+        debug_assert!(
+            ranked
+                .windows(2)
+                .all(|w| Self::rank_order(&w[0], &w[1]) != std::cmp::Ordering::Greater),
+            "ranked prefix must be ordered"
+        );
+    }
+
     pub async fn search(&self, query_embedding: &[f32], top_k: usize) -> Vec<(MemoryEntry, f32)> {
         self.search_with_coverage(query_embedding, top_k).await.0
     }
@@ -1024,9 +1098,13 @@ impl VectorStore {
         // O(store²) across a run. Capturing every tool call raises the write
         // count roughly forty-fold, which would have turned that from wasteful
         // into a stall.
+        //
+        // `rank_top_k` is the second half of the same idea: it also stopped
+        // *ordering* all N to keep `top_k`. Measured at 50k (`bench/BASELINE.md`
+        // Suite 2c), the sort was the larger part of the gap between the raw
+        // cosine kernel and this function.
         let mut ranked: Vec<(usize, f32)> = similarities.into_iter().enumerate().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(top_k);
+        Self::rank_top_k(&mut ranked, top_k);
         let scored: Vec<(MemoryEntry, f32)> = ranked
             .into_iter()
             .map(|(idx, sim)| (entries[idx].clone(), sim))
@@ -2124,6 +2202,91 @@ fn chrono_timestamp() -> i64 {
 mod tests {
     use super::*;
 
+    /// What the ranking did before `rank_top_k`: a STABLE sort of all N on
+    /// similarity alone, then `truncate`. Kept verbatim as the oracle, so the
+    /// equivalence claim is checked against the real previous behaviour rather
+    /// than against a restatement of the new one.
+    fn legacy_rank(similarities: &[f32], top_k: usize) -> Vec<(usize, f32)> {
+        let mut ranked: Vec<(usize, f32)> = similarities.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(top_k);
+        ranked
+    }
+
+    fn new_rank(similarities: &[f32], top_k: usize) -> Vec<(usize, f32)> {
+        let mut ranked: Vec<(usize, f32)> = similarities.iter().copied().enumerate().collect();
+        VectorStore::rank_top_k(&mut ranked, top_k);
+        ranked
+    }
+
+    #[test]
+    fn selection_ranking_matches_the_stable_sort_it_replaced() {
+        // Deliberately tie-heavy: only eight distinct scores across 200 slots,
+        // so nearly every comparison is a tie and an unstable selection without
+        // the index tiebreak would diverge immediately. Includes the stale
+        // floor (-1.0), which a real store produces for every wrong-width row.
+        const TIED: [f32; 8] = [0.99, 0.75, 0.75, 0.50, 0.50, 0.0, -1.0, -1.0];
+        let scores: Vec<f32> = (0..200).map(|i| TIED[i % TIED.len()]).collect();
+
+        for top_k in [1, 2, 3, 10, 31, 199, 200, 201, 1000] {
+            assert_eq!(
+                new_rank(&scores, top_k),
+                legacy_rank(&scores, top_k),
+                "selection diverged from the stable sort at top_k = {top_k}"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_ranking_handles_the_degenerate_sizes() {
+        let scores = [0.3_f32, 0.9, 0.1];
+
+        // top_k = 0 returns nothing rather than panicking in the selection.
+        assert_eq!(new_rank(&scores, 0), Vec::new());
+        // An empty candidate list is fine at any top_k.
+        assert_eq!(new_rank(&[], 5), Vec::new());
+        // top_k at and above the length keeps everything, fully ordered.
+        assert_eq!(new_rank(&scores, 3), vec![(1, 0.9), (0, 0.3), (2, 0.1)]);
+        assert_eq!(new_rank(&scores, 9), vec![(1, 0.9), (0, 0.3), (2, 0.1)]);
+        // And the ordinary case keeps exactly top_k, best first.
+        assert_eq!(new_rank(&scores, 2), vec![(1, 0.9), (0, 0.3)]);
+    }
+
+    #[test]
+    fn ties_resolve_by_ascending_index_so_the_ranking_is_deterministic() {
+        // Every score identical: the order is decided entirely by the tiebreak.
+        let scores = [0.5_f32; 64];
+        let ranked = new_rank(&scores, 5);
+        assert_eq!(
+            ranked.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4],
+            "an all-ties ranking must return the first top_k by index"
+        );
+    }
+
+    #[test]
+    fn a_nan_score_ranks_last_instead_of_anywhere() {
+        // A zero-magnitude embedding of the right width yields cosine 0/0.
+        // The old comparator handed NaN to `partial_cmp`, got `None`, and
+        // treated it as Equal — an intransitive comparator, so NaN could land
+        // in the results. It must now rank below even the stale floor.
+        let scores = [f32::NAN, -1.0, 0.8, f32::NAN, 0.2];
+
+        let ranked = new_rank(&scores, 3);
+        assert_eq!(
+            ranked.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![2, 4, 1],
+            "NaN must not displace a real score"
+        );
+
+        // And when NaN cannot be avoided it is last, in index order.
+        let all = new_rank(&scores, 5);
+        assert_eq!(
+            all.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![2, 4, 1, 0, 3]
+        );
+    }
+
     #[test]
     fn preview_never_splits_a_character() {
         // 39 ASCII bytes then a 3-byte char straddling byte 40.
@@ -2701,6 +2864,100 @@ mod tests {
     /// A queued row in the store must be skipped by search, not panic it: the
     /// raw SIMD cosine asserts equal widths and this crate aborts on panic, so
     /// before the fix one queued row took the daemon down on the next recall.
+    /// The ranking properties, proven through the **shipped** `search` rather
+    /// than through `rank_top_k` in isolation. The unit tests above pin the
+    /// ranking function; this one pins that `search` actually uses it, and that
+    /// `top_k` really does bound what comes back out of a larger store.
+    #[tokio::test]
+    async fn search_ranks_ties_deterministically_and_honours_top_k() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+
+        // Twenty rows, all with the SAME embedding, so every score ties and the
+        // order is decided entirely by the index tiebreak. Insertion order is
+        // the index order, so the answer must be the first `top_k` inserted.
+        for i in 0..20 {
+            store
+                .add(MemoryEntry {
+                    embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    ..entry_dim8(&format!("tied-{i:02}"))
+                })
+                .await
+                .unwrap();
+        }
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let ranked_ids = |r: &[(MemoryEntry, f32)]| -> Vec<String> {
+            r.iter().map(|(e, _)| e.id.clone()).collect()
+        };
+
+        let first = store.search(&query, 5).await;
+        assert_eq!(first.len(), 5, "top_k bounds the result");
+        assert_eq!(
+            ranked_ids(&first),
+            ["tied-00", "tied-01", "tied-02", "tied-03", "tied-04"],
+        );
+
+        // Repeat it: an unstable selection without the tiebreak would be free
+        // to return a different five, or the same five in another order.
+        for _ in 0..8 {
+            assert_eq!(
+                ranked_ids(&store.search(&query, 5).await),
+                ranked_ids(&first),
+                "an all-ties ranking must be stable across calls"
+            );
+        }
+    }
+
+    /// A zero-magnitude embedding of the RIGHT width yields cosine `0/0` = NaN.
+    /// The width check cannot catch it — the vector is the correct length, it
+    /// is the content that is degenerate — so the ranking is the only thing
+    /// standing between a NaN and the results. It must lose to a real match.
+    #[tokio::test]
+    async fn search_never_returns_a_nan_scored_row_ahead_of_a_real_match() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        // Right width, zero magnitude — this is the row that produces NaN.
+        store
+            .add(MemoryEntry {
+                embedding: vec![0.0; 8],
+                ..entry_dim8("zero-magnitude")
+            })
+            .await
+            .unwrap();
+        store
+            .add(MemoryEntry {
+                embedding: vec![0.2, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ..entry_dim8("weak-match")
+            })
+            .await
+            .unwrap();
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        // Asked for one: it must be the real row, never the degenerate one.
+        let top = store.search(&query, 1).await;
+        assert_eq!(top.len(), 1);
+        assert_eq!(
+            top[0].0.id, "weak-match",
+            "a NaN-scoring row must not outrank a real, if weak, match"
+        );
+
+        // Asked for both: the degenerate row comes last, and its score is not
+        // a NaN leaking out to callers that compare it against a threshold.
+        let all = store.search(&query, 10).await;
+        assert_eq!(
+            all.iter().map(|(e, _)| e.id.as_str()).collect::<Vec<_>>(),
+            ["weak-match", "zero-magnitude"],
+        );
+    }
+
     #[tokio::test]
     async fn search_skips_queued_rows_instead_of_panicking() {
         let store = VectorStore::new(VectorStoreConfig {

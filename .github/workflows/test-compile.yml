@@ -33,10 +33,22 @@ jobs:
     # `compile-tests-linux` below.
     runs-on: windows-latest
     # Measured: 16m12s on the first run, with a completely cold cache
-    # (run 29557077493). 30 gives ~2x headroom for a dependency bump that
+    # (run 29557077493). 30 gave ~2x headroom for a dependency bump that
     # invalidates everything, while still killing a hang in reasonable time.
     # Re-measure if the graph grows; do not raise it to paper over a hang.
-    timeout-minutes: 30
+    #
+    # Re-measured 2026-09-18: the graph has grown (MCP 2026-07-28 over every
+    # transport, the reference-SDK interop crates, the GUI startup work) and a
+    # cold build no longer fits in 30. Run 35392894354 was not hung: it
+    # compiled steadily through 754 crates, reached the root `nanna` crate 18
+    # minutes in, and was still compiling and linking its test targets when
+    # the limit cancelled it at 28. Cancellation also skips the cache save, so
+    # every retry started cold again: a limit a cold build cannot meet never
+    # heals. The next cold run (35395737558, "No cache found") finished: the
+    # compile step took 20m26s and the job 26m01s with the cache save, so a
+    # cold build now runs 20-30 minutes depending on the runner. 60 is ~2x the
+    # slower of the two.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v7
@@ -45,12 +57,12 @@ jobs:
       # rust-toolchain.toml, so the pinned channel is passed explicitly rather
       # than `@nightly`. Keep it in lockstep with rust-toolchain.toml — that
       # file carries the pin's rationale and the condition for removing it.
-      # (The channel below is nightly-2026-09-08; an earlier version of this
+      # (The channel below is nightly-2026-09-20; an earlier version of this
       # comment still named the superseded nightly-2026-07-13 pin.)
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-09-08
+          toolchain: nightly-2026-09-20
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -101,7 +113,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-09-08
+          toolchain: nightly-2026-09-20
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -140,7 +152,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-09-08
+          toolchain: nightly-2026-09-20
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -194,7 +206,7 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-09-08
+          toolchain: nightly-2026-09-20
 
       - uses: Swatinem/rust-cache@v2
         with:
