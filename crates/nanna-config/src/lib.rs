@@ -28,6 +28,9 @@ mod channel_secrets;
 mod secret_filing;
 /// `[server].webhook_secret` in the secure store, and out of `config.toml`.
 mod server_secret;
+/// The `[llm]` keys and `[tools].brave_api_key` a `config.toml` holds, filed
+/// in the secure store as it loads.
+mod api_keys;
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
@@ -815,26 +818,54 @@ fn retired_ollama_url_notice(content: &str, config: &Config) -> Option<String> {
 /// File in `store` under `key` a secret `config.toml` itself holds — `held`,
 /// trimmed and not blank — as the file loads, so that the save which next
 /// strips it from the file loses nothing ([`channel_secrets::adopt`],
-/// [`server_secret::adopt`]). A different stored value is replaced: every load
-/// of the file runs with the file's, so the one kept must be the file's, or
-/// that save would switch to another. Each load says the line can be deleted.
+/// [`server_secret::adopt`], [`api_keys::adopt`]). A different stored value is
+/// replaced: every load of the file runs with the file's, so the one kept must
+/// be the file's, or that save would switch to another. Each load says the
+/// line can be deleted.
 ///
 /// `field` names the secret in `config.toml` and `env_var` is where else it can
 /// come from, for the messages (never the value).
 fn adopt_file_secret(field: &str, env_var: &str, key: &str, held: &str, store: &SecureStore) {
-    let stored = store.get(key);
-    if stored.as_deref().is_ok_and(|stored| stored == held) {
+    let stored = match store.get(key) {
+        Ok(stored) if stored == held => StoredCopy::Same,
+        Ok(_) => StoredCopy::Other,
+        Err(_) => StoredCopy::None,
+    };
+    adopt_file_secret_with(field, env_var, stored, || store.set(key, held));
+}
+
+/// What the secure store holds of a secret `config.toml` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredCopy {
+    /// Nothing.
+    None,
+    /// Something else, or the same filed otherwise than the file's would be.
+    Other,
+    /// The file's, filed as it would be.
+    Same,
+}
+
+/// [`adopt_file_secret`] for a secret filed by `file`, not under one store
+/// key: unless `stored` is already the file's, `file` files it, and each load
+/// says the line can be deleted.
+fn adopt_file_secret_with(
+    field: &str,
+    env_var: &str,
+    stored: StoredCopy,
+    file: impl FnOnce() -> Result<(), crate::credentials::CredentialError>,
+) {
+    if stored == StoredCopy::Same {
         warn!(
             "config.toml holds {field} in plain text. It is in the secure store, so the line \
              can be deleted; the next save of the settings removes it."
         );
         return;
     }
-    match store.set(key, held) {
+    match file() {
         Ok(()) => warn!(
             "config.toml holds {field} in plain text. It is now filed in the secure store{}, so \
              the line can be deleted; the next save of the settings removes it.",
-            if stored.is_ok() {
+            if stored == StoredCopy::Other {
                 " in place of the one there"
             } else {
                 ""
@@ -891,12 +922,13 @@ impl Config {
 
     /// Read and parse the config file at `path`, with a non-Anthropic
     /// `[llm].provider`'s key filed under its own name
-    /// ([`provider_key::refile_provider_key`]) and each channel secret and the
-    /// webhook secret the file itself holds filed in `store`
-    /// ([`channel_secrets::adopt`], [`server_secret::adopt`]) — before any
-    /// secret is hydrated, so only a key the old layout left
-    /// behind is moved and only the file's own secrets are filed. The file's
-    /// text comes back too, for what only the raw text can show.
+    /// ([`provider_key::refile_provider_key`]) and each channel secret, the
+    /// webhook secret and each `[llm]` and `[tools]` key the file itself holds
+    /// filed in `store` ([`channel_secrets::adopt`], [`server_secret::adopt`],
+    /// [`api_keys::adopt`]) — before any secret is hydrated, so only a key the
+    /// old layout left behind is moved and only the file's own secrets are
+    /// filed. The file's text comes back too, for what only the raw text can
+    /// show.
     fn parse_file(
         path: &Path,
         store: &crate::credentials::SecureStore,
@@ -907,6 +939,7 @@ impl Config {
         provider_key::refile_provider_key(&mut config.llm, store);
         channel_secrets::adopt(&mut config.channels, store);
         server_secret::adopt(&mut config.server, store);
+        api_keys::adopt(&mut config, store);
         Ok((config, content))
     }
 
