@@ -267,6 +267,9 @@ async fn config_set_does_not_hand_a_legacy_ollama_token_to_a_new_address() {
         .expect("set");
     let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
     cp.credential_store = store.clone();
+    // Persisting, as the daemon does: the save files what a change brings in,
+    // and must not file the old server's token for the new address either.
+    cp.config_path = Some(dir.path().join("config.toml"));
     {
         // As the boot load left it: the legacy token, for the configured server.
         let mut config = cp.config.write().await;
@@ -333,6 +336,7 @@ async fn reset_and_import_record_a_legacy_ollama_tokens_server_first() {
             .expect("set");
         let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
         cp.credential_store = store.clone();
+        cp.config_path = Some(dir.path().join("config.toml"));
         {
             let mut config = cp.config.write().await;
             config.memory.ollama_host = "https://gpu.example/ollama".to_string();
@@ -358,6 +362,320 @@ async fn reset_and_import_record_a_legacy_ollama_tokens_server_first() {
             "{label}: recorded as the replaced server's"
         );
     }
+}
+
+/// A control plane that persists as the daemon's does — a `config.toml` and a
+/// secure store of its own under `dir`, never the OS keyring.
+fn persisting_control_plane(dir: &std::path::Path) -> (ControlPlane, nanna_config::SecureStore) {
+    let store = nanna_config::SecureStore::file_only_at(dir.join("store"));
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.config_path = Some(dir.join("config.toml"));
+    cp.credential_store = store.clone();
+    (cp, store)
+}
+
+/// The saved `config.toml`, or nothing when no save was made.
+fn saved_config(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("config.toml")).unwrap_or_default()
+}
+
+/// `config.toml` never holds a secret: the save strips every one, and the
+/// secure store is their only durable home. A secret written by `config.set`
+/// was never filed there, so it worked until the next load — a restart, or
+/// the config watcher re-reading the daemon's own save — and was gone.
+#[tokio::test]
+async fn a_secret_set_is_filed_before_the_save_strips_it() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    let cp = Arc::new(cp);
+
+    for (path, key, secret) in [
+        (
+            "llm.api_key",
+            keys::ANTHROPIC_API_KEY,
+            "sk-ant-set-by-config-set",
+        ),
+        (
+            "llm.openrouter_api_key",
+            keys::OPENROUTER_API_KEY,
+            "sk-or-set-by-config-set",
+        ),
+        (
+            "tools.brave_api_key",
+            keys::BRAVE_API_KEY,
+            "brave-set-by-config-set",
+        ),
+        (
+            "server.webhook_secret",
+            keys::SERVER_WEBHOOK_SECRET,
+            "webhook-set-by-config-set",
+        ),
+    ] {
+        let resp = cp
+            .handle(
+                "test",
+                Action::Config(ConfigAction::Set {
+                    path: path.into(),
+                    value: json!(secret),
+                }),
+            )
+            .await;
+        assert_eq!(resp["status"], "updated", "{path}: {resp}");
+        assert_eq!(
+            store.get(key).ok().as_deref(),
+            Some(secret),
+            "{path}: filed"
+        );
+        let running = serde_json::to_value(&*cp.config.read().await).expect("json");
+        let held = path
+            .split('.')
+            .try_fold(&running, |node, part| node.get(part))
+            .and_then(Value::as_str);
+        assert_eq!(
+            held,
+            Some(secret),
+            "{path}: still held by the running config"
+        );
+        let saved = saved_config(dir.path());
+        assert!(!saved.is_empty(), "{path}: the change was saved");
+        assert!(
+            !saved.contains(secret),
+            "{path}: not written to config.toml"
+        );
+    }
+
+    // A channel's secrets arrive with its section.
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "channels.telegram".into(),
+                value: json!({
+                    "bot_token": "telegram-bot-set-by-config-set",
+                    "webhook_secret": "telegram-webhook-set-by-config-set",
+                }),
+            }),
+        )
+        .await;
+    assert_eq!(resp["status"], "updated", "{resp}");
+    for (key, secret) in [
+        (keys::TELEGRAM_BOT_TOKEN, "telegram-bot-set-by-config-set"),
+        (
+            keys::TELEGRAM_WEBHOOK_SECRET,
+            "telegram-webhook-set-by-config-set",
+        ),
+    ] {
+        assert_eq!(store.get(key).ok().as_deref(), Some(secret), "{key}: filed");
+        assert!(
+            !saved_config(dir.path()).contains(secret),
+            "{key}: not written to config.toml"
+        );
+    }
+    let telegram = cp
+        .config
+        .read()
+        .await
+        .channels
+        .telegram
+        .clone()
+        .expect("the section is set");
+    assert_eq!(telegram.bot_token, "telegram-bot-set-by-config-set");
+    assert_eq!(
+        telegram.webhook_secret.as_deref(),
+        Some("telegram-webhook-set-by-config-set")
+    );
+}
+
+/// The Ollama token is filed for the server it is set for. The store holds
+/// one token, bound to one server; the token set here is the same string the
+/// store holds for another. Filed as "already stored", it stayed bound to the
+/// other server, and the next load withheld it from this one.
+#[tokio::test]
+async fn an_ollama_token_set_is_filed_for_the_running_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    store
+        .save_ollama_token("shared-token", "https://a.example/ollama")
+        .expect("save");
+    cp.config.write().await.memory.ollama_host = "https://b.example/ollama".to_string();
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.ollama_api_key".into(),
+                value: json!("shared-token"),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(store.ollama_token().as_deref(), Some("shared-token"));
+    assert_eq!(
+        store
+            .ollama_token_host()
+            .expect("a file store answers")
+            .as_deref(),
+        Some("https://b.example/ollama"),
+        "filed for the server it was set for"
+    );
+    assert_eq!(
+        cp.config.read().await.llm.ollama_api_key.as_deref(),
+        Some("shared-token")
+    );
+    assert!(!saved_config(dir.path()).contains("shared-token"));
+}
+
+/// `config.import` replaces the whole config, secrets included: each one it
+/// carries is filed, the Ollama token for the server the import names.
+/// (Secrets `with_env_overrides` would replace are left out, so the
+/// environment the test runs in cannot change what it sees.)
+#[tokio::test]
+async fn an_import_files_the_secrets_it_carries() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    store
+        .save_ollama_token("old-token", "https://a.example/ollama")
+        .expect("save");
+    {
+        let mut config = cp.config.write().await;
+        config.memory.ollama_host = "https://a.example/ollama".to_string();
+        config.llm.ollama_api_key = Some("old-token".to_string());
+    }
+    let cp = Arc::new(cp);
+
+    let mut imported = Config::default();
+    imported.memory.ollama_host = "https://b.example/ollama".to_string();
+    imported.llm.ollama_api_key = Some("imported-token".to_string());
+    imported.llm.openrouter_api_key = Some("sk-or-imported".to_string());
+    imported.tools.brave_api_key = Some("brave-imported".to_string());
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Import {
+                config: serde_json::to_value(&imported).expect("json"),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["status"], "imported", "{resp}");
+    assert_eq!(
+        store.get(keys::OPENROUTER_API_KEY).ok().as_deref(),
+        Some("sk-or-imported")
+    );
+    assert_eq!(
+        store.get(keys::BRAVE_API_KEY).ok().as_deref(),
+        Some("brave-imported")
+    );
+    assert_eq!(store.ollama_token().as_deref(), Some("imported-token"));
+    assert_eq!(
+        store
+            .ollama_token_host()
+            .expect("a file store answers")
+            .as_deref(),
+        Some("https://b.example/ollama")
+    );
+    let config = cp.config.read().await;
+    assert_eq!(
+        config.llm.openrouter_api_key.as_deref(),
+        Some("sk-or-imported")
+    );
+    assert_eq!(
+        config.tools.brave_api_key.as_deref(),
+        Some("brave-imported")
+    );
+    assert_eq!(config.llm.ollama_api_key.as_deref(), Some("imported-token"));
+    let saved = saved_config(dir.path());
+    for secret in ["sk-or-imported", "brave-imported", "imported-token"] {
+        assert!(
+            !saved.contains(secret),
+            "{secret} not written to config.toml"
+        );
+    }
+}
+
+/// Only a change that brings a secret in writes the store. A running config
+/// holds secrets that are not the store's to keep — one from the environment
+/// here — and a change of something else (a Settings toggle, a slider) must
+/// not copy them into the keyring, or touch it at all.
+#[tokio::test]
+async fn a_change_that_brings_in_no_secret_leaves_the_store_alone() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cp, store) = persisting_control_plane(dir.path());
+    cp.config.write().await.llm.api_key = Some("sk-ant-from-the-environment".to_string());
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.model".into(),
+                value: json!("nanna-test-other-model"),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert!(
+        !store.exists(keys::ANTHROPIC_API_KEY),
+        "a secret the change did not bring in is not filed"
+    );
+    assert_eq!(
+        cp.config.read().await.llm.api_key.as_deref(),
+        Some("sk-ant-from-the-environment")
+    );
+}
+
+/// A secret the store cannot file would live until the next load and then be
+/// gone. The change is refused instead, with why: nothing is applied or saved.
+#[tokio::test]
+async fn a_secret_the_store_cannot_file_is_refused_with_its_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The store's directory would sit under a plain file: every write fails.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "not a directory").expect("write");
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.config_path = Some(dir.path().join("config.toml"));
+    cp.credential_store = nanna_config::SecureStore::file_only_at(blocker.join("store"));
+    let cp = Arc::new(cp);
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.openrouter_api_key".into(),
+                value: json!("sk-or-unfilable"),
+            }),
+        )
+        .await;
+    assert_eq!(resp["error"], "secret_store_failed", "{resp}");
+    assert_eq!(resp["path"], "llm.openrouter_api_key", "{resp}");
+    assert_eq!(cp.config.read().await.llm.openrouter_api_key, None);
+
+    let mut imported = Config::default();
+    imported.tools.brave_api_key = Some("brave-unfilable".to_string());
+    imported.llm.model = "nanna-test-imported-model".to_string();
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Import {
+                config: serde_json::to_value(&imported).expect("json"),
+            }),
+        )
+        .await;
+    assert_eq!(resp["error"], "secret_store_failed", "{resp}");
+    let config = cp.config.read().await;
+    assert_eq!(config.tools.brave_api_key, None);
+    assert_ne!(
+        config.llm.model, "nanna-test-imported-model",
+        "nothing is applied"
+    );
+    drop(config);
+    assert_eq!(saved_config(dir.path()), "", "nothing is saved");
 }
 
 /// Negative space: with no memory configured at all, consolidation reports the

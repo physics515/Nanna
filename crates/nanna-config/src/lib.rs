@@ -24,6 +24,8 @@ mod provider_key;
 /// Channel secrets (bot tokens, signing and webhook secrets) in the secure
 /// store, and out of `config.toml`.
 mod channel_secrets;
+/// Filing the secrets a change brings in before a save strips them.
+mod secret_filing;
 /// `[server].webhook_secret` in the secure store, and out of `config.toml`.
 mod server_secret;
 

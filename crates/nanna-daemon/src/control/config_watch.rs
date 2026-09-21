@@ -189,6 +189,45 @@ mod tests {
         );
     }
 
+    /// The watcher re-reads the daemon's own `config.set` save. That save
+    /// strips every secret, so a key set through `config.set` and never filed
+    /// in the store read back as missing: a difference, applied — the key was
+    /// gone from the running daemon within one poll of being set.
+    #[tokio::test]
+    async fn the_watcher_keeps_a_secret_set_through_config_set() {
+        use crate::protocol::{Action, ConfigAction};
+        // The environment's key wins every load, by design; with one set there
+        // is no store read to show.
+        if std::env::var("BRAVE_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("config.toml");
+        let mut control = ControlPlane::new(Arc::new(crate::session::SessionManager::new()));
+        control.config_path = Some(file.clone());
+        control.credential_store =
+            nanna_config::SecureStore::file_only_at(dir.path().join("store"));
+        let control = Arc::new(control);
+
+        let resp = control
+            .handle(
+                "test",
+                Action::Config(ConfigAction::Set {
+                    path: "tools.brave_api_key".into(),
+                    value: serde_json::json!("brave-set-by-config-set"),
+                }),
+            )
+            .await;
+        assert_eq!(resp["status"], "updated", "{resp}");
+        control.reload_changed_config(&file).await;
+
+        assert_eq!(
+            control.config.read().await.tools.brave_api_key.as_deref(),
+            Some("brave-set-by-config-set"),
+            "the save the watcher read back still has the key"
+        );
+    }
+
     #[test]
     fn a_stamp_tracks_length_and_absence() {
         let dir = tempfile::tempdir().expect("tempdir");
