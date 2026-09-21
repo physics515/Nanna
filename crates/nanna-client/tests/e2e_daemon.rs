@@ -785,6 +785,9 @@ const PLANNER_PROMPT_OPENING: &str = "You are planning how to satisfy one reques
 /// Ollama provider, which [`ScriptedOllama`] stands in for.
 const STUB_MODEL: &str = "e2e-stub:1b";
 
+/// A model the scripted server answers with Ollama's unknown-model 404.
+const UNSERVED_MODEL: &str = "e2e-gone:1b";
+
 /// A scripted Ollama server playing a well-behaved model, and keeping each
 /// chat request body so a test can see what reached the model.
 ///
@@ -868,6 +871,17 @@ impl ScriptedOllama {
                     }
                     if !request_line.contains("/api/chat") {
                         respond(&mut socket, "{}").await;
+                        return;
+                    }
+                    // The model this server does not serve, answered the way
+                    // Ollama answers an unknown model.
+                    if body.contains(&format!("\"model\":\"{UNSERVED_MODEL}\"")) {
+                        respond_status(
+                            &mut socket,
+                            "404 Not Found",
+                            &format!("{{\"error\":\"model '{UNSERVED_MODEL}' not found\"}}"),
+                        )
+                        .await;
                         return;
                     }
                     let (delay_ms, line) = if body.contains(PLANNER_PROMPT_OPENING) {
@@ -1011,9 +1025,14 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String
 }
 
 async fn respond(stream: &mut tokio::net::TcpStream, body: &str) {
+    respond_status(stream, "200 OK", body).await;
+}
+
+/// [`respond`] with an explicit status line.
+async fn respond_status(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
     use tokio::io::AsyncWriteExt;
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
@@ -1108,6 +1127,58 @@ async fn a_conversation_turn_round_trips_and_persists_its_reply() {
     assert!(
         text.contains(REPLY),
         "the assistant's reply is persisted: {history}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A chat whose head model fails is answered by the next model in the
+/// priority list, and says so — the walk the retired direct-chat path did and
+/// the harness path (every chat turn) did not: a failing head ended the turn
+/// in "could not run" with working models configured below it (2026-09-21).
+#[tokio::test]
+async fn a_failing_head_model_falls_back_to_the_next_in_the_priority_list() {
+    const REPLY: &str = "Answered by the fallback model.";
+
+    let ollama = ScriptedOllama::start(vec![format!("{REPLY}\nTASK COMPLETE")]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model_priority(vec![
+            format!("ollama/{UNSERVED_MODEL}"),
+            format!("ollama/{STUB_MODEL}"),
+        ])
+        .with_ollama_host(host)
+        .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("fallback".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+
+    let answered = converse(&client, &session, "hello").await;
+
+    assert_eq!(answered.trim(), REPLY, "the next model's answer is the reply");
+    let bodies = ollama.chat_bodies.lock().await.clone();
+    assert!(
+        bodies.iter().any(|body| body.contains(STUB_MODEL)),
+        "the fallback model was asked"
+    );
+    // The switch is on the record, not silent.
+    let history = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("sessions.history answers")
+        .to_string();
+    assert!(
+        history.contains(&format!("continuing on ollama/{STUB_MODEL}")),
+        "the run journal names the fallback: {history}"
     );
 
     client.disconnect().await;

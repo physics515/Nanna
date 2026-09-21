@@ -1281,6 +1281,15 @@ impl AgentService {
         self.router.health_sorted_models(&base_models).await
     }
 
+    /// The models a harness run falls back through, in priority order:
+    /// `[llm] model_priority`, or the single `[llm] model`. Deliberately NOT
+    /// health-sorted — the run's head model is `agent_config().model`, the
+    /// list's head, and the chain must start where the run does.
+    pub async fn chat_model_chain(&self) -> Vec<String> {
+        let config = self.config.read().await;
+        configured_models(&config.model, &config.model_priority)
+    }
+
     /// Whether any model is configured to run a prompt with. A daemon built
     /// without one (no `[llm] model`, no `[llm] model_priority`) has nothing
     /// to send a scheduled prompt to.
@@ -2453,7 +2462,7 @@ pub struct MemoryContext {
     pub score: f32,
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
+pub(crate) fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {

@@ -1573,6 +1573,7 @@ impl TaskSource for TursoTaskSource {
 
 /// Runs one harness step as a fresh `Agent` with an isolated context — the
 /// re-anchor.
+#[derive(Clone)]
 pub struct AgentStepRunner {
     /// Tools the model has discovered so far in THIS harness run.
     ///
@@ -1650,6 +1651,114 @@ pub struct AgentStepRunner {
     /// from a fresh context, so a later step working on the image would
     /// otherwise not see it. Empty for runs no message started.
     pub attachments: Arc<Vec<(String, String)>>,
+    /// The models this run may fall back to, in `[llm] model_priority`
+    /// order, shared by every runner of the run (planner and steps).
+    ///
+    /// `None` = no fallback: the run lives and dies on
+    /// `agent_config.model` (a chat pinned to its own model — substituting
+    /// another one silently is exactly what a pin forbids — and tests).
+    pub model_chain: Option<Arc<ModelChain>>,
+}
+
+/// The fallback walk down `[llm] model_priority` for ONE run.
+///
+/// The harness is the only chat path, and it used to run every step on the
+/// head of the priority list alone: when that model's provider failed, the
+/// step ladder retried the same model, the continuation loop retried the
+/// round, and the turn ended in "could not run" while the rest of the list
+/// sat unused (observed 2026-09-21: a remote Ollama answering every request
+/// with "error decoding response body", Claude models configured below it,
+/// three turns in a row with no reply). The retired direct-chat path walked
+/// the list; this restores that for every run.
+///
+/// Sticky for the run: once a model has failed past its retries, the rest of
+/// the run stays on the model that replaced it rather than paying the dead
+/// model's retry ladder again on every step. The NEXT run builds a fresh
+/// chain from the top, so a recovered primary is used again at once.
+pub struct ModelChain {
+    models: Vec<String>,
+    active: std::sync::atomic::AtomicUsize,
+    /// Where a switch is announced. On the chain rather than the runner
+    /// because the planner — whose runner deliberately has no transcript
+    /// sink — is usually the first to meet a dead model.
+    announce: Option<ChatSink>,
+}
+
+impl ModelChain {
+    /// A chain over `models` (in priority order), starting at the first one
+    /// a registered provider serves — or at the head when none is, so the
+    /// caller's unserved-model notice names the model the user put first.
+    ///
+    /// # Panics
+    ///
+    /// When `models` is empty: a run always has a model to start on.
+    #[must_use]
+    pub fn new(models: Vec<String>, router: &LlmRouter) -> Self {
+        assert!(!models.is_empty(), "a model chain needs at least one model");
+        let start = models
+            .iter()
+            .position(|m| router.client_for_model(m).is_some())
+            .unwrap_or(0);
+        Self {
+            models,
+            active: std::sync::atomic::AtomicUsize::new(start),
+            announce: None,
+        }
+    }
+
+    /// Announce every switch in `sink`'s transcript (see
+    /// [`ChatSink::model_fallback`]).
+    #[must_use]
+    pub fn announcing_to(mut self, sink: ChatSink) -> Self {
+        self.announce = Some(sink);
+        self
+    }
+
+    /// The model the run is on now.
+    #[must_use]
+    pub fn active(&self) -> String {
+        let index = self.active.load(std::sync::atomic::Ordering::SeqCst);
+        debug_assert!(index < self.models.len());
+        self.models[index].clone()
+    }
+
+    /// `failed` gave up: move to the next model a registered provider serves
+    /// and return it, or `None` when the list is exhausted.
+    ///
+    /// Only advances when `failed` is still the active model, so two runners
+    /// reporting the same failure move the chain once, not twice.
+    pub fn advance_past(&self, failed: &str, router: &LlmRouter) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        let current = self.active.load(Ordering::SeqCst);
+        if self.models[current] != failed {
+            // Someone already moved on; follow them.
+            return Some(self.models[current].clone());
+        }
+        let next = (current + 1..self.models.len())
+            .find(|&i| router.client_for_model(&self.models[i]).is_some())?;
+        match self
+            .active
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => Some(self.models[next].clone()),
+            Err(now) => Some(self.models[now].clone()),
+        }
+    }
+}
+
+/// A step failure that says the MODEL (or its provider) cannot serve this
+/// run, so the next model in the priority list should get it: transient
+/// provider faults that outlived the step's retry ladder, any provider 4xx
+/// (auth, billing, rate limit, unknown model, context too long for this
+/// window), an unregistered provider, and a model that kept answering with
+/// nothing. Everything else — a Stop, a harness guard — is not the model's
+/// fault, and another model would fail it the same way.
+#[must_use]
+pub(crate) fn warrants_model_fallback(message: &str) -> bool {
+    is_transient_llm_error(message)
+        || message.contains("API error: 4")
+        || message.contains("No provider available for model")
+        || message.contains("empty completion")
 }
 
 /// Split a message's attachments into the images a step can send to the
@@ -2163,6 +2272,36 @@ impl ChatSink {
                     item_id: request.item_id,
                     at: chrono::Utc::now().to_rfc3339(),
                 });
+        }
+    }
+
+    /// Say — where the user is looking — that `failed` gave up and the run
+    /// continues on `next`: a fault in the run journal (what the chat shows
+    /// inline), the model badge's switch event, and the liveness ledger's
+    /// model. A silent substitution would read as the configured model
+    /// answering.
+    pub fn model_fallback(&self, failed: &str, next: &str, error: &str) {
+        let message = format!(
+            "{failed} failed: {} — continuing on {next}",
+            crate::agent_service::truncate(error, 200)
+        );
+        if let Some(live) = &self.liveness {
+            live.set_model(next);
+        }
+        let _ = self.event_tx.send(Event::ModelSwitch {
+            model: next.to_string(),
+            reason: Some(message.clone()),
+        });
+        let _ = self.event_tx.send(Event::Error {
+            code: "model_error".to_string(),
+            message: message.clone(),
+            session_id: Some(self.session_id.clone()),
+        });
+        if let Some(run) = &self.run {
+            crate::agent_service::timeline_lock(&run.timeline).push(crate::session::TimelineItem::Fault {
+                message,
+                at: chrono::Utc::now().to_rfc3339(),
+            });
         }
     }
 }
@@ -2834,7 +2973,77 @@ const fn gpu_fault_action(fault_ordinal: u32) -> GpuFaultAction {
 
 #[async_trait::async_trait]
 impl StepRunner for AgentStepRunner {
+    /// The step's retry ladder on the run's active model, then — when that
+    /// model gives up with a fault another model could get past — the same
+    /// step on the next model in the chain (see [`ModelChain`]).
     async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
+        let Some(chain) = self.model_chain.as_ref() else {
+            return self.run_step_ladder(request).await;
+        };
+        let mut request = request;
+        loop {
+            let model = chain.active();
+            let result = if model == self.agent_config.model {
+                self.run_step_ladder(request.clone()).await
+            } else {
+                self.on_model(&model).run_step_ladder(request.clone()).await
+            };
+            let err = match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(err) => err,
+            };
+            let cancelled = request.cancel.as_ref().is_some_and(CancelToken::is_cancelled);
+            if cancelled || !warrants_model_fallback(&err) {
+                return Err(err);
+            }
+            let Some(next) = chain.advance_past(&model, &self.router) else {
+                return Err(err);
+            };
+            tracing::warn!(
+                failed = %model,
+                next = %next,
+                error = %err,
+                "model gave up on this step — falling back to the next model in the priority list"
+            );
+            if let Some(sink) = &chain.announce {
+                sink.model_fallback(&model, &next, &err);
+            }
+            // The failed attempt may have run tools the next model's fresh
+            // context cannot show: the same re-anchor the ladder uses.
+            if is_transient_llm_error(&err) {
+                request
+                    .prompt
+                    .push_str(&transient_retry_note(1, transient_fault_kind(&err)));
+                if let Some(line) = self.carried_side_effects_line() {
+                    request.prompt.push_str(&line);
+                }
+            }
+        }
+    }
+}
+
+impl AgentStepRunner {
+    /// The model this run is on now: the chain's active model, or the
+    /// configured one when the run has no fallback chain.
+    #[must_use]
+    pub fn active_model(&self) -> String {
+        self.model_chain
+            .as_ref()
+            .map_or_else(|| self.agent_config.model.clone(), |chain| chain.active())
+    }
+
+    /// This runner moved onto `model`: same run state, the model swapped the
+    /// way a chat pin swaps it (routing tiers cleared, or iteration 2 would
+    /// route straight back to the model that just failed).
+    fn on_model(&self, model: &str) -> Self {
+        let mut runner = self.clone();
+        crate::agent_service::apply_chat_model_override(&mut runner.agent_config, model);
+        runner
+    }
+
+    /// One step on `agent_config.model`: attempts plus the in-place retry
+    /// ladder for transient faults.
+    async fn run_step_ladder(&self, request: StepRequest) -> Result<StepOutcome, String> {
         let mut last_err = String::new();
         let mut nudge_pending = false;
         // Set once a transient fault has interrupted THIS step, and holds the
@@ -2958,9 +3167,7 @@ impl StepRunner for AgentStepRunner {
         }
         Err(last_err)
     }
-}
 
-impl AgentStepRunner {
     /// Get ready for retry `attempt` of a step: honour a Stop, back off, and
     /// clear a wedged or out-of-memory runner. Returns `false` when the user
     /// cancelled, in which case the step ends with the last error.
@@ -8536,6 +8743,7 @@ mod summarizer_wiring_tests {
             gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             degradations: None,
             attachments: Arc::default(),
+            model_chain: None,
         }
     }
 
@@ -8585,6 +8793,150 @@ mod summarizer_wiring_tests {
             reached.iter().any(|r| r.path == "/api/chat"
                 && r.authorization.as_deref() == Some("Bearer bound-token")),
             "{reached:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_fallback_tests {
+    use super::{AgentStepRunner, ModelChain, warrants_model_fallback};
+    use crate::embedding_reload::test_ollama::spawn_answering;
+    use crate::llm_router::LlmRouter;
+    use nanna_agent::harness::{StepKind, StepRequest, StepRunner};
+    use std::sync::Arc;
+
+    fn runner(router: Arc<LlmRouter>, model: &str, chain: Option<Arc<ModelChain>>) -> AgentStepRunner {
+        AgentStepRunner {
+            discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+            user_selected_tools: Vec::new(),
+            repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
+            router,
+            tools: Arc::new(nanna_tools::ToolRegistry::new()),
+            agent_config: nanna_agent::AgentConfig {
+                model: model.to_string(),
+                ..nanna_agent::AgentConfig::default()
+            },
+            system_prompt: String::new(),
+            workspace_root: None,
+            workspace_context: None,
+            stats: None,
+            memory: None,
+            workspace_id: None,
+            chat_sink: None,
+            gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            degradations: None,
+            attachments: Arc::default(),
+            model_chain: chain,
+        }
+    }
+
+    fn request() -> StepRequest {
+        StepRequest {
+            item_title: "say hello".to_string(),
+            item_id: 1,
+            step_index: 0,
+            step_kind: StepKind::Execute,
+            prompt: "Task #1: say hello".to_string(),
+            tool_scope: Vec::new(),
+            token_budget: None,
+            max_iterations: Some(1),
+            max_wall_clock: None,
+            cancel: None,
+        }
+    }
+
+    fn models(names: &[&str]) -> Vec<String> {
+        names.iter().map(|m| (*m).to_string()).collect()
+    }
+
+    #[test]
+    fn the_live_failures_fall_back_and_harness_guards_do_not() {
+        // The exact string the 2026-09-21 turns died on, three times running.
+        assert!(warrants_model_fallback(
+            "step error: LLM error: Stream error: error decoding response body"
+        ));
+        assert!(warrants_model_fallback("step error: LLM error: API error: 502 - bad gateway"));
+        assert!(warrants_model_fallback("step error: LLM error: API error: 401 - invalid api key"));
+        assert!(warrants_model_fallback("step error: LLM error: API error: 404 - model not found"));
+        assert!(warrants_model_fallback("No provider available for model 'claude-opus-5'"));
+        assert!(warrants_model_fallback(
+            "empty completion (no text, no tool calls, ~0 tokens) from provider"
+        ));
+        assert!(!warrants_model_fallback("step cancelled by the user"));
+        assert!(!warrants_model_fallback(
+            "step error: effective context window (8192 tokens) is below the floor"
+        ));
+    }
+
+    #[test]
+    fn a_chain_starts_at_the_first_served_model_and_skips_unserved_ones() {
+        let router = LlmRouter::new().with_ollama("http://127.0.0.1:9");
+        // No Anthropic credential: the head is unserved, so the run starts
+        // on the first model a provider can actually reach.
+        let chain = ModelChain::new(
+            models(&["claude-opus-5", "ollama/a:1b", "claude-sonnet-5", "ollama/b:1b"]),
+            &router,
+        );
+        assert_eq!(chain.active(), "ollama/a:1b");
+        assert_eq!(chain.advance_past("ollama/a:1b", &router).as_deref(), Some("ollama/b:1b"));
+        assert_eq!(chain.active(), "ollama/b:1b");
+        assert_eq!(chain.advance_past("ollama/b:1b", &router), None, "exhausted");
+        assert_eq!(chain.active(), "ollama/b:1b", "an exhausted chain stays put");
+    }
+
+    #[test]
+    fn two_reports_of_one_failure_advance_the_chain_once() {
+        let router = LlmRouter::new().with_ollama("http://127.0.0.1:9");
+        let chain = ModelChain::new(models(&["ollama/a:1b", "ollama/b:1b", "ollama/c:1b"]), &router);
+        assert_eq!(chain.advance_past("ollama/a:1b", &router).as_deref(), Some("ollama/b:1b"));
+        // The planner and a step both saw `a` fail: the second report
+        // follows the chain rather than skipping `b`.
+        assert_eq!(chain.advance_past("ollama/a:1b", &router).as_deref(), Some("ollama/b:1b"));
+        assert_eq!(chain.active(), "ollama/b:1b");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_step_the_head_model_fails_is_answered_by_the_next_model() {
+        // `dead:1b` is not served (404), `alive:1b` answers.
+        let (host, seen) = spawn_answering(&[("alive:1b", "hello from the fallback")]).await;
+        let router = Arc::new(LlmRouter::new().with_ollama(&host));
+        let chain = Arc::new(ModelChain::new(models(&["ollama/dead:1b", "ollama/alive:1b"]), &router));
+        let step = runner(Arc::clone(&router), "ollama/dead:1b", Some(Arc::clone(&chain)));
+
+        let outcome = step.run_step(request()).await.expect("the fallback model answers");
+
+        assert!(outcome.text.contains("hello from the fallback"), "{}", outcome.text);
+        assert_eq!(chain.active(), "ollama/alive:1b", "the run stays on the model that worked");
+        let asked: Vec<Option<String>> = seen.lock().expect("seen").iter().map(|r| r.model.clone()).collect();
+        assert!(asked.contains(&Some("dead:1b".to_string())), "the head was tried first: {asked:?}");
+        assert_eq!(asked.last(), Some(&Some("alive:1b".to_string())), "{asked:?}");
+
+        // The next step starts on the model that worked, not the dead head.
+        let before = seen.lock().expect("seen").len();
+        step.run_step(request()).await.expect("second step");
+        // Chat requests only: a model-info lookup rides along without a
+        // `model` field.
+        let later: Vec<String> = seen.lock().expect("seen")[before..]
+            .iter()
+            .filter(|r| r.path == "/api/chat")
+            .filter_map(|r| r.model.clone())
+            .collect();
+        assert!(!later.is_empty() && later.iter().all(|m| m == "alive:1b"), "{later:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_chain_a_failing_model_still_fails_the_step() {
+        // A pinned chat: no substitution, the failure is reported as is.
+        let (host, seen) = spawn_answering(&[("alive:1b", "should never be asked")]).await;
+        let router = Arc::new(LlmRouter::new().with_ollama(&host));
+        let step = runner(router, "ollama/dead:1b", None);
+
+        let err = step.run_step(request()).await.expect_err("the pinned model fails");
+
+        assert!(err.contains("404"), "{err}");
+        assert!(
+            seen.lock().expect("seen").iter().all(|r| r.model.as_deref() != Some("alive:1b")),
+            "no other model was asked"
         );
     }
 }
