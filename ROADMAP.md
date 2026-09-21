@@ -2111,8 +2111,10 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             its steps, and the reason says both: `abandoned after 6 steps (2 of them replans) made
             no verifiable progress; 8 no-progress charges spent (…charged twice)`. e2e
             `a_repeated_failing_call_ends_bounded_and_reports_the_steps_it_ran` asserts the two
-            counts agree (fails on the old counter). Not changed: the "last said" excerpt in that
-            report can quote model-facing harness notes (`[HARNESS NOTE — …]`) verbatim.
+            counts agree (fails on the old counter). *(Same run, follow-up)* The report's "last said"
+            excerpt no longer quotes notices written for the model (`[HARNESS NOTE — …]`, the
+            repeat-failure / zero-information breakers, `[CONTEXT NOTICE…]`): it is cut before the first
+            one and the cut marked (`without_model_notices`); the e2e asserts neither appears.
       - [x] *(2026-09-21)* **Regenerate — or asking the same question twice — appended a
             "⚠️ repeat completion" warning to a plain answer.** The P22 escalation ("this same
             request has now ended 'all tasks done' 2 times in a row with no side-effecting work … If

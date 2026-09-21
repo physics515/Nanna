@@ -2060,6 +2060,10 @@ async fn a_repeated_failing_call_ends_bounded_and_reports_the_steps_it_ran() {
         ollama.chat_bodies.lock().await.len() < 100,
         "the loop is bounded by the harness, not by the model"
     );
+    assert!(
+        !reply.contains("HARNESS NOTE") && !reply.contains("BREAKER"),
+        "notices written for the model are not quoted to the user: {reply}"
+    );
 
     client.disconnect().await;
     daemon.stop();

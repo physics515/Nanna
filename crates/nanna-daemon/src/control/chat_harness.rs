@@ -3023,7 +3023,9 @@ fn unresolved_evidence(
             let last = item
                 .last_result
                 .as_deref()
-                .map(|r| format!(" — last said: {}", clamp_display(r, 200)))
+                .map(without_model_notices)
+                .filter(|said| !said.is_empty())
+                .map(|said| format!(" — last said: {}", clamp_display(&said, 200)))
                 .unwrap_or_default();
             let _ = write!(
                 out,
@@ -3324,6 +3326,44 @@ pub(crate) async fn established_rows(
         });
     }
     rows
+}
+
+/// Notices the harness writes TO THE MODEL, by their opening bracket. They
+/// ride tool results and step text so the model reads them; a user-facing
+/// report quoting that text verbatim showed the user lines like
+/// `frobnicate FAILED ([HARNESS NOTE — you are mid-task: …] [REPEAT-FAILURE
+/// BREAKER …`.
+const MODEL_FACING_NOTICE_OPENERS: &[&str] = &[
+    "[HARNESS NOTE",
+    "[REPEAT-FAILURE BREAKER",
+    "[ZERO-INFORMATION BREAKER",
+    "[CONTEXT NOTICE",
+];
+
+/// `text` cut before the first model-facing notice (see
+/// [`MODEL_FACING_NOTICE_OPENERS`]), with the cut marked; empty when the
+/// notice was all there was. Notices run to the end of the entry they are
+/// attached to, so everything after the first one is harness text.
+fn without_model_notices(text: &str) -> String {
+    let Some(at) = MODEL_FACING_NOTICE_OPENERS
+        .iter()
+        .filter_map(|opener| text.find(opener))
+        .min()
+    else {
+        return text.to_string();
+    };
+    let kept = text[..at].trim_end().trim_end_matches('(').trim_end();
+    debug_assert!(
+        MODEL_FACING_NOTICE_OPENERS
+            .iter()
+            .all(|o| !kept.contains(o)),
+        "the cut is before every notice"
+    );
+    if kept.is_empty() {
+        String::new()
+    } else {
+        format!("{kept}…")
+    }
 }
 
 /// Clamp a stored string for display, announcing the cut.
@@ -4831,6 +4871,20 @@ mod tests {
             passing < set && set < unchecked && unchecked < answer,
             "{mixed}"
         );
+    }
+
+    #[test]
+    fn a_user_facing_excerpt_drops_notices_written_for_the_model() {
+        let step = "[step report synthesized from the tool record — the model emitted no final text]\n\
+                    - frobnicate FAILED ([HARNESS NOTE — you are mid-task: x] [REPEAT-FAILURE BREAKER — stop)";
+        let kept = without_model_notices(step);
+        assert!(kept.ends_with("- frobnicate FAILED…"), "{kept}");
+        assert!(
+            !kept.contains("HARNESS NOTE") && !kept.contains("BREAKER"),
+            "{kept}"
+        );
+        assert_eq!(without_model_notices("[HARNESS NOTE — only this]"), "");
+        assert_eq!(without_model_notices("plain words"), "plain words");
     }
 
     #[test]
