@@ -774,6 +774,9 @@ async fn a_chat_with_no_model_configured_says_which_setting_is_missing() {
     daemon.stop();
 }
 
+/// The scripted model's `/api/show`: a 32K-context tool-calling model.
+const SHOW_REPLY: &str = r#"{"model_info":{"general.architecture":"llama","llama.context_length":32768},"capabilities":["completion","tools"]}"#;
+
 /// How `nanna_agent::planner::build_plan_prompt` opens — the stub's cue that a
 /// request is the planner's rather than a step's.
 const PLANNER_PROMPT_OPENING: &str = "You are planning how to satisfy one request";
@@ -853,6 +856,12 @@ impl ScriptedOllama {
                     let Some((request_line, body)) = read_http_request(&mut socket).await else {
                         return;
                     };
+                    // Model info like a real 32K tool-calling model, so the
+                    // daemon sizes its context the way it would in use.
+                    if request_line.contains("/api/show") {
+                        respond(&mut socket, SHOW_REPLY).await;
+                        return;
+                    }
                     if !request_line.contains("/api/chat") {
                         respond(&mut socket, "{}").await;
                         return;
@@ -1871,6 +1880,67 @@ async fn a_clarifying_question_is_answered_by_the_next_message() {
     assert!(
         tasks.iter().all(|task| !task.ends_with("Paris")),
         "the answer was consumed, not queued as new work: {tasks:?}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A tool call with a huge argument keeps the model's own call in context.
+///
+/// Only write tools had their bulk argument stripped from the stored turn;
+/// here the scripted model passes 185 KB to `echo`, which sat verbatim in
+/// the assistant message, pushed the estimate to ~56k tokens against a
+/// 12k-token limit (the actual request was ~1.6k), and the hard cap dropped
+/// the model's own tool call with a "history shortened" notice.
+#[tokio::test]
+async fn a_huge_tool_argument_does_not_evict_the_call_that_made_it() {
+    let big: String = (0..6000)
+        .map(|i| format!("line {i}: the quick brown fox\n"))
+        .collect();
+    let call = format!("CALL echo {}", serde_json::json!({ "text": big }));
+    let ollama = ScriptedOllama::start(vec![call, "Done.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("big argument".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let reply = converse(&client, &session, "Echo a lot.").await;
+    assert_eq!(reply.trim(), "Done.");
+
+    // The request after the call: it must still hold the model's own call.
+    let after_call = ollama
+        .chat_bodies
+        .lock()
+        .await
+        .iter()
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .find(|request| {
+            request["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"))
+        })
+        .expect("the tool result went back to the model");
+    let messages = after_call["messages"].as_array().expect("messages");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["role"] == "assistant" && m["tool_calls"].is_array()),
+        "the model's own tool call is still in context"
+    );
+    assert!(
+        !after_call.to_string().contains("history shortened"),
+        "nothing was dropped to make room"
     );
 
     client.disconnect().await;

@@ -2073,6 +2073,22 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             `chat.send` ack reads `"status":"interjected"… "admitted to the run in progress"` — true
             of the mechanism (the reply rides the pending queue the call drains), and no client
             reads the status today.
+      - [x] *(2026-09-21)* **A huge tool argument evicted the model's own tool call.** Only write
+            tools had their bulk argument stripped from the stored turn; a 185 KB argument to any
+            other tool (here `echo`; in practice an `exec` heredoc, `python` code, `create_tool`
+            source, `remember` content) sat verbatim in the assistant message. Real daemon log:
+            `Tier 3: hard limit exceeded, truncating estimated_tokens=56168 hard_limit=12288`
+            against an actual request of ~1.6k tokens — the hard cap dropped the call and left an
+            orphaned result "whose request was compressed out". Now any argument over the same
+            bound a single tool RESULT gets (`context_share_chars`: a quarter of the input budget,
+            shared by both) is replaced by an outcome-neutral placeholder once the call is stored;
+            the tool still receives the full arguments. **Second, independent defect on the same
+            path:** with memory disabled, a memory-targeted result has no sink and fell through to
+            the whole result verbatim — now it takes the context path's own bounded compaction.
+            Real daemon after the fix: no Tier 3 at all. e2e
+            `a_huge_tool_argument_does_not_evict_the_call_that_made_it` fails when either half is
+            removed; 2 unit tests. The e2e stub now answers `/api/show` like a 32K tool-calling
+            model, so every scripted test sizes context as a real model would.
       - [ ] **Owner call: does Stop abandon the stopped request, or pause it?** Found by the probe
             behind the test above. `finish_turn` demotes a stopped turn's items to pending, and its
             comment says "the next message decides what happens to them" — but the harness simply
