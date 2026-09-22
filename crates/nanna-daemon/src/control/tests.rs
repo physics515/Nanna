@@ -1030,6 +1030,107 @@ async fn a_change_the_environment_does_not_undo_is_made() {
     );
 }
 
+/// A secret the environment supplies is never filed, even when a change
+/// brings it in. The running config can hold another value for it: a
+/// plaintext secret `config.toml` held at boot, which the load keeps over a
+/// variable it only fills from (`BRAVE_API_KEY`). A reset, or an import or a
+/// `config.set` of the environment's own value, then brings the
+/// environment's value in over it. None of them is refused, since the next
+/// load keeps that value, and each filed it: the copy then outlived its
+/// variable.
+#[tokio::test]
+async fn a_secret_the_environment_supplies_is_never_filed() {
+    use nanna_config::credentials::keys;
+    let mut import = Config::default();
+    import.tools.brave_api_key = Some("brave-from-the-environment".to_string());
+    for (label, change, status) in [
+        ("reset", ConfigAction::Reset { path: None }, "reset"),
+        (
+            "set",
+            ConfigAction::Set {
+                path: "tools.brave_api_key".into(),
+                value: json!("brave-from-the-environment"),
+            },
+            "updated",
+        ),
+        (
+            "import",
+            ConfigAction::Import {
+                config: serde_json::to_value(&import).expect("json"),
+            },
+            "imported",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut cp, store) = persisting_control_plane(dir.path());
+        cp.environment = environment(&[("BRAVE_API_KEY", "brave-from-the-environment")]);
+        cp.config.write().await.tools.brave_api_key = Some("brave-from-config-toml".to_string());
+        let cp = Arc::new(cp);
+
+        let resp = cp.handle("test", Action::Config(change)).await;
+
+        assert_eq!(resp["status"], status, "{label}: {resp}");
+        assert!(
+            !store.exists(keys::BRAVE_API_KEY),
+            "{label}: the environment's is never filed"
+        );
+        assert_eq!(
+            cp.config.read().await.tools.brave_api_key.as_deref(),
+            Some("brave-from-the-environment"),
+            "{label}: and runs"
+        );
+        assert_running_is_the_next_load(&cp, dir.path(), label).await;
+    }
+}
+
+/// A reset builds a channel from the environment when its bot token is
+/// exported (`with_env_overrides`), and so brings the token in over a running
+/// config without that channel: one whose section a `config.set` just
+/// removed, before the watcher reads the save back and the load builds it
+/// again. The reset filed the token, which then outlived its variable.
+#[tokio::test]
+async fn a_reset_never_files_a_channel_the_environment_builds() {
+    use nanna_config::credentials::keys;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut cp, store) = persisting_control_plane(dir.path());
+    cp.environment = environment(&[("TELEGRAM_BOT_TOKEN", "telegram-from-the-environment")]);
+    boot_from(&cp, dir.path(), &Config::default()).await;
+    let cp = Arc::new(cp);
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "channels.telegram".into(),
+                value: json!(null),
+            }),
+        )
+        .await;
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert!(cp.config.read().await.channels.telegram.is_none());
+
+    let resp = cp
+        .handle("test", Action::Config(ConfigAction::Reset { path: None }))
+        .await;
+
+    assert_eq!(resp["status"], "reset", "{resp}");
+    assert!(
+        !store.exists(keys::TELEGRAM_BOT_TOKEN),
+        "the environment's is never filed"
+    );
+    assert_eq!(
+        cp.config
+            .read()
+            .await
+            .channels
+            .telegram
+            .as_ref()
+            .map(|telegram| telegram.bot_token.as_str()),
+        Some("telegram-from-the-environment"),
+        "and runs"
+    );
+    assert_running_is_the_next_load(&cp, dir.path(), "reset").await;
+}
+
 /// Negative space: with no memory configured at all, consolidation reports the
 /// missing store rather than reaching the dreaming gate.
 #[tokio::test]
