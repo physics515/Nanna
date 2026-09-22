@@ -1,15 +1,15 @@
 {
-  "version": "0.3.26",
-  "notes": "Chat now falls back to the next model in your list when the first one fails, and tools you create survive a restart. Keys and bot tokens stay out of config.toml, in your secure store, and a key you change, clear or reset stays that way.",
-  "pub_date": "2026-09-21T22:37:12Z",
+  "version": "0.3.27",
+  "notes": "A key your environment supplies, such as BRAVE_API_KEY, is no longer copied into your secure store when you reset, import or change your settings.",
+  "pub_date": "2026-09-22T05:31:32Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXJtci9Hd05keXFvQVZPNzFJWE9sL3QzeWpTeFQ1SC9XaXlQckN5VU1rcnpBejhZUjJZejhDMUwrM2syK2RSUFFRWEZkNnBnSHhTK24vazJ0c1pCWVE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDMwMjAzCWZpbGU6TmFubmFfMC4zLjI2X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMjYKMkxMeWV3N2FoU0ZSYnJVMExFNHY4ek5QNWpRUGtqdlNZeUVia09WVmZMK0lxSHFyazUva2llZ3RSU2I3d2RyUUpYL0VEZkhVRnJhZit3VWp5NUJMRHc9PQo=",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.26-beta.35/Nanna_0.3.26_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaW9iOXRjcFhBeHpEbUI3OThZdlNSaTBBcHR2SWFxa1VWbGtjUitRUTNmbDJCb1hIS1FONXRKa2x5M1FjRlU4NWpkVkZ1WFNlUTVQU285cS9FKzk4VXcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDU1MDYzCWZpbGU6TmFubmFfMC4zLjI3X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMjcKNGZDOFNCNE8xYXFHVDdVZkgvWlRaNlFFaFVLS2F0WVc0dGxZRitXbmJwVlYyeWxRMXJXNml2NTJWYWdyY1l0R3FoQ2N0ZzZWKy90ZE80TkcwcmY4Q1E9PQo=",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.27-beta.36/Nanna_0.3.27_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXBTeHhydjNudjlrVmpsV0dZcmRkR3lBVXQ5bW5rSXFEVlp4WFZRaVU4UEZ0T0ovNGFUSHppUnAzcnNFL21nb2NIcG5RWk1qQ0hkR091RWt4K1BlZmdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDI4MzU5CWZpbGU6TmFubmFfMC4zLjI2X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjI2Ck9uRjNXR0pwK0E1V0kyenhTd2lxcjQwaXNDOTl2dHdLQ3RKUEpaMFlJQm92WUdlOUNsNm80d2gwdDJuVnRCZU9BRHk5eXM4SitQWVlWOXI3YWxmY0FRPT0K",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.26-beta.35/Nanna_0.3.26_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXJLWnBDNHhpOEFvK202ZDNSb3lKNi9xMlc5VkRmenhBNzRDdHJMSWtyZEFvNDY5TjRSNmJhQkRDWXVuYmo3R3lud2o4MXkwZytNRnNXaUpLbEU1OGdJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMDUzMzc4CWZpbGU6TmFubmFfMC4zLjI3X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjI3CkZ0MllaU1ZCNVJQWENvSCswMzMyNTl3bjBKSCs2cGtzMmxZVHlmazhYSHprNXk4WHV6Y3B1WkRyNkhXcHB4NDBBWnNDUGxOUlRSeGRCU1M2a0V0ekJ3PT0K",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.27-beta.36/Nanna_0.3.27_amd64.AppImage"
     }
   }
 }
