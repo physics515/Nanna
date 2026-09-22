@@ -506,10 +506,13 @@ impl ControlPlane {
     /// here worked until the next load — a restart, or the config watcher
     /// reading the save back seconds later — and was gone.
     ///
-    /// Only those (`Config::file_secrets_brought_in`): the running config
-    /// also holds the secrets the environment supplied at load, and one of
-    /// those filed with a change outlived its variable — unset or rotated,
-    /// and the next start ran on the stale copy.
+    /// Only those, and none the daemon's environment supplies
+    /// (`Config::file_secrets_brought_in`): the running config also holds the
+    /// secrets the environment supplied at load, and a change can bring one
+    /// in over another value the running config held, or none — a reset or an
+    /// import rebuilt with the environment's overrides, or a set of the
+    /// environment's own value. One of those filed with a change outlived its
+    /// variable — unset or rotated, and the next start ran on the stale copy.
     ///
     /// Only for a control plane that saves: with no config path nothing it
     /// changes outlives it, secrets included. Called with the config write
@@ -533,8 +536,10 @@ impl ControlPlane {
         }
         let (filing, previous) = (changed.clone(), previous.clone());
         let store = self.credential_store.clone();
-        let filed =
-            tokio::task::spawn_blocking(move || filing.file_secrets_brought_in(&previous, &store));
+        let env = Arc::clone(&self.environment);
+        let filed = tokio::task::spawn_blocking(move || {
+            filing.file_secrets_brought_in(&previous, &store, &*env)
+        });
         match filed.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(format!("the secure store refused a secret: {e}")),

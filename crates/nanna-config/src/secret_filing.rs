@@ -15,6 +15,9 @@
 //! [`Config::secrets_the_environment_replaces`] names each such secret a
 //! change brings in, and the variable it comes from, so that the change can
 //! be refused instead of undone seconds after it answered that it was made.
+//! Nor is one ever filed ([`Config::file_secrets_brought_in`]): the next load
+//! takes it from its variable whatever the store holds, and a copy filed
+//! there would only outlive that variable.
 
 use std::collections::BTreeMap;
 
@@ -175,18 +178,31 @@ impl Config {
 
     /// File in `store` the secrets this config brings in over `previous`
     /// ([`Self::brings_in_secrets`]), as [`Self::file_secrets_in`] files
-    /// them, and no other: this config is left as it is.
+    /// them, but none the environment `env` supplies, and no other: this
+    /// config is left as it is.
     ///
     /// For a change of a running config that is then saved (the daemon's
     /// `config.set`, reset and import). Besides the secrets entered with the
-    /// change, a running config holds ones the environment supplied at load,
-    /// which are never filed: filed, one outlives its variable — unset or
-    /// rotated, and the next start runs on the stale copy — and a secret only
-    /// ever exported is on disk. The rest it holds are filed already.
+    /// change, a running config holds ones the environment supplied at load;
+    /// the rest it holds are filed already. A secret the environment supplies
+    /// is never filed: filed, one outlives its variable — unset or rotated,
+    /// and the next start runs on the stale copy — and a secret only ever
+    /// exported is on disk.
+    ///
+    /// A change can bring one in, too. The running config may hold another
+    /// value for it, or none: a plaintext secret `config.toml` held at boot,
+    /// which the load keeps over a variable it only fills from, or a channel
+    /// whose section was just removed. A reset or an import, rebuilt with the
+    /// environment's overrides, or a set of the environment's own value, then
+    /// brings the environment's value in. So every secret the next load of
+    /// this config takes from `env` ([`Self::env_supplied_secrets`]) is left
+    /// out, whatever value it is brought in with; a change bringing in one
+    /// the environment would replace is refused before it gets here
+    /// ([`Self::secrets_the_environment_replaces`]).
     ///
     /// A config that cannot be serialized, and so cannot say which it brings
-    /// in, files every secret it holds: an unneeded filing costs a store
-    /// write, a missed one costs the secret.
+    /// in, files every secret it holds, the environment's included: an
+    /// unneeded filing costs a store write, a missed one costs the secret.
     ///
     /// # Errors
     ///
@@ -195,9 +211,14 @@ impl Config {
         &self,
         previous: &Self,
         store: &SecureStore,
+        env: impl Fn(&str) -> Option<String>,
     ) -> Result<(), CredentialError> {
         self.brought_in_secrets(previous)
-            .and_then(|brought_in| self.holding_only(&brought_in))
+            .and_then(|mut brought_in| {
+                let supplied = self.env_supplied_secrets(&env);
+                brought_in.retain(|path, _| !supplied.contains_key(path));
+                self.holding_only(&brought_in)
+            })
             .as_ref()
             .unwrap_or(self)
             .file_secrets_in(store)
@@ -290,8 +311,8 @@ fn is_blank(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::EnvSuppliedSecret;
-    use crate::Config;
     use crate::credentials::{SecureStore, keys};
+    use crate::{Config, UnboundOllamaToken};
 
     /// A hermetic store: its own directory, never the OS keyring.
     fn store() -> (tempfile::TempDir, SecureStore) {
@@ -592,7 +613,7 @@ mod tests {
         let held = changed.held_secrets().expect("serializes");
 
         changed
-            .file_secrets_brought_in(&previous, &store)
+            .file_secrets_brought_in(&previous, &store, no_env)
             .expect("filed");
 
         assert_eq!(
@@ -616,6 +637,55 @@ mod tests {
         );
     }
 
+    /// A secret the environment supplies is never filed, though a change
+    /// brings it in: a reset or an import, rebuilt with the environment's
+    /// overrides over a running config holding other values, brings in the
+    /// environment's. Filed, each copy would outlive its variable. Here every
+    /// secret is brought in at its variable's value, with a Discord channel
+    /// the overrides build, and nothing is filed.
+    #[test]
+    fn a_secret_the_environment_supplies_is_never_filed() {
+        let previous = holding_every_secret();
+        let every_variable = |variable: &str| Some(format!("from-{variable}"));
+        let mut rebuilt = previous.clone();
+        rebuilt.strip_secrets_for_disk();
+        rebuilt.fill_secrets(None, &every_variable, UnboundOllamaToken::Configured);
+        let rebuilt = rebuilt.with_env_overrides_from(every_variable);
+        let brought_in = rebuilt.brought_in_secrets(&previous).expect("serializes");
+        for path in previous.held_secrets().expect("serializes").keys() {
+            assert!(brought_in.contains_key(path), "{path} is brought in");
+        }
+        assert!(brought_in.contains_key("channels.discord.bot_token"));
+        let (_dir, store) = store();
+
+        rebuilt
+            .file_secrets_brought_in(&previous, &store, every_variable)
+            .expect("filed");
+
+        assert!(store.list_keys().is_empty(), "{:?}", store.list_keys());
+        assert!(!store.exists(keys::OLLAMA_API_KEY_HOST));
+    }
+
+    /// Only what the environment supplies is left out: a change bringing in
+    /// the environment's Brave key and a new GitHub token files the token.
+    #[test]
+    fn only_the_secrets_the_environment_supplies_are_left_out() {
+        let (_dir, store) = store();
+        let previous = holding_every_secret();
+        let mut changed = previous.clone();
+        changed.tools.brave_api_key = Some("brave-from-the-environment".to_string());
+        changed.llm.github_token = Some("ghp-rotated".to_string());
+        let only_brave = |variable: &str| {
+            (variable == "BRAVE_API_KEY").then(|| "brave-from-the-environment".to_string())
+        };
+
+        changed
+            .file_secrets_brought_in(&previous, &store, only_brave)
+            .expect("filed");
+
+        assert_eq!(store.list_keys(), [keys::GITHUB_TOKEN]);
+    }
+
     /// The Ollama token is brought in by a move to another server, and is
     /// filed for that one.
     #[test]
@@ -629,7 +699,7 @@ mod tests {
         moved.memory.ollama_host = "https://b.example/ollama".to_string();
 
         moved
-            .file_secrets_brought_in(&previous, &store)
+            .file_secrets_brought_in(&previous, &store, no_env)
             .expect("filed");
 
         assert_eq!(store.list_keys(), [keys::OLLAMA_API_KEY]);
