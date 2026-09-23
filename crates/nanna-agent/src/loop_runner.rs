@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 use tracing::{Instrument as _, debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::numeric::{f32_to_usize, millis_u64, usize_to_f32};
+use crate::numeric::{usize_from_f32, millis_u64, f32_from_usize};
 
 /// Core tools always sent to the LLM. Everything else is discoverable via `discover_tools`.
 const CORE_TOOL_NAMES: &[&str] = &["remember", "recall", "reflect", "discover_tools"];
@@ -9026,8 +9026,8 @@ impl Agent {
 
         // Calculate base confidence
         let base_confidence = match uncertain_count.cmp(&confident_count) {
-            std::cmp::Ordering::Greater => usize_to_f32(uncertain_count).mul_add(-0.1, 0.5),
-            std::cmp::Ordering::Less => usize_to_f32(confident_count).mul_add(0.05, 0.8),
+            std::cmp::Ordering::Greater => f32_from_usize(uncertain_count).mul_add(-0.1, 0.5),
+            std::cmp::Ordering::Less => f32_from_usize(confident_count).mul_add(0.05, 0.8),
             std::cmp::Ordering::Equal => 0.7, // Neutral
         };
 
@@ -9074,11 +9074,11 @@ impl Agent {
         // Calculate intensity based on punctuation and caps
         let exclamations = user_text.matches('!').count();
         let _questions = user_text.matches('?').count(); // Reserved for future use
-        let caps_ratio = usize_to_f32(user_text.chars().filter(|c| c.is_uppercase()).count())
-            / usize_to_f32(user_text.len().max(1));
+        let caps_ratio = f32_from_usize(user_text.chars().filter(|c| c.is_uppercase()).count())
+            / f32_from_usize(user_text.len().max(1));
 
         let intensity =
-            usize_to_f32(max_matches).mul_add(0.1, caps_ratio.mul_add(0.3, usize_to_f32(exclamations).mul_add(0.1, 0.3)))
+            f32_from_usize(max_matches).mul_add(0.1, caps_ratio.mul_add(0.3, f32_from_usize(exclamations).mul_add(0.1, 0.3)))
                 .clamp(0.0, 1.0);
 
         // Suggest tone adjustment
@@ -9875,7 +9875,7 @@ fn semantic_chunk(text: &str, target_chars: usize, overlap_pct: f32) -> Vec<(usi
     if text.len() <= target_chars {
         return vec![(0, text.to_string())];
     }
-    let overlap = f32_to_usize(usize_to_f32(target_chars) * overlap_pct);
+    let overlap = usize_from_f32(f32_from_usize(target_chars) * overlap_pct);
     let step = target_chars.saturating_sub(overlap).max(1);
     let mut chunks = Vec::new();
     let mut pos = 0;

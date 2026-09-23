@@ -115,8 +115,7 @@ async fn fetch_agents(backend: &Backend) -> Vec<AgentInfo> {
     result
         .get("sub_sessions")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(sub_session_to_agent).collect())
-        .unwrap_or_default()
+        .map_or_default(|arr| arr.iter().filter_map(sub_session_to_agent).collect())
 }
 
 // =============================================================================

@@ -1,9 +1,13 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+// Solver depth only, as on the daemon crate roots: proving these futures
+// `Send` walks the wgpu/daemon type graph past the default limit of 128.
+#![recursion_limit = "256"]
 //! GPU vs SIMD Crossover Benchmark
 //!
 //! Measures the crossover point where GPU batch cosine similarity
 //! becomes faster than SIMD for various vector counts and dimensions.
 //!
-//! Run with: cargo bench -p nanna-gpu --bench gpu_vs_simd
+//! Run with: cargo bench -p nanna-gpu --bench `gpu_vs_simd`
 
 use std::time::{Duration, Instant};
 
@@ -42,7 +46,7 @@ fn generate_vectors(count: usize, dim: usize) -> Vec<Vec<f32>> {
                     let mut h = DefaultHasher::new();
                     (i * dim + j).hash(&mut h);
                     let bits = h.finish();
-                    (bits as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32
+                    nanna_numeric::f32_from_f64((nanna_numeric::f64_from_u64(bits) / nanna_numeric::f64_from_u64(u64::MAX)).mul_add(2.0, -1.0))
                 })
                 .collect();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -112,18 +116,18 @@ struct BenchResult {
 
 impl BenchResult {
     fn from_durations(times: &[Duration]) -> Self {
-        let nanos: Vec<f64> = times.iter().map(|t| t.as_nanos() as f64).collect();
-        let mean = nanos.iter().sum::<f64>() / nanos.len() as f64;
-        let variance = nanos.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / nanos.len() as f64;
+        let nanos: Vec<f64> = times.iter().map(|t| t.as_secs_f64() * 1e9).collect();
+        let mean = nanos.iter().sum::<f64>() / nanna_numeric::f64_from_usize(nanos.len());
+        let variance = nanos.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / nanna_numeric::f64_from_usize(nanos.len());
         let stddev = variance.sqrt();
-        let min = nanos.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = nanos.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min = nanos.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = nanos.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         Self {
-            mean: Duration::from_nanos(mean as u64),
-            stddev: Duration::from_nanos(stddev as u64),
-            min: Duration::from_nanos(min as u64),
-            max: Duration::from_nanos(max as u64),
+            mean: Duration::from_secs_f64(mean / 1e9),
+            stddev: Duration::from_secs_f64(stddev / 1e9),
+            min: Duration::from_secs_f64(min / 1e9),
+            max: Duration::from_secs_f64(max / 1e9),
         }
     }
 }
@@ -141,13 +145,13 @@ impl std::fmt::Display for BenchResult {
 fn format_duration_short(d: Duration) -> String {
     let nanos = d.as_nanos();
     if nanos < 1_000 {
-        format!("{}ns", nanos)
+        format!("{nanos}ns")
     } else if nanos < 1_000_000 {
-        format!("{:.1}µs", nanos as f64 / 1_000.0)
+        format!("{:.1}µs", d.as_secs_f64() * 1e6)
     } else if nanos < 1_000_000_000 {
-        format!("{:.2}ms", nanos as f64 / 1_000_000.0)
+        format!("{:.2}ms", d.as_secs_f64() * 1e3)
     } else {
-        format!("{:.3}s", nanos as f64 / 1_000_000_000.0)
+        format!("{:.3}s", d.as_secs_f64())
     }
 }
 
@@ -226,7 +230,7 @@ fn main() {
                     );
 
                     let speedup =
-                        simd_result.mean.as_nanos() as f64 / gpu_result.mean.as_nanos() as f64;
+                        simd_result.mean.as_secs_f64() * 1e9 / gpu_result.mean.as_secs_f64() * 1e9;
                     let gpu_faster = speedup > 1.0;
 
                     if gpu_faster && !prev_gpu_faster {
@@ -245,13 +249,10 @@ fn main() {
                 _ => (None, "SIMD (no GPU)".to_string()),
             };
 
-            let gpu_str = gpu_result
-                .map(|r| format!("{r}"))
-                .unwrap_or_else(|| "N/A".to_string());
+            let gpu_str = gpu_result.map_or_else(|| "N/A".to_string(), |r| format!("{r}"));
 
             println!(
-                "│ {:>7} │ {:>6} │ {simd_result} │ {gpu_str:>32} │ {winner:>8} │",
-                count, dim
+                "│ {count:>7} │ {dim:>6} │ {simd_result} │ {gpu_str:>32} │ {winner:>8} │"
             );
         }
 
@@ -261,12 +262,21 @@ fn main() {
     println!("└─────────┴────────┴──────────────────────────────────┴──────────────────────────────────┴──────────┘");
     println!();
 
+    print_analysis(&crossover_points, ctx.is_some());
+
+    if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
+        measure_gpu_overhead(&rt, ctx, pipeline);
+    }
+}
+
+/// Where the GPU overtook SIMD, and what that says about `GPU_THRESHOLD`.
+fn print_analysis(crossover_points: &[(usize, usize)], gpu_available: bool) {
     // ── Analysis ───────────────────────────────────────────────────
     println!("═══ Analysis ═══");
     println!();
 
     if crossover_points.is_empty() {
-        if ctx.is_some() {
+        if gpu_available {
             println!("GPU never became faster than SIMD in the tested range.");
             println!("The current threshold of 1000 vectors may be too low.");
             println!("Consider increasing GPU_THRESHOLD or removing GPU dispatch.");
@@ -275,7 +285,7 @@ fn main() {
         }
     } else {
         println!("Crossover points (where GPU becomes faster):");
-        for (dim, count) in &crossover_points {
+        for (dim, count) in crossover_points {
             println!("  dim={dim}: ~{count} vectors");
         }
 
@@ -294,7 +304,7 @@ fn main() {
             );
             println!(
                 "  This would enable GPU acceleration for {:.0}% more searches.",
-                ((1000 - min_crossover) as f64 / 1000.0) * 100.0
+                (nanna_numeric::f64_from_usize(1000 - min_crossover) / 1000.0) * 100.0
             );
         } else {
             println!(
@@ -303,46 +313,50 @@ fn main() {
             println!("  Consider raising to {min_crossover} for safety margin.");
         }
     }
+}
 
-    // ── GPU overhead measurement ───────────────────────────────────
-    if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
-        println!();
-        println!("═══ GPU Fixed Overhead ═══");
-        println!();
+/// The fixed cost of one GPU dispatch, against one SIMD cosine of the same size.
+fn measure_gpu_overhead(
+    rt: &tokio::runtime::Runtime,
+    ctx: &nanna_gpu::GpuContext,
+    pipeline: &nanna_gpu::CosineSimilaritySearch,
+) {
+    println!();
+    println!("═══ GPU Fixed Overhead ═══");
+    println!();
 
-        // Measure GPU overhead with minimal work (1 vector)
-        let query = &generate_vectors(1, 768)[0];
-        let single_vec = flatten_vectors(&generate_vectors(1, 768));
+    // Measure GPU overhead with minimal work (1 vector)
+    let query = &generate_vectors(1, 768)[0];
+    let single_vec = flatten_vectors(&generate_vectors(1, 768));
 
-        let overhead = bench_async(
-            &rt,
-            || gpu_batch_search(pipeline, ctx, query, &single_vec),
-            5,
-            50,
-        );
+    let overhead = bench_async(
+        rt,
+        || gpu_batch_search(pipeline, ctx, query, &single_vec),
+        5,
+        50,
+    );
 
-        println!(
-            "GPU dispatch overhead (1 vector, 768-dim): {}",
-            format_duration_short(overhead.mean)
-        );
-        println!("  This is the fixed cost of: buffer upload + shader dispatch + readback");
-        println!("  GPU only wins when compute savings exceed this overhead.");
-        println!();
+    println!(
+        "GPU dispatch overhead (1 vector, 768-dim): {}",
+        format_duration_short(overhead.mean)
+    );
+    println!("  This is the fixed cost of: buffer upload + shader dispatch + readback");
+    println!("  GPU only wins when compute savings exceed this overhead.");
+    println!();
 
-        // Compare to SIMD for the same trivial case
-        let single_vecs = generate_vectors(1, 768);
-        let simd_single = bench_fn(
-            || simd_cosine_similarity(query, &single_vecs[0]),
-            5,
-            50,
-        );
-        println!(
-            "SIMD single cosine similarity (768-dim): {}",
-            format_duration_short(simd_single.mean)
-        );
-        println!(
-            "GPU/SIMD overhead ratio: {:.0}×",
-            overhead.mean.as_nanos() as f64 / simd_single.mean.as_nanos() as f64
-        );
-    }
+    // Compare to SIMD for the same trivial case
+    let single_vecs = generate_vectors(1, 768);
+    let simd_single = bench_fn(
+        || simd_cosine_similarity(query, &single_vecs[0]),
+        5,
+        50,
+    );
+    println!(
+        "SIMD single cosine similarity (768-dim): {}",
+        format_duration_short(simd_single.mean)
+    );
+    println!(
+        "GPU/SIMD overhead ratio: {:.0}×",
+        overhead.mean.as_secs_f64() * 1e9 / simd_single.mean.as_secs_f64() * 1e9
+    );
 }

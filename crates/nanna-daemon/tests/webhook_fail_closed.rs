@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! The inbound webhook surface must fail CLOSED.
 //!
 //! These drive the **real** `WebhookServer` over a real TCP socket with a real

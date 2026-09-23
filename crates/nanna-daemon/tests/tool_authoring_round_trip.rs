@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! An agent can author a tool and call it in the same run.
 //!
 //! The three authoring skills (`create_tool`, `edit_tool`, `list_user_tools`)

@@ -28,6 +28,7 @@ name = "threshold_benchmark"
 harness = false
 
 [dev-dependencies]
+nanna-numeric = { path = "../nanna-numeric" }
 nanna-simd = { path = "../nanna-simd" }
 tokio = { version = "1.53", features = ["full"] }
 criterion = { version = "0.8", features = ["html_reports"] }

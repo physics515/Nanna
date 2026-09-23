@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Ghost Vectors regression: deleting a memory must destroy its embedding on disk.
 //!
 //! An embedding is invertible back to its source text by a Vec2Text-class model
@@ -20,8 +21,8 @@ use turso::Builder;
 /// occur by chance elsewhere in the database file (a 384-byte ramp). `seed`
 /// shifts the ramp so callers can mint several mutually-distinct sentinels.
 fn sentinel_embedding_seeded(seed: f32) -> Vec<f32> {
-    (0..96)
-        .map(|i| (i as f32) * 7.531_9 + 3.140_1 + seed * 101.7)
+    (0..96_u16)
+        .map(|i| seed.mul_add(101.7, f32::from(i).mul_add(7.531_9, 3.140_1)))
         .collect()
 }
 
@@ -92,7 +93,7 @@ fn temp_db_path(tag: &str) -> (std::path::PathBuf, String) {
     let dir = std::env::temp_dir().join(format!(
         "nanna_ghost_{tag}_{}_{:p}",
         std::process::id(),
-        &tag as *const _
+        &raw const tag
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -249,11 +250,12 @@ async fn raw_delete_leaves_embedding_on_disk() {
 
     // Reopen with a bare turso connection and issue a plain DELETE — no overwrite.
     {
-        let db = Builder::new_local(&db_path)
+        let conn = Builder::new_local(&db_path)
             .build()
             .await
-            .expect("reopen raw");
-        let conn = db.connect().expect("connect raw");
+            .expect("reopen raw")
+            .connect()
+            .expect("connect raw");
         conn.execute("DELETE FROM memories WHERE memory_id = ?1", ["ghost-1"])
             .await
             .expect("raw delete");

@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Source-tree guard: every `.rs` file under a crate's `src/` must be reachable
 //! from that crate's root module.
 //!
@@ -143,7 +144,7 @@ fn walk(entry: &Path, depth: usize, reached: &mut BTreeSet<PathBuf>) {
     let Ok(source) = std::fs::read_to_string(entry) else {
         return;
     };
-    let dir = entry.parent().unwrap_or(Path::new("."));
+    let dir = entry.parent().unwrap_or_else(|| Path::new("."));
     let stem = entry.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     // `lib.rs`/`main.rs`/`mod.rs` own their own directory; any other file owns
     // a subdirectory named after it.

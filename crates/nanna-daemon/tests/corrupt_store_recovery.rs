@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Boot-level corruption recovery.
 //!
 //! A `nanna.db` whose memories table has page-level corruption (a zeroed

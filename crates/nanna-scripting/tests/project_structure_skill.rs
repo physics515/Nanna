@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Behavioral tests for the `project_structure` default skill, executed for
 //! real through the Boa engine with a bridge scoped to a temp directory.
 //!
@@ -5,7 +6,7 @@
 //! walk was unbounded. `buildTree` recursed with a per-directory
 //! `Nanna.listDir(dirPath, false)` down to `max_depth` with no noise-dir skip
 //! list and no entry budget, so a real workspace marshalled every entry under
-//! node_modules/.git/target into Boa as its own JS object — and then READ every
+//! `node_modules/.git/target` into Boa as its own JS object — and then READ every
 //! text file under 1 MB and `split("\n")` it to report a line count, the single
 //! most expensive operation in this engine. A longer declared deadline (120s
 //! rather than the 30s default) is more rope, not a bound, and an overrun
@@ -38,7 +39,7 @@ fn skill_path() -> PathBuf {
         .join("../nanna-tools/default-skills/project_structure/tool.ts")
 }
 
-/// Execute the real project_structure tool.ts against `input`, sandboxed to
+/// Execute the real `project_structure` tool.ts against `input`, sandboxed to
 /// `dir`.
 ///
 /// The 120s timeout mirrors production: `ScriptedSkill::from_file` applies the
@@ -352,10 +353,10 @@ async fn missing_path_returns_structured_failure_not_a_throw() {
 }
 
 /// Manual timing check against a REAL large tree (the nanna repo root,
-/// including node_modules/.git/target — the workspace shape that produced
+/// including `node_modules/.git/target` — the workspace shape that produced
 /// nothing at all before this was bounded). Ignored by default: wall-time on a
 /// shared box is not a stable assertion.
-/// Run: cargo test -p nanna-scripting --features boa --test project_structure_skill \
+/// Run: cargo test -p nanna-scripting --features boa --test `project_structure_skill` \
 ///        -- --ignored --nocapture timing
 #[tokio::test]
 #[ignore = "manual timing check against the real repo tree"]

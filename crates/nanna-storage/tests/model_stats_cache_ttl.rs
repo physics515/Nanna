@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Migration 015: the 1-hour share of prompt-cache writes is persisted beside the
 //! write total, so a restarted daemon still prices those writes at 2x input.
 

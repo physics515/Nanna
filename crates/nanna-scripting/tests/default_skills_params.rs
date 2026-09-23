@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Real-data guard: every shipped default skill's `parameters` block must
 //! normalize into a valid JSON-Schema object via `extract_manifest`, so the
 //! LLM-facing tool definitions carry real input schemas (not empty lists).
@@ -50,8 +51,7 @@ fn every_default_skill_parameters_block_parses() {
             assert!(
                 params
                     .get("properties")
-                    .map(|p| p.is_object())
-                    .unwrap_or(false)
+                    .is_some_and(serde_json::Value::is_object)
                     || params.get("type").is_some(),
                 "parameters schema missing properties/type: {}",
                 tool_ts.display()

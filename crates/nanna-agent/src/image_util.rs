@@ -8,7 +8,7 @@ use image::ImageFormat;
 use std::io::Cursor;
 use tracing::{debug, warn};
 
-use crate::numeric::{f32_to_u32, u64_to_f32};
+use crate::numeric::{u32_from_f32, f32_from_u64};
 
 /// Maximum image size (in decoded bytes) per provider.
 /// Returns the limit for the given provider prefix, defaulting to the
@@ -95,8 +95,8 @@ pub fn fit_image_to_limit(
         let resized = if (scale - 1.0).abs() < f32::EPSILON {
             img.clone()
         } else {
-            let new_w = f32_to_u32(u64_to_f32(u64::from(img.width())) * scale);
-            let new_h = f32_to_u32(u64_to_f32(u64::from(img.height())) * scale);
+            let new_w = u32_from_f32(f32_from_u64(u64::from(img.width())) * scale);
+            let new_h = u32_from_f32(f32_from_u64(u64::from(img.height())) * scale);
             img.resize(
                 new_w.max(1),
                 new_h.max(1),

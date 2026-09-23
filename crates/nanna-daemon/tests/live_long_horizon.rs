@@ -1,3 +1,7 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+// Solver depth only, as on the daemon crate roots: proving these futures
+// `Send` walks the wgpu/daemon type graph past the default limit of 128.
+#![recursion_limit = "256"]
 //! Live long-horizon eval suite (P14): the real harness driving a real local
 //! model with machine-run acceptance checks.
 //!
@@ -39,7 +43,7 @@ fn eval_model_is_ollama() -> bool {
     ProviderId::from_model(&eval_model()) == ProviderId::Ollama
 }
 
-/// OpenRouter key for cloud eval runs: env override first, then the user's
+/// `OpenRouter` key for cloud eval runs: env override first, then the user's
 /// nanna config.
 fn openrouter_key() -> Option<String> {
     std::env::var("OPENROUTER_API_KEY")
@@ -168,7 +172,7 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         Arc::new(nanna_daemon::tasks::TurnBaselines::new()),
     );
     let loaded = tools.load_skills_with_services(&tools_dir, &services).await;
-    assert!(loaded > 0, "no skills loaded from {tools_dir:?}");
+    assert!(loaded > 0, "no skills loaded from {}", tools_dir.display());
 
     let mut router = LlmRouter::new().with_ollama("http://localhost:11434");
     if let Some(key) = openrouter_key() {
@@ -403,7 +407,7 @@ async fn run_smoke_once() -> (LongHorizonReport, usize, usize) {
     let tasks_total = plan_ids.len();
 
     let config = LongHorizonConfig {
-        max_wall_clock: Duration::from_secs(15 * 60),
+        max_wall_clock: Duration::from_mins(15),
         max_replans_per_item: 1,
         ..LongHorizonConfig::default()
     };
@@ -496,6 +500,7 @@ const MINIDB_GOAL: &str = "Build `minidb`, a key-value store CLI implemented as 
      POSIX sh compatible (no bashisms are required by the tests).";
 
 /// One rung of the feature ladder.
+#[derive(Clone, Copy)]
 struct Feature {
     name: &'static str,
     spec: &'static str,
@@ -505,351 +510,353 @@ struct Feature {
 /// The 42-feature minidb ladder. Each test script is self-contained: it
 /// resets the db, exercises exactly one feature, and exits nonzero with a
 /// FAIL line on the first broken assertion.
-fn minidb_features() -> Vec<Feature> {
-    vec![
-        Feature {
-            name: "usage on no args",
-            spec: "Running `sh ./minidb` with no arguments exits with code 2 and prints a line containing the word 'usage' (any case).",
-            test_body: r#"sh ./minidb >out.txt 2>&1
+const MINIDB_FEATURES: &[Feature] = &[
+    Feature {
+        name: "usage on no args",
+        spec: "Running `sh ./minidb` with no arguments exits with code 2 and prints a line containing the word 'usage' (any case).",
+        test_body: r#"sh ./minidb >out.txt 2>&1
 [ $? -eq 2 ] || fail "exit code should be 2"
 grep -qi usage out.txt || fail "should print usage"
 rm -f out.txt"#,
-        },
-        Feature {
-            name: "help command",
-            spec: "`sh ./minidb help` exits 0 and prints text containing 'minidb' and the word 'set'.",
-            test_body: r#"sh ./minidb help >out.txt 2>&1 || fail "help should exit 0"
+    },
+    Feature {
+        name: "help command",
+        spec: "`sh ./minidb help` exits 0 and prints text containing 'minidb' and the word 'set'.",
+        test_body: r#"sh ./minidb help >out.txt 2>&1 || fail "help should exit 0"
 grep -qi minidb out.txt || fail "help should mention minidb"
 grep -q set out.txt || fail "help should mention set"
 rm -f out.txt"#,
-        },
-        Feature {
-            name: "set and get",
-            spec: "`set <key> <value>` stores a value (exit 0). `get <key>` prints the value and exits 0.",
-            test_body: r#"sh ./minidb set name alice || fail "set should exit 0"
+    },
+    Feature {
+        name: "set and get",
+        spec: "`set <key> <value>` stores a value (exit 0). `get <key>` prints the value and exits 0.",
+        test_body: r#"sh ./minidb set name alice || fail "set should exit 0"
 v=$(sh ./minidb get name) || fail "get should exit 0"
 [ "$v" = "alice" ] || fail "get should print alice, got: $v""#,
-        },
-        Feature {
-            name: "get missing key",
-            spec: "`get` on a key that does not exist prints nothing and exits with code 1.",
-            test_body: r#"out=$(sh ./minidb get nope 2>/dev/null)
+    },
+    Feature {
+        name: "get missing key",
+        spec: "`get` on a key that does not exist prints nothing and exits with code 1.",
+        test_body: r#"out=$(sh ./minidb get nope 2>/dev/null)
 rc=$?
 [ $rc -eq 1 ] || fail "exit code should be 1, got $rc"
 [ -z "$out" ] || fail "should print nothing, got: $out""#,
-        },
-        Feature {
-            name: "set overwrites",
-            spec: "Setting an existing key replaces its value; the file never holds two records for one key.",
-            test_body: r#"sh ./minidb set k first || fail set1
+    },
+    Feature {
+        name: "set overwrites",
+        spec: "Setting an existing key replaces its value; the file never holds two records for one key.",
+        test_body: r#"sh ./minidb set k first || fail set1
 sh ./minidb set k second || fail set2
 v=$(sh ./minidb get k)
 [ "$v" = "second" ] || fail "get should print second, got: $v"
 n=$(grep -c "^k	" "$MINIDB_FILE")
 [ "$n" -eq 1 ] || fail "db should hold exactly one record for k, got $n""#,
-        },
-        Feature {
-            name: "independent keys",
-            spec: "Different keys hold independent values.",
-            test_body: r#"sh ./minidb set a 1 && sh ./minidb set b 2 || fail set
+    },
+    Feature {
+        name: "independent keys",
+        spec: "Different keys hold independent values.",
+        test_body: r#"sh ./minidb set a 1 && sh ./minidb set b 2 || fail set
 [ "$(sh ./minidb get a)" = "1" ] || fail "a should be 1"
 [ "$(sh ./minidb get b)" = "2" ] || fail "b should be 2""#,
-        },
-        Feature {
-            name: "del command",
-            spec: "`del <key>` removes the key (exit 0); a later get exits 1.",
-            test_body: r#"sh ./minidb set k v || fail set
+    },
+    Feature {
+        name: "del command",
+        spec: "`del <key>` removes the key (exit 0); a later get exits 1.",
+        test_body: r#"sh ./minidb set k v || fail set
 sh ./minidb del k || fail "del should exit 0"
 sh ./minidb get k >/dev/null 2>&1
 [ $? -eq 1 ] || fail "get after del should exit 1""#,
-        },
-        Feature {
-            name: "del missing key",
-            spec: "`del` on a missing key exits with code 1.",
-            test_body: r#"sh ./minidb del nothere >/dev/null 2>&1
+    },
+    Feature {
+        name: "del missing key",
+        spec: "`del` on a missing key exits with code 1.",
+        test_body: r#"sh ./minidb del nothere >/dev/null 2>&1
 [ $? -eq 1 ] || fail "del missing should exit 1""#,
-        },
-        Feature {
-            name: "exists command",
-            spec: "`exists <key>` prints nothing; exits 0 when the key is present, 1 when absent.",
-            test_body: r#"sh ./minidb set k v || fail set
+    },
+    Feature {
+        name: "exists command",
+        spec: "`exists <key>` prints nothing; exits 0 when the key is present, 1 when absent.",
+        test_body: r#"sh ./minidb set k v || fail set
 out=$(sh ./minidb exists k) || fail "exists should exit 0 for present key"
 [ -z "$out" ] || fail "exists should print nothing"
 sh ./minidb exists other >/dev/null 2>&1
 [ $? -eq 1 ] || fail "exists should exit 1 for absent key""#,
-        },
-        Feature {
-            name: "count command",
-            spec: "`count` prints the number of stored keys (0 for an empty store) and exits 0.",
-            test_body: r#"[ "$(sh ./minidb count)" = "0" ] || fail "empty count should be 0"
+    },
+    Feature {
+        name: "count command",
+        spec: "`count` prints the number of stored keys (0 for an empty store) and exits 0.",
+        test_body: r#"[ "$(sh ./minidb count)" = "0" ] || fail "empty count should be 0"
 sh ./minidb set a 1 && sh ./minidb set b 2 || fail set
 [ "$(sh ./minidb count)" = "2" ] || fail "count should be 2""#,
-        },
-        Feature {
-            name: "list command",
-            spec: "`list` prints all keys sorted (byte order), one per line.",
-            test_body: r#"sh ./minidb set b 2 && sh ./minidb set a 1 && sh ./minidb set c 3 || fail set
+    },
+    Feature {
+        name: "list command",
+        spec: "`list` prints all keys sorted (byte order), one per line.",
+        test_body: r#"sh ./minidb set b 2 && sh ./minidb set a 1 && sh ./minidb set c 3 || fail set
 got=$(sh ./minidb list)
 want=$(printf 'a\nb\nc')
 [ "$got" = "$want" ] || fail "list should print sorted keys, got: $got""#,
-        },
-        Feature {
-            name: "clear command",
-            spec: "`clear` removes every key (exit 0); count is 0 afterwards.",
-            test_body: r#"sh ./minidb set a 1 && sh ./minidb set b 2 || fail set
+    },
+    Feature {
+        name: "clear command",
+        spec: "`clear` removes every key (exit 0); count is 0 afterwards.",
+        test_body: r#"sh ./minidb set a 1 && sh ./minidb set b 2 || fail set
 sh ./minidb clear || fail "clear should exit 0"
 [ "$(sh ./minidb count)" = "0" ] || fail "count after clear should be 0""#,
-        },
-        Feature {
-            name: "values with spaces",
-            spec: "Values may contain spaces: `set greet \"hello world\"` round-trips exactly.",
-            test_body: r#"sh ./minidb set greet "hello world" || fail set
+    },
+    Feature {
+        name: "values with spaces",
+        spec: "Values may contain spaces: `set greet \"hello world\"` round-trips exactly.",
+        test_body: r#"sh ./minidb set greet "hello world" || fail set
 v=$(sh ./minidb get greet)
 [ "$v" = "hello world" ] || fail "value with spaces should round-trip, got: $v""#,
-        },
-        Feature {
-            name: "case-sensitive keys",
-            spec: "Keys are case-sensitive: Key and key are different entries.",
-            test_body: r#"sh ./minidb set Key A && sh ./minidb set key B || fail set
+    },
+    Feature {
+        name: "case-sensitive keys",
+        spec: "Keys are case-sensitive: Key and key are different entries.",
+        test_body: r#"sh ./minidb set Key A && sh ./minidb set key B || fail set
 [ "$(sh ./minidb get Key)" = "A" ] || fail "Key should be A"
 [ "$(sh ./minidb get key)" = "B" ] || fail "key should be B""#,
-        },
-        Feature {
-            name: "MINIDB_FILE env",
-            spec: "The MINIDB_FILE environment variable selects the database file.",
-            test_body: r#"MINIDB_FILE=./alt_db sh ./minidb set k v || fail set
+    },
+    Feature {
+        name: "MINIDB_FILE env",
+        spec: "The MINIDB_FILE environment variable selects the database file.",
+        test_body: r#"MINIDB_FILE=./alt_db sh ./minidb set k v || fail set
 [ -f ./alt_db ] || fail "alt_db file should exist"
 v=$(MINIDB_FILE=./alt_db sh ./minidb get k)
 [ "$v" = "v" ] || fail "get from alt_db should print v"
 sh ./minidb get k >/dev/null 2>&1
 [ $? -eq 1 ] || fail "default db should not have the key"
 rm -f ./alt_db"#,
-        },
-        Feature {
-            name: "append command",
-            spec: "`append <key> <text>` appends text to the existing value and exits 0.",
-            test_body: r#"sh ./minidb set k ab || fail set
+    },
+    Feature {
+        name: "append command",
+        spec: "`append <key> <text>` appends text to the existing value and exits 0.",
+        test_body: r#"sh ./minidb set k ab || fail set
 sh ./minidb append k cd || fail "append should exit 0"
 [ "$(sh ./minidb get k)" = "abcd" ] || fail "append should concatenate""#,
-        },
-        Feature {
-            name: "append creates missing",
-            spec: "`append` on a missing key creates it with the given text.",
-            test_body: r#"sh ./minidb append fresh xy || fail "append should exit 0"
+    },
+    Feature {
+        name: "append creates missing",
+        spec: "`append` on a missing key creates it with the given text.",
+        test_body: r#"sh ./minidb append fresh xy || fail "append should exit 0"
 [ "$(sh ./minidb get fresh)" = "xy" ] || fail "append should create the key""#,
-        },
-        Feature {
-            name: "incr command",
-            spec: "`incr <key>` increments a numeric value by 1, prints the new value, exits 0.",
-            test_body: r#"sh ./minidb set n 5 || fail set
+    },
+    Feature {
+        name: "incr command",
+        spec: "`incr <key>` increments a numeric value by 1, prints the new value, exits 0.",
+        test_body: r#"sh ./minidb set n 5 || fail set
 out=$(sh ./minidb incr n) || fail "incr should exit 0"
 [ "$out" = "6" ] || fail "incr should print 6, got: $out"
 [ "$(sh ./minidb get n)" = "6" ] || fail "stored value should be 6""#,
-        },
-        Feature {
-            name: "incr creates at 1",
-            spec: "`incr` on a missing key creates it at 1 and prints 1.",
-            test_body: r#"out=$(sh ./minidb incr m) || fail "incr should exit 0"
+    },
+    Feature {
+        name: "incr creates at 1",
+        spec: "`incr` on a missing key creates it at 1 and prints 1.",
+        test_body: r#"out=$(sh ./minidb incr m) || fail "incr should exit 0"
 [ "$out" = "1" ] || fail "incr missing should print 1, got: $out""#,
-        },
-        Feature {
-            name: "incr non-numeric",
-            spec: "`incr` on a non-numeric value exits with code 2 and leaves the value unchanged.",
-            test_body: r#"sh ./minidb set s abc || fail set
+    },
+    Feature {
+        name: "incr non-numeric",
+        spec: "`incr` on a non-numeric value exits with code 2 and leaves the value unchanged.",
+        test_body: r#"sh ./minidb set s abc || fail set
 sh ./minidb incr s >/dev/null 2>&1
 [ $? -eq 2 ] || fail "incr non-numeric should exit 2"
 [ "$(sh ./minidb get s)" = "abc" ] || fail "value should be unchanged""#,
-        },
-        Feature {
-            name: "decr command",
-            spec: "`decr <key>` decrements a numeric value by 1, prints the new value, exits 0.",
-            test_body: r#"sh ./minidb set n 5 || fail set
+    },
+    Feature {
+        name: "decr command",
+        spec: "`decr <key>` decrements a numeric value by 1, prints the new value, exits 0.",
+        test_body: r#"sh ./minidb set n 5 || fail set
 out=$(sh ./minidb decr n) || fail "decr should exit 0"
 [ "$out" = "4" ] || fail "decr should print 4, got: $out""#,
-        },
-        Feature {
-            name: "mset command",
-            spec: "`mset k1 v1 k2 v2 ...` sets several pairs in one call, exit 0.",
-            test_body: r#"sh ./minidb mset a 1 b 2 c 3 || fail "mset should exit 0"
+    },
+    Feature {
+        name: "mset command",
+        spec: "`mset k1 v1 k2 v2 ...` sets several pairs in one call, exit 0.",
+        test_body: r#"sh ./minidb mset a 1 b 2 c 3 || fail "mset should exit 0"
 [ "$(sh ./minidb get a)" = "1" ] || fail a
 [ "$(sh ./minidb get b)" = "2" ] || fail b
 [ "$(sh ./minidb get c)" = "3" ] || fail c"#,
-        },
-        Feature {
-            name: "mget command",
-            spec: "`mget k1 k2 ...` prints each value on its own line, in argument order.",
-            test_body: r#"sh ./minidb set a 1 && sh ./minidb set b 2 || fail set
+    },
+    Feature {
+        name: "mget command",
+        spec: "`mget k1 k2 ...` prints each value on its own line, in argument order.",
+        test_body: r#"sh ./minidb set a 1 && sh ./minidb set b 2 || fail set
 got=$(sh ./minidb mget a b)
 want=$(printf '1\n2')
 [ "$got" = "$want" ] || fail "mget should print values in order, got: $got""#,
-        },
-        Feature {
-            name: "rename command",
-            spec: "`rename <old> <new>` moves the value; old is gone, new holds it. Exit 0.",
-            test_body: r#"sh ./minidb set old v || fail set
+    },
+    Feature {
+        name: "rename command",
+        spec: "`rename <old> <new>` moves the value; old is gone, new holds it. Exit 0.",
+        test_body: r#"sh ./minidb set old v || fail set
 sh ./minidb rename old new || fail "rename should exit 0"
 sh ./minidb get old >/dev/null 2>&1
 [ $? -eq 1 ] || fail "old key should be gone"
 [ "$(sh ./minidb get new)" = "v" ] || fail "new key should hold the value""#,
-        },
-        Feature {
-            name: "rename missing",
-            spec: "`rename` on a missing source key exits with code 1.",
-            test_body: r#"sh ./minidb rename ghost dst >/dev/null 2>&1
+    },
+    Feature {
+        name: "rename missing",
+        spec: "`rename` on a missing source key exits with code 1.",
+        test_body: r#"sh ./minidb rename ghost dst >/dev/null 2>&1
 [ $? -eq 1 ] || fail "rename missing should exit 1""#,
-        },
-        Feature {
-            name: "copy command",
-            spec: "`copy <src> <dst>` duplicates a value; both keys hold it. Exit 0.",
-            test_body: r#"sh ./minidb set src v || fail set
+    },
+    Feature {
+        name: "copy command",
+        spec: "`copy <src> <dst>` duplicates a value; both keys hold it. Exit 0.",
+        test_body: r#"sh ./minidb set src v || fail set
 sh ./minidb copy src dst || fail "copy should exit 0"
 [ "$(sh ./minidb get src)" = "v" ] || fail "src should keep the value"
 [ "$(sh ./minidb get dst)" = "v" ] || fail "dst should hold the value""#,
-        },
-        Feature {
-            name: "search command",
-            spec: "`search <substring>` prints all keys containing the substring, sorted, one per line.",
-            test_body: r#"sh ./minidb mset apple 1 apricot 2 banana 3 || fail mset
+    },
+    Feature {
+        name: "search command",
+        spec: "`search <substring>` prints all keys containing the substring, sorted, one per line.",
+        test_body: r#"sh ./minidb mset apple 1 apricot 2 banana 3 || fail mset
 got=$(sh ./minidb search ap)
 want=$(printf 'apple\napricot')
 [ "$got" = "$want" ] || fail "search ap should print apple+apricot, got: $got""#,
-        },
-        Feature {
-            name: "vgrep command",
-            spec: "`vgrep <substring>` prints all keys whose VALUE contains the substring, sorted.",
-            test_body: r#"sh ./minidb mset a hello b world c hell || fail mset
+    },
+    Feature {
+        name: "vgrep command",
+        spec: "`vgrep <substring>` prints all keys whose VALUE contains the substring, sorted.",
+        test_body: r#"sh ./minidb mset a hello b world c hell || fail mset
 got=$(sh ./minidb vgrep hell)
 want=$(printf 'a\nc')
 [ "$got" = "$want" ] || fail "vgrep hell should print a+c, got: $got""#,
-        },
-        Feature {
-            name: "export command",
-            spec: "`export` prints every record as key<TAB>value lines, sorted by key.",
-            test_body: r#"sh ./minidb set b 2 && sh ./minidb set a 1 || fail set
+    },
+    Feature {
+        name: "export command",
+        spec: "`export` prints every record as key<TAB>value lines, sorted by key.",
+        test_body: r#"sh ./minidb set b 2 && sh ./minidb set a 1 || fail set
 got=$(sh ./minidb export)
 want=$(printf 'a\t1\nb\t2')
 [ "$got" = "$want" ] || fail "export should print sorted TSV, got: $got""#,
-        },
-        Feature {
-            name: "import command",
-            spec: "`import <file>` reads key<TAB>value lines from the file and stores them all. Exit 0.",
-            test_body: r#"printf 'x\t9\ny\t8\n' > imp.tsv
+    },
+    Feature {
+        name: "import command",
+        spec: "`import <file>` reads key<TAB>value lines from the file and stores them all. Exit 0.",
+        test_body: r#"printf 'x\t9\ny\t8\n' > imp.tsv
 sh ./minidb import imp.tsv || fail "import should exit 0"
 [ "$(sh ./minidb get x)" = "9" ] || fail x
 [ "$(sh ./minidb get y)" = "8" ] || fail y
 rm -f imp.tsv"#,
-        },
-        Feature {
-            name: "import merges",
-            spec: "`import` overwrites keys that already exist and keeps unrelated keys.",
-            test_body: r#"sh ./minidb set x 1 && sh ./minidb set z 5 || fail set
+    },
+    Feature {
+        name: "import merges",
+        spec: "`import` overwrites keys that already exist and keeps unrelated keys.",
+        test_body: r#"sh ./minidb set x 1 && sh ./minidb set z 5 || fail set
 printf 'x\t9\ny\t8\n' > imp.tsv
 sh ./minidb import imp.tsv || fail import
 [ "$(sh ./minidb get x)" = "9" ] || fail "x should be overwritten to 9"
 [ "$(sh ./minidb get y)" = "8" ] || fail "y should be added"
 [ "$(sh ./minidb get z)" = "5" ] || fail "z should be kept"
 rm -f imp.tsv"#,
-        },
-        Feature {
-            name: "sum command",
-            spec: "`sum` prints the sum of all values that are integers, ignoring non-numeric values.",
-            test_body: r#"sh ./minidb mset a 1 b 2 c abc || fail mset
+    },
+    Feature {
+        name: "sum command",
+        spec: "`sum` prints the sum of all values that are integers, ignoring non-numeric values.",
+        test_body: r#"sh ./minidb mset a 1 b 2 c abc || fail mset
 [ "$(sh ./minidb sum)" = "3" ] || fail "sum should be 3""#,
-        },
-        Feature {
-            name: "top command",
-            spec: "`top <N>` prints the N keys with the largest integer values as 'key value' lines, descending.",
-            test_body: r#"sh ./minidb mset a 5 b 9 c 1 || fail mset
+    },
+    Feature {
+        name: "top command",
+        spec: "`top <N>` prints the N keys with the largest integer values as 'key value' lines, descending.",
+        test_body: r#"sh ./minidb mset a 5 b 9 c 1 || fail mset
 got=$(sh ./minidb top 2)
 want=$(printf 'b 9\na 5')
 [ "$got" = "$want" ] || fail "top 2 should print b 9 then a 5, got: $got""#,
-        },
-        Feature {
-            name: "delp prefix delete",
-            spec: "`delp <prefix>` deletes every key starting with the prefix and prints the number removed.",
-            test_body: r#"sh ./minidb mset user:a 1 user:b 2 other 3 || fail mset
+    },
+    Feature {
+        name: "delp prefix delete",
+        spec: "`delp <prefix>` deletes every key starting with the prefix and prints the number removed.",
+        test_body: r#"sh ./minidb mset user:a 1 user:b 2 other 3 || fail mset
 out=$(sh ./minidb delp user:) || fail "delp should exit 0"
 [ "$out" = "2" ] || fail "delp should print 2, got: $out"
 [ "$(sh ./minidb count)" = "1" ] || fail "one key should remain""#,
-        },
-        Feature {
-            name: "stats command",
-            spec: "`stats` prints a line 'keys=N' and a line 'file=<db path>'.",
-            test_body: r#"sh ./minidb set k v || fail set
+    },
+    Feature {
+        name: "stats command",
+        spec: "`stats` prints a line 'keys=N' and a line 'file=<db path>'.",
+        test_body: r#"sh ./minidb set k v || fail set
 sh ./minidb stats > out.txt || fail "stats should exit 0"
 grep -q '^keys=1$' out.txt || fail "stats should print keys=1"
 grep -q '^file=' out.txt || fail "stats should print file="
 rm -f out.txt"#,
-        },
-        Feature {
-            name: "backup and restore",
-            spec: "`backup <file>` snapshots the db to the file; `restore <file>` replaces the db from it.",
-            test_body: r#"sh ./minidb set k v1 || fail set
+    },
+    Feature {
+        name: "backup and restore",
+        spec: "`backup <file>` snapshots the db to the file; `restore <file>` replaces the db from it.",
+        test_body: r#"sh ./minidb set k v1 || fail set
 sh ./minidb backup b.db || fail "backup should exit 0"
 sh ./minidb set k v2 || fail set2
 sh ./minidb restore b.db || fail "restore should exit 0"
 [ "$(sh ./minidb get k)" = "v1" ] || fail "restore should bring back v1"
 rm -f b.db"#,
-        },
-        Feature {
-            name: "validate command",
-            spec: "`validate` exits 0 when every db line is key<TAB>value; exits 3 if any line is malformed.",
-            test_body: r#"sh ./minidb set k v || fail set
+    },
+    Feature {
+        name: "validate command",
+        spec: "`validate` exits 0 when every db line is key<TAB>value; exits 3 if any line is malformed.",
+        test_body: r#"sh ./minidb set k v || fail set
 sh ./minidb validate || fail "validate should exit 0 on clean db"
 printf 'brokenlinewithnotab\n' >> "$MINIDB_FILE"
 sh ./minidb validate >/dev/null 2>&1
 [ $? -eq 3 ] || fail "validate should exit 3 on malformed db""#,
-        },
-        Feature {
-            name: "repair command",
-            spec: "`repair` drops malformed db lines, keeps valid records, exits 0; validate passes afterwards.",
-            test_body: r#"sh ./minidb set a 1 || fail set
+    },
+    Feature {
+        name: "repair command",
+        spec: "`repair` drops malformed db lines, keeps valid records, exits 0; validate passes afterwards.",
+        test_body: r#"sh ./minidb set a 1 || fail set
 printf 'brokenlinewithnotab\n' >> "$MINIDB_FILE"
 sh ./minidb repair || fail "repair should exit 0"
 sh ./minidb validate || fail "validate should pass after repair"
 [ "$(sh ./minidb get a)" = "1" ] || fail "valid record should survive repair"
 [ "$(sh ./minidb count)" = "1" ] || fail "count should be 1""#,
-        },
-        Feature {
-            name: "namespaced set/get",
-            spec: "`nset <ns> <key> <value>` and `nget <ns> <key>` store per-namespace entries isolated from plain keys and other namespaces.",
-            test_body: r#"sh ./minidb nset app k v1 || fail nset1
+    },
+    Feature {
+        name: "namespaced set/get",
+        spec: "`nset <ns> <key> <value>` and `nget <ns> <key>` store per-namespace entries isolated from plain keys and other namespaces.",
+        test_body: r#"sh ./minidb nset app k v1 || fail nset1
 sh ./minidb nset web k v2 || fail nset2
 sh ./minidb set k plain || fail set
 [ "$(sh ./minidb nget app k)" = "v1" ] || fail "app ns should hold v1"
 [ "$(sh ./minidb nget web k)" = "v2" ] || fail "web ns should hold v2"
 [ "$(sh ./minidb get k)" = "plain" ] || fail "plain key should be isolated""#,
-        },
-        Feature {
-            name: "nlist command",
-            spec: "`nlist <ns>` prints the keys in that namespace sorted, one per line (without the namespace prefix).",
-            test_body: r#"sh ./minidb nset app b 2 || fail n1
+    },
+    Feature {
+        name: "nlist command",
+        spec: "`nlist <ns>` prints the keys in that namespace sorted, one per line (without the namespace prefix).",
+        test_body: r#"sh ./minidb nset app b 2 || fail n1
 sh ./minidb nset app a 1 || fail n2
 sh ./minidb nset web c 3 || fail n3
 got=$(sh ./minidb nlist app)
 want=$(printf 'a\nb')
 [ "$got" = "$want" ] || fail "nlist app should print a+b, got: $got""#,
-        },
-        Feature {
-            name: "jexport command",
-            spec: "`jexport` prints the store as one JSON object on one line, keys sorted: {\"a\":\"1\",\"b\":\"2\"}.",
-            test_body: r#"sh ./minidb set b 2 && sh ./minidb set a 1 || fail set
+    },
+    Feature {
+        name: "jexport command",
+        spec: "`jexport` prints the store as one JSON object on one line, keys sorted: {\"a\":\"1\",\"b\":\"2\"}.",
+        test_body: r#"sh ./minidb set b 2 && sh ./minidb set a 1 || fail set
 got=$(sh ./minidb jexport)
 [ "$got" = '{"a":"1","b":"2"}' ] || fail "jexport mismatch, got: $got""#,
-        },
-        Feature {
-            name: "readonly mode",
-            spec: "When MINIDB_READONLY=1 is set, `set` exits with code 4 and changes nothing; `get` still works.",
-            test_body: r#"sh ./minidb set k v || fail set
+    },
+    Feature {
+        name: "readonly mode",
+        spec: "When MINIDB_READONLY=1 is set, `set` exits with code 4 and changes nothing; `get` still works.",
+        test_body: r#"sh ./minidb set k v || fail set
 MINIDB_READONLY=1 sh ./minidb set k w >/dev/null 2>&1
 [ $? -eq 4 ] || fail "readonly set should exit 4"
 [ "$(sh ./minidb get k)" = "v" ] || fail "value should be unchanged"
 [ "$(MINIDB_READONLY=1 sh ./minidb get k)" = "v" ] || fail "readonly get should work""#,
-        },
-    ]
+    },
+];
+
+fn minidb_features() -> Vec<Feature> {
+    MINIDB_FEATURES.to_vec()
 }
 
-/// Write tests/test_NN.sh scripts and seed the dependency-chained task ladder.
+/// Write `tests/test_NN.sh` scripts and seed the dependency-chained task ladder.
 async fn seed_minidb_tasks(storage: &Arc<Storage>, workdir: &Path) -> Vec<i64> {
     let tests_dir = workdir.join("tests");
     std::fs::create_dir_all(&tests_dir).expect("tests dir");
@@ -890,7 +897,7 @@ async fn seed_minidb_tasks(storage: &Arc<Storage>, workdir: &Path) -> Vec<i64> {
                 "timeout_secs": 60
             }),
         );
-        new.sort_order = nn as i64;
+        new.sort_order = i64::try_from(nn).expect("ladder index fits i64");
         if let Some(prev_id) = prev {
             new.depends_on = vec![prev_id];
         }
@@ -911,7 +918,7 @@ async fn seed_minidb_tasks(storage: &Arc<Storage>, workdir: &Path) -> Vec<i64> {
 /// The delegate MUST tree-kill: a parent-only `ollama.exe` kill leaves each
 /// loaded model's `llama-server.exe` runner (~6 GB VRAM for an 8B model)
 /// orphaned and invisible to the respawned server's `ollama ps`, so every
-/// heal quietly shrinks the card until the num_ctx probe latches below the
+/// heal quietly shrinks the card until the `num_ctx` probe latches below the
 /// min-viable floor and the eval dies on below-floor stops (2026-08-09: four
 /// orphans held 12.5 of 16 GB, killed two endurance attempts) — see the
 /// regression note on [`nanna_daemon::tasks::restart_ollama_server`].
@@ -1132,6 +1139,81 @@ fn live_endurance() {
     run_eval_bounded(live_endurance_body());
 }
 
+/// Bound on resumes: 8 over the window tolerates an incident every ~40
+/// minutes without letting a permanently dead provider spin forever.
+const ENDURANCE_RESUMES_MAX: usize = 8;
+
+/// The plan's top-level item ids, and whether they were found (a resume)
+/// rather than seeded. Re-seeding an existing plan would duplicate all 42
+/// features and reset progress, so seeding happens ONLY when the scope is empty.
+async fn plan_for_run(env: &EvalEnv, workdir: &Path) -> (Vec<i64>, bool) {
+    let existing = env
+        .storage
+        .tasks()
+        .list("session", Some(EVAL_SESSION), true)
+        .await
+        .expect("list tasks");
+    if existing.is_empty() {
+        (seed_minidb_tasks(&env.storage, workdir).await, false)
+    } else {
+        let mut ids: Vec<i64> = existing
+            .iter()
+            .filter(|t| t.acceptance.is_some() && t.parent_id.is_none())
+            .map(|t| t.id)
+            .collect();
+        ids.sort_unstable();
+        (ids, true)
+    }
+}
+
+fn announce_start(resumed: bool, total: usize, done_already: usize, hours: f64, workdir: &Path) {
+    if resumed {
+        println!(
+            "endurance: RESUMED from {} — {total} features in the plan, {done_already} already closed, cap {hours}h, model {}",
+            workdir.display(),
+            eval_model()
+        );
+    } else {
+        println!(
+            "endurance: {total} features seeded at {}, wall-clock cap {hours}h, model {}",
+            workdir.display(),
+            eval_model()
+        );
+    }
+}
+
+/// Progress reporter: done/total every 2 minutes, for the life of the run.
+fn spawn_progress_reporter(storage: Arc<Storage>, started: std::time::Instant) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(120));
+        tick.tick().await; // immediate first tick consumed
+        loop {
+            tick.tick().await;
+            if let Ok((open, closed)) = storage.tasks().counts("session", Some(EVAL_SESSION)).await {
+                println!(
+                    "[progress] t={}m done={closed}/{} open={open}",
+                    started.elapsed().as_secs() / 60,
+                    closed + open,
+                );
+            }
+        }
+    })
+}
+
+/// Provider-aware healing before a resume: local-server surgery only for
+/// Ollama-served models; for cloud models (incl. openrouter/free, where the
+/// serving model varies per request) the pause + resume IS the healing.
+///
+/// A repeated identical failure doubles the pause — if it is about to become
+/// deterministic, give the machine (VRAM, the server) real time to change
+/// state before the last attempt.
+async fn heal_before_resume(env: &EvalEnv, streak: usize) {
+    if eval_model_is_ollama() && !restart_ollama_server(&env.runner.router).await {
+        env.runner.reset_ollama_runner().await;
+    }
+    tokio::time::sleep(Duration::from_secs(15 * (1 << streak.saturating_sub(1)).max(1))).await;
+}
+
 async fn live_endurance_body() {
     init_tracing();
     let hours: f64 = std::env::var("NANNA_EVAL_HOURS")
@@ -1150,25 +1232,7 @@ async fn live_endurance_body() {
     std::fs::create_dir_all(&workdir).expect("eval state dir");
     let env = build_env(&workdir).await;
 
-    // Re-seeding an existing plan would duplicate all 42 features and reset
-    // progress, so seed ONLY when the scope is empty.
-    let existing = env
-        .storage
-        .tasks()
-        .list("session", Some(EVAL_SESSION), true)
-        .await
-        .expect("list tasks");
-    let (plan_ids, resumed) = if existing.is_empty() {
-        (seed_minidb_tasks(&env.storage, &workdir).await, false)
-    } else {
-        let mut ids: Vec<i64> = existing
-            .iter()
-            .filter(|t| t.acceptance.is_some() && t.parent_id.is_none())
-            .map(|t| t.id)
-            .collect();
-        ids.sort_unstable();
-        (ids, true)
-    };
+    let (plan_ids, resumed) = plan_for_run(&env, &workdir).await;
     let total = plan_ids.len();
     let done_already = plan_ids.len()
         - env
@@ -1176,52 +1240,17 @@ async fn live_endurance_body() {
             .tasks()
             .list("session", Some(EVAL_SESSION), false)
             .await
-            .map(|open| open.iter().filter(|t| plan_ids.contains(&t.id)).count())
-            .unwrap_or(total);
-    if resumed {
-        println!(
-            "endurance: RESUMED from {} — {total} features in the plan, {done_already} already closed, cap {hours}h, model {}",
-            workdir.display(),
-            eval_model()
-        );
-    } else {
-        println!(
-            "endurance: {total} features seeded at {}, wall-clock cap {hours}h, model {}",
-            workdir.display(),
-            eval_model()
-        );
-    }
+            .map_or(total, |open| open.iter().filter(|t| plan_ids.contains(&t.id)).count());
+    announce_start(resumed, total, done_already, hours, &workdir);
 
-    // Progress reporter: done/total every 2 minutes.
-    let progress_storage = env.storage.clone();
     let started = std::time::Instant::now();
-    let progress = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(120));
-        tick.tick().await; // immediate first tick consumed
-        loop {
-            tick.tick().await;
-            if let Ok((open, closed)) = progress_storage
-                .tasks()
-                .counts("session", Some(EVAL_SESSION))
-                .await
-            {
-                println!(
-                    "[progress] t={}m done={closed}/{} open={open}",
-                    started.elapsed().as_secs() / 60,
-                    closed as usize + open as usize,
-                );
-            }
-        }
-    });
+    let progress = spawn_progress_reporter(env.storage.clone(), started);
 
     // The store IS the checkpoint: a run stopped by a provider incident is
     // resumed by simply starting again — next() picks up exactly where the
     // plan stands (the P14 resume property, exercised for real here).
-    // Bound: 8 resumes over the window tolerates an incident every ~40
-    // minutes without letting a permanently dead provider spin forever.
-    const ENDURANCE_RESUMES_MAX: usize = 8;
     let cap = Duration::from_secs_f64(hours * 3600.0);
-    let mut resumes = 0usize;
+    let mut resume_count = 0usize;
     let mut identical_failures = IdenticalFailureStreak::default();
     let mut segment_reports: Vec<LongHorizonReport> = Vec::new();
     let report = loop {
@@ -1269,31 +1298,21 @@ async fn live_endurance_body() {
             println!(
                 "[stop] the same failure ended {streak} consecutive segments — this is \
                  deterministic (e.g. a context window below the step floor), not a \
-                 transient provider incident; stopping instead of thrashing resumes. \
+                 transient provider incident; stopping instead of thrashing resume_count. \
                  Last error: {}",
                 report.last_runner_error.as_deref().unwrap_or("<none recorded>")
             );
             break report;
         }
-        if !provider_died || resumes >= ENDURANCE_RESUMES_MAX || started.elapsed() >= cap {
+        if !provider_died || resume_count >= ENDURANCE_RESUMES_MAX || started.elapsed() >= cap {
             break report;
         }
-        resumes += 1;
+        resume_count += 1;
         println!(
-            "[resume {resumes}/{ENDURANCE_RESUMES_MAX}] provider incident at t={}m — healing and resuming the plan",
+            "[resume {resume_count}/{ENDURANCE_RESUMES_MAX}] provider incident at t={}m — healing and resuming the plan",
             started.elapsed().as_secs() / 60
         );
-        // Provider-aware healing: local-server surgery only for Ollama-served
-        // models; for cloud models (incl. openrouter/free, where the serving
-        // model varies per request) the pause + resume IS the healing.
-        if eval_model_is_ollama() && !restart_ollama_server(&env.runner.router).await {
-            env.runner.reset_ollama_runner().await;
-        }
-        // A repeated identical failure doubles the pause — if it is about to
-        // become deterministic, give the machine (VRAM, the server) real time
-        // to change state before the last attempt.
-        tokio::time::sleep(Duration::from_secs(15 * (1 << streak.saturating_sub(1)).max(1)))
-            .await;
+        heal_before_resume(&env, streak).await;
     };
     progress.abort();
 
@@ -1303,7 +1322,7 @@ async fn live_endurance_body() {
     let agg_out: u64 = segment_reports.iter().map(|r| r.output_tokens).sum();
     let agg_completed: usize = segment_reports.iter().map(|r| r.items_completed).sum();
     println!(
-        "aggregate over {} segment(s), {resumes} resume(s): steps={agg_steps} completed={agg_completed} tokens={}",
+        "aggregate over {} segment(s), {resume_count} resume(s): steps={agg_steps} completed={agg_completed} tokens={}",
         segment_reports.len(),
         agg_in + agg_out
     );
@@ -1314,7 +1333,7 @@ async fn live_endurance_body() {
     let seeded_done = assert_seeded_verified(&env.storage, &plan_ids).await;
     let elapsed = started.elapsed();
     println!(
-        "endurance summary: {seeded_done}/{total} features verified in {}s ({:.2}h), {resumes} resume(s)",
+        "endurance summary: {seeded_done}/{total} features verified in {}s ({:.2}h), {resume_count} resume(s)",
         elapsed.as_secs(),
         elapsed.as_secs_f64() / 3600.0
     );

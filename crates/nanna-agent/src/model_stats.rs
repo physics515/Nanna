@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 use nanna_storage::StoredModelStats;
 
-use crate::numeric::{millis_u64, u64_to_f64, usize_to_f64};
+use crate::numeric::{millis_u64, f64_from_u64, f64_from_usize};
 /// Called with every recorded request.
 ///
 /// It is the per-request history the in-memory aggregates cannot give back (a
@@ -412,7 +412,7 @@ impl ModelStats {
 
     fn summary(&self) -> ModelStatsSummary {
         let success_rate = if self.total_requests > 0 {
-            u64_to_f64(self.successful_requests) / u64_to_f64(self.total_requests)
+            f64_from_u64(self.successful_requests) / f64_from_u64(self.total_requests)
         } else {
             1.0
         };
@@ -428,12 +428,12 @@ impl ModelStats {
         let avg_throughput_tps = if self.throughput_tps.is_empty() {
             0.0
         } else {
-            self.throughput_tps.iter().sum::<f64>() / usize_to_f64(self.throughput_tps.len())
+            self.throughput_tps.iter().sum::<f64>() / f64_from_usize(self.throughput_tps.len())
         };
 
         let total_cacheable = self.total_input_tokens + self.total_cache_read_tokens;
         let cache_hit_rate = if total_cacheable > 0 {
-            u64_to_f64(self.total_cache_read_tokens) / u64_to_f64(total_cacheable)
+            f64_from_u64(self.total_cache_read_tokens) / f64_from_u64(total_cacheable)
         } else {
             0.0
         };

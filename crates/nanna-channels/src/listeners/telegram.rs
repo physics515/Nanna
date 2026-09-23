@@ -320,14 +320,11 @@ impl TelegramListener {
 }
 
 /// A Telegram media duration (whole seconds, `i32` on the wire) as the `f32`
-/// seconds the channel model carries.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "std has no i32 -> f32 conversion; f32 is exact for every whole second below 2^24 \
-              (~194 days), and a longer duration rounding to a neighbouring second is harmless"
-)]
-const fn duration_secs(secs: i32) -> f32 {
-    secs as f32
+/// seconds the channel model carries: exact for every whole second below 2^24
+/// (~194 days), and a longer duration rounding to a neighbouring second is
+/// harmless.
+fn duration_secs(secs: i32) -> f32 {
+    nanna_numeric::f32_from_i32(secs)
 }
 
 #[async_trait]

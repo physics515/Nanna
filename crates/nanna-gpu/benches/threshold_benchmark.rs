@@ -1,9 +1,13 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+// Solver depth only, as on the daemon crate roots: proving these futures
+// `Send` walks the wgpu/daemon type graph past the default limit of 128.
+#![recursion_limit = "256"]
 //! GPU vs SIMD Threshold Benchmark
 //!
 //! Measures the crossover point where GPU batch cosine similarity
 //! becomes faster than SIMD for 384-dimensional vectors.
 //!
-//! Run with: cargo bench -p nanna-gpu --bench threshold_benchmark
+//! Run with: cargo bench -p nanna-gpu --bench `threshold_benchmark`
 
 use std::time::{Duration, Instant};
 
@@ -42,7 +46,7 @@ fn generate_vectors(count: usize, dim: usize) -> Vec<Vec<f32>> {
                     let mut h = DefaultHasher::new();
                     (i * dim + j).hash(&mut h);
                     let bits = h.finish();
-                    (bits as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32
+                    nanna_numeric::f32_from_f64((nanna_numeric::f64_from_u64(bits) / nanna_numeric::f64_from_u64(u64::MAX)).mul_add(2.0, -1.0))
                 })
                 .collect();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -112,18 +116,18 @@ struct BenchResult {
 
 impl BenchResult {
     fn from_durations(times: &[Duration]) -> Self {
-        let nanos: Vec<f64> = times.iter().map(|t| t.as_nanos() as f64).collect();
-        let mean = nanos.iter().sum::<f64>() / nanos.len() as f64;
-        let variance = nanos.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / nanos.len() as f64;
+        let nanos: Vec<f64> = times.iter().map(|t| t.as_secs_f64() * 1e9).collect();
+        let mean = nanos.iter().sum::<f64>() / nanna_numeric::f64_from_usize(nanos.len());
+        let variance = nanos.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / nanna_numeric::f64_from_usize(nanos.len());
         let stddev = variance.sqrt();
-        let min = nanos.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = nanos.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min = nanos.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = nanos.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         Self {
-            mean: Duration::from_nanos(mean as u64),
-            stddev: Duration::from_nanos(stddev as u64),
-            min: Duration::from_nanos(min as u64),
-            max: Duration::from_nanos(max as u64),
+            mean: Duration::from_secs_f64(mean / 1e9),
+            stddev: Duration::from_secs_f64(stddev / 1e9),
+            min: Duration::from_secs_f64(min / 1e9),
+            max: Duration::from_secs_f64(max / 1e9),
         }
     }
 }
@@ -176,7 +180,7 @@ fn main() {
 
     // Benchmark configuration
     let dim = 384;  // Standard embedding dimension
-    let vector_counts = [100, 500, 1000, 5000, 10000, 50000, 100000];
+    let vector_counts = [100, 500, 1000, 5000, 10_000, 50_000, 100_000];
     let iterations = 20;
     let warmup = 3;
 
@@ -211,7 +215,7 @@ fn main() {
                 );
 
                 let speedup =
-                    simd_result.mean.as_nanos() as f64 / gpu_result.mean.as_nanos() as f64;
+                    simd_result.mean.as_secs_f64() * 1e9 / gpu_result.mean.as_secs_f64() * 1e9;
                 let gpu_faster = speedup > 1.0;
 
                 if gpu_faster && !prev_gpu_faster && crossover_point.is_none() {
@@ -220,7 +224,7 @@ fn main() {
                 prev_gpu_faster = gpu_faster;
 
                 let winner = if gpu_faster {
-                    std::format!("GPU {:.1}x", speedup)
+                    std::format!("GPU {speedup:.1}x")
                 } else {
                     std::format!("SIMD {:.1}x", 1.0 / speedup)
                 };
@@ -230,13 +234,10 @@ fn main() {
             _ => (None, "SIMD (no GPU)".to_string()),
         };
 
-        let gpu_str = gpu_result
-            .map(|r| std::format!("{r}"))
-            .unwrap_or_else(|| "N/A".to_string());
+        let gpu_str = gpu_result.map_or_else(|| "N/A".to_string(), |r| std::format!("{r}"));
 
         println!(
-            "│ {:>7} │ {simd_result} │ {gpu_str:>32} │ {winner:>8} │",
-            count
+            "│ {count:>7} │ {simd_result} │ {gpu_str:>32} │ {winner:>8} │"
         );
     }
 
@@ -248,11 +249,11 @@ fn main() {
     println!();
 
     if let Some(threshold) = crossover_point {
-        println!("✓ GPU becomes faster at: ~{} vectors (384-dim)", threshold);
+        println!("✓ GPU becomes faster at: ~{threshold} vectors (384-dim)");
         println!();
         println!("RECOMMENDATION:");
-        println!("  Set GPU_THRESHOLD = {}", threshold);
-        println!("  This enables GPU acceleration for searches with {} or more vectors.", threshold);
+        println!("  Set GPU_THRESHOLD = {threshold}");
+        println!("  This enables GPU acceleration for searches with {threshold} or more vectors.");
     } else if ctx.is_some() {
         println!("GPU did not become faster than SIMD in the tested range (100-100k vectors).");
         println!("Consider increasing GPU_THRESHOLD or disabling GPU dispatch for 384-dim vectors.");

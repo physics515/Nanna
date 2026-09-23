@@ -23,17 +23,8 @@ pub mod retention;
 mod service;
 
 /// Integer <-> `f32` conversions for scores, averages and budgets, where std has
-/// no lossless route. Each one is exactly the `as` cast it replaced, kept in one
-/// place so the precision trade-off is stated once rather than at every site.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "std has no lossless integer -> f32 conversion (f32 is exact only below 2^24) and \
-              no f32 -> usize conversion at all; these values are similarity and FSRS scoring \
-              inputs, weight averages and a removal budget, for which the nearest f32 (and the \
-              saturating truncation of a product) is the intended result"
-)]
+/// no lossless route. Each one is value-for-value the `as` cast it replaced, by
+/// way of `nanna_numeric`, which states the rounding once for the workspace.
 mod lossy {
     /// An integer as the nearest `f32` (ties to even), exactly as `as f32`.
     pub trait LossyF32 {
@@ -42,38 +33,38 @@ mod lossy {
 
     impl LossyF32 for usize {
         fn lossy_f32(self) -> f32 {
-            self as f32
+            nanna_numeric::f32_from_usize(self)
         }
     }
 
     impl LossyF32 for u32 {
         fn lossy_f32(self) -> f32 {
-            self as f32
+            nanna_numeric::f32_from_u32(self)
         }
     }
 
     impl LossyF32 for u64 {
         fn lossy_f32(self) -> f32 {
-            self as f32
+            nanna_numeric::f32_from_u64(self)
         }
     }
 
     impl LossyF32 for i64 {
         fn lossy_f32(self) -> f32 {
-            self as f32
+            nanna_numeric::f32_from_i64(self)
         }
     }
 
     /// `x` truncated toward zero, saturating at the bounds and mapping NaN to 0,
     /// exactly as `as usize`.
-    pub const fn f32_to_usize(x: f32) -> usize {
-        x as usize
+    pub fn f32_to_usize(x: f32) -> usize {
+        nanna_numeric::usize_from_f32(x)
     }
 
     /// `x` truncated toward zero, saturating at the bounds and mapping NaN to 0,
     /// exactly as `as i64`.
-    pub const fn f32_to_i64(x: f32) -> i64 {
-        x as i64
+    pub fn f32_to_i64(x: f32) -> i64 {
+        nanna_numeric::i64_from_f64(f64::from(x))
     }
 }
 

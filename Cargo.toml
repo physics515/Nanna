@@ -61,6 +61,7 @@ members = [
     "crates/nanna-daemon",
     "crates/nanna-client",
     "crates/nanna-timeline",
+    "crates/nanna-numeric",
     "crates/nanna-bench",
     "gui/src-tauri",
 ]

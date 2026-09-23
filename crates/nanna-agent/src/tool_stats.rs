@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::numeric::{millis_u64, u64_to_f64};
+use crate::numeric::{millis_u64, f64_from_u64};
 
 /// Maximum number of latency samples to keep per tool (ring buffer).
 const MAX_LATENCY_SAMPLES: usize = 200;
@@ -313,7 +313,7 @@ impl ToolStatsTracker {
             .map(|s| s.avg_latency_ms * s.call_count)
             .sum();
         let avg_latency_ms = weighted_latency.checked_div(total_calls).unwrap_or(0);
-        let success_rate = if total_executed > 0 { u64_to_f64(total_success) / u64_to_f64(total_executed) } else { 1.0 };
+        let success_rate = if total_executed > 0 { f64_from_u64(total_success) / f64_from_u64(total_executed) } else { 1.0 };
 
         // Top 5 slowest by P95
         let mut slowest = all_summaries.clone();
@@ -330,8 +330,8 @@ impl ToolStatsTracker {
             .cloned()
             .collect();
         by_error.sort_by(|a, b| {
-            let rate_a = if a.call_count > 0 { u64_to_f64(a.failure_count) / u64_to_f64(a.call_count) } else { 0.0 };
-            let rate_b = if b.call_count > 0 { u64_to_f64(b.failure_count) / u64_to_f64(b.call_count) } else { 0.0 };
+            let rate_a = if a.call_count > 0 { f64_from_u64(a.failure_count) / f64_from_u64(a.call_count) } else { 0.0 };
+            let rate_b = if b.call_count > 0 { f64_from_u64(b.failure_count) / f64_from_u64(b.call_count) } else { 0.0 };
             rate_b.partial_cmp(&rate_a).unwrap_or(std::cmp::Ordering::Equal)
         });
         by_error.truncate(5);
@@ -481,7 +481,7 @@ impl ToolStats {
         // they can neither succeed nor fail.
         let executed = self.success_count + self.failure_count;
         let success_rate = if executed > 0 {
-            u64_to_f64(self.success_count) / u64_to_f64(executed)
+            f64_from_u64(self.success_count) / f64_from_u64(executed)
         } else {
             1.0
         };

@@ -7,7 +7,7 @@
 //! *family prefix* so dated ids like `claude-opus-4-8` resolve. Local models
 //! (Ollama / on-device Burn) are free and intentionally return `None`.
 
-use crate::numeric::u64_to_f64;
+use crate::numeric::f64_from_u64;
 
 /// USD price per 1,000,000 tokens for one model, split by token class.
 ///
@@ -178,10 +178,10 @@ pub fn estimate_cost_usd(
     // Per-class cost in "USD * 1M tokens", summed then divided once. Kept as
     // explicit per-term locals so the sum is plain addition (no fused
     // multiply-add rewrite that would obscure the money math).
-    let input = u64_to_f64(input_tokens) * pricing.input_usd_per_mtok;
-    let output = u64_to_f64(output_tokens) * pricing.output_usd_per_mtok;
-    let cache_read = u64_to_f64(cache_read_tokens) * pricing.cache_read_usd_per_mtok;
-    let cache_write = u64_to_f64(cache_write_tokens) * pricing.cache_write_usd_per_mtok;
+    let input = f64_from_u64(input_tokens) * pricing.input_usd_per_mtok;
+    let output = f64_from_u64(output_tokens) * pricing.output_usd_per_mtok;
+    let cache_read = f64_from_u64(cache_read_tokens) * pricing.cache_read_usd_per_mtok;
+    let cache_write = f64_from_u64(cache_write_tokens) * pricing.cache_write_usd_per_mtok;
     let cost = (input + output + cache_read + cache_write) / TOKENS_PER_MILLION;
 
     debug_assert!(cost >= 0.0, "estimated cost must be non-negative");

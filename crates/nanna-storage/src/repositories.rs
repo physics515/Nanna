@@ -376,15 +376,11 @@ fn decode_memory_row(
 /// Narrow a `REAL` column back to the `f32` it was written from.
 ///
 /// Every `f32` this crate stores goes in as `f64::from(f32)`, which is exact,
-/// so for those rows this narrowing is exact too. `as` is the only f64 to f32
-/// conversion the language has (there is no `TryFrom`); any other value rounds
-/// to the nearest `f32`, and one beyond the `f32` range becomes infinite.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "no lossless f64 -> f32 conversion exists; columns are written from f32 via f64::from, so the round-trip is exact"
-)]
-const fn f32_from_real(value: f64) -> f32 {
-    value as f32
+/// so for those rows this narrowing is exact too. Any other value rounds to
+/// the nearest `f32`, and one beyond the `f32` range becomes infinite — the
+/// semantics of the `as` cast, implemented losslessly in `nanna_numeric`.
+fn f32_from_real(value: f64) -> f32 {
+    nanna_numeric::f32_from_f64(value)
 }
 
 fn decode_embedding(bytes: &[u8]) -> Vec<f32> {

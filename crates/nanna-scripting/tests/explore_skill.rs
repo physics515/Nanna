@@ -1,10 +1,11 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Behavioral tests for the `explore` default skill, executed for real
 //! through the Boa engine with a bridge scoped to a temp directory.
 //!
 //! The contract under test (regression for the 2026-08-02 live failure where
 //! every explore call blew the 30s Boa deadline on a real workspace and the
 //! model retry-looped it): the walk is level-by-level and bounded — noise
-//! dirs (node_modules, .git, target, ...) are counted but never descended,
+//! dirs (`node_modules`, .git, target, ...) are counted but never descended,
 //! at most 1000 entries are visited (derived from the ~2KB context output
 //! budget), the cap announces itself, and an inaccessible root returns a
 //! structured `success: false` result instead of a thrown error.
@@ -191,11 +192,11 @@ async fn empty_directory_is_an_observation_not_an_error() {
 }
 
 /// Manual timing check against a REAL large tree (the nanna repo root,
-/// including node_modules/.git/target). The old recursive-walk version blew
+/// including `node_modules/.git/target`). The old recursive-walk version blew
 /// the 30s Boa deadline on 100% of calls here; the bounded walk must finish
 /// in single-digit seconds. Ignored by default: wall-time on a shared CI box
 /// is not a stable assertion.
-/// Run: cargo test -p nanna-scripting --test explore_skill -- --ignored --nocapture
+/// Run: cargo test -p nanna-scripting --test `explore_skill` -- --ignored --nocapture
 #[tokio::test]
 #[ignore = "manual timing check against the real repo tree"]
 async fn timing_against_real_workspace() {

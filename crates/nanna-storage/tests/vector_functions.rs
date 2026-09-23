@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Capability probe: does the pinned `turso` really compute vector distance in SQL?
 //!
 //! Both `ROADMAP.md` and the `daily-dev` Appendix C have long asserted that Turso "does NO vector
@@ -43,7 +44,7 @@ async fn query_one_f64(conn: &Connection, sql: &str) -> f64 {
     let value = row.get_value(0).expect("column 0 should exist");
     let distance = match value {
         turso::Value::Real(real) => real,
-        turso::Value::Integer(int) => int as f64,
+        turso::Value::Integer(int) => nanna_numeric::f64_from_i64(int),
         other => panic!("expected a numeric distance, got {other:?}"),
     };
     drop(rows);

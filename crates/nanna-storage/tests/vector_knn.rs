@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! SQL-side exact k-NN over the stored embedding column.
 //!
 //! P13 sequences the "indexed clustering" work as: measure whether Turso's
@@ -114,8 +115,8 @@ async fn sql_knn_respects_limit_and_skips_null_embeddings() {
     let storage = store().await;
     let repo = storage.memories();
 
-    for i in 0..5 {
-        let v = vec![1.0_f32, i as f32 * 0.1, 0.0, 0.0];
+    for i in 0..5_u16 {
+        let v = vec![1.0_f32, f32::from(i) * 0.1, 0.0, 0.0];
         repo.create(new_memory(&format!("has-{i}"), Some(v), None))
             .await
             .expect("insert");

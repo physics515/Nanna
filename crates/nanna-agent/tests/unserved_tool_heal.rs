@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! End-to-end regression test for the unserved-tool heal.
 //!
 //! Some Ollama templates/parsers (observed live 2026-08-08: ministral-3:8b,
@@ -57,7 +58,7 @@ impl Tool for StubExec {
     }
 }
 
-/// Read one HTTP/1.1 request off the socket; returns (request_line, body).
+/// Read one HTTP/1.1 request off the socket; returns (`request_line`, body).
 async fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -201,6 +202,7 @@ async fn provider_unserved_tool_rejection_heals_by_activation() {
         bodies[1].contains(r#""name":"exec""#),
         "the healed retry must carry the exec definition"
     );
+    drop(bodies);
     assert!(
         response.tool_calls.iter().any(|call| call.name == "exec"),
         "the previously-rejected call must actually execute after the heal"

@@ -83,7 +83,7 @@ pub async fn list_sessions(
     let mut all_sessions: Vec<SessionInfo> = result
         .get("sessions")
         .and_then(|v| v.as_array())
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(|s| {
                     let id = s.get("id").and_then(|v| v.as_str())?.to_string();
@@ -107,18 +107,16 @@ pub async fn list_sessions(
                         chat_tools: s
                             .get("chat_tools")
                             .and_then(|v| v.as_array())
-                            .map(|arr| {
+                            .map_or_default(|arr| {
                                 arr.iter()
                                     .filter_map(|t| t.as_str())
                                     .map(String::from)
                                     .collect()
-                            })
-                            .unwrap_or_default(),
+                            }),
                     })
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
 
     all_sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(all_sessions)
@@ -148,7 +146,7 @@ pub async fn get_session_history(
     Ok(result
         .get("messages")
         .and_then(|v| v.as_array())
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(|m| {
                     let tool_calls = m
@@ -170,8 +168,7 @@ pub async fn get_session_history(
                     })
                 })
                 .collect()
-        })
-        .unwrap_or_default())
+        }))
 }
 
 /// Delete a session.

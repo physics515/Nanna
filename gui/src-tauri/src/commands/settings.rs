@@ -1221,7 +1221,7 @@ fn ollama_models_from_report(report: &serde_json::Value) -> Result<Vec<OllamaMod
     let models = report
         .get("models")
         .and_then(|m| m.as_array())
-        .map(|models| {
+        .map_or_default(|models| {
             models
                 .iter()
                 .filter_map(|m| {
@@ -1234,8 +1234,7 @@ fn ollama_models_from_report(report: &serde_json::Value) -> Result<Vec<OllamaMod
                     })
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     Ok(models)
 }
 
@@ -1341,8 +1340,7 @@ fn ollama_probe_from_report(report: &serde_json::Value) -> Result<OllamaProbeRes
         report
             .get(key)
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
-            .unwrap_or_default()
+            .map_or_default(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
     };
     let reachable = report.get("reachable").and_then(serde_json::Value::as_bool) == Some(true);
     let models = if reachable {
@@ -1353,7 +1351,7 @@ fn ollama_probe_from_report(report: &serde_json::Value) -> Result<OllamaProbeRes
     let missing = report
         .get("missing")
         .and_then(|v| v.as_array())
-        .map(|a| {
+        .map_or_default(|a| {
             a.iter()
                 .filter_map(|m| {
                     let name = m.get("name").and_then(|n| n.as_str())?.to_string();
@@ -1364,8 +1362,7 @@ fn ollama_probe_from_report(report: &serde_json::Value) -> Result<OllamaProbeRes
                     Some(OllamaMissingModel { name, pull })
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     Ok(OllamaProbeResult {
         base_url: report
             .get("base_url")

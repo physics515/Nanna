@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Dependency guard: crates whose **types cross a crate boundary** must resolve
 //! to exactly ONE version in the workspace graph.
 //!
@@ -55,8 +56,8 @@ impl Remedy {
         debug_assert!(versions.len() >= 2, "only called on an actual split");
         debug_assert!(!name.is_empty(), "crate name must be non-empty");
         match self {
-            Remedy::Manual(text) => (*text).to_string(),
-            Remedy::PinBackTo(keep) => {
+            Self::Manual(text) => (*text).to_string(),
+            Self::PinBackTo(keep) => {
                 assert!(
                     versions.contains(keep),
                     "`{name}` must keep {keep}, but the graph holds {versions:?} — the pin \

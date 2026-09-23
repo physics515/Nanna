@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Every bundled skill must declare its own `permissions.json`.
 //!
 //! A missing file does not mean "no permissions" — it means a scope somebody
@@ -59,9 +60,9 @@ fn read_permissions(dir: &Path) -> Option<Value> {
 /// Every directory under `default-skills/` that holds a `tool.ts`.
 fn bundled_skills() -> Vec<PathBuf> {
     let dir = default_skills_dir();
-    assert!(dir.is_dir(), "{dir:?} is not a directory");
+    assert!(dir.is_dir(), "{} is not a directory", dir.display());
     let mut skills: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("cannot read {dir:?}: {e}"))
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.is_dir() && p.join("tool.ts").is_file())

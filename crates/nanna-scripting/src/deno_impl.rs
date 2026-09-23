@@ -20,14 +20,8 @@ pub async fn execute(
     let is_typescript = tool.is_typescript;
 
     // Run in a blocking task because JsRuntime isn't Send
-    let result = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| ScriptError::Execution(format!("Failed to create runtime: {e}")))?;
-
-        rt.block_on(execute_inner(&source, &input_clone, is_typescript))
-    });
+    let result =
+        tokio::task::spawn_blocking(move || execute_inner(&source, &input_clone, is_typescript));
 
     match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), result).await {
         Ok(Ok(result)) => result,
@@ -38,93 +32,96 @@ pub async fn execute(
 
 // The whole point of this function is the non-`Send` V8 runtime: `JsRuntime`
 // holds an `Rc<ContextState>` and is driven across two awaits
-// (`run_event_loop`, `resolve`). `execute` above already pins it to a
-// current-thread runtime inside `spawn_blocking` for exactly that reason, so
-// there is no restructuring that makes the future `Send` without giving up the
-// engine.
-#[expect(clippy::future_not_send, reason = "JsRuntime is !Send by construction; \
-    `execute` drives this on a current-thread runtime inside spawn_blocking")]
-async fn execute_inner(source: &str, input: &Value, is_typescript: bool) -> Result<Value> {
-    // Transpile TypeScript if needed
-    let js_source = if is_typescript {
-        transpile_typescript(source)?
-    } else {
-        source.to_string()
-    };
+// (`run_event_loop`, `resolve`). It therefore runs as a plain blocking function
+// that owns a current-thread runtime and drives the isolate on it; `execute`
+// above calls it from `spawn_blocking` for exactly that reason.
+fn execute_inner(source: &str, input: &Value, is_typescript: bool) -> Result<Value> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ScriptError::Execution(format!("Failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        // Transpile TypeScript if needed
+        let js_source = if is_typescript {
+            transpile_typescript(source)?
+        } else {
+            source.to_string()
+        };
 
-    let input_json = serde_json::to_string(input)?;
+        let input_json = serde_json::to_string(input)?;
 
-    // Execute the script - returns JSON string
-    let script = format!(
-        r"
-        (function() {{
-            globalThis.INPUT = {input_json};
-            globalThis.console = {{
-                log: (...args) => {{}},
-                warn: (...args) => {{}},
-                error: (...args) => {{}},
-                debug: (...args) => {{}},
-            }};
+        // Execute the script - returns JSON string
+        let script = format!(
+            r"
+            (function() {{
+                globalThis.INPUT = {input_json};
+                globalThis.console = {{
+                    log: (...args) => {{}},
+                    warn: (...args) => {{}},
+                    error: (...args) => {{}},
+                    debug: (...args) => {{}},
+                }};
             
-            {js_source}
+                {js_source}
             
-            if (typeof execute === 'function') {{
-                const result = execute(INPUT);
-                // Handle both sync and async results
-                if (result && typeof result.then === 'function') {{
-                    return result.then(r => JSON.stringify(r));
+                if (typeof execute === 'function') {{
+                    const result = execute(INPUT);
+                    // Handle both sync and async results
+                    if (result && typeof result.then === 'function') {{
+                        return result.then(r => JSON.stringify(r));
+                    }}
+                    return JSON.stringify(result);
                 }}
-                return JSON.stringify(result);
-            }}
             
-            throw new Error('No execute function found');
-        }})()
-        "
-    );
+                throw new Error('No execute function found');
+            }})()
+            "
+        );
 
-    // Create runtime
-    let mut runtime = JsRuntime::new(RuntimeOptions {
-        extensions: vec![nanna_extension::init()],
-        ..Default::default()
-    });
+        // Create runtime
+        let mut runtime = JsRuntime::new(RuntimeOptions {
+            extensions: vec![nanna_extension::init()],
+            ..Default::default()
+        });
 
-    let result = runtime
-        .execute_script("<tool>", script)
-        .map_err(|e| ScriptError::Execution(format!("Script error: {e}")))?;
+        let result = runtime
+            .execute_script("<tool>", script)
+            .map_err(|e| ScriptError::Execution(format!("Script error: {e}")))?;
 
-    // Run event loop for any pending async work
-    runtime
-        .run_event_loop(PollEventLoopOptions::default())
-        .await
-        .map_err(|e| ScriptError::Execution(format!("Event loop error: {e}")))?;
+        // Run event loop for any pending async work
+        runtime
+            .run_event_loop(PollEventLoopOptions::default())
+            .await
+            .map_err(|e| ScriptError::Execution(format!("Event loop error: {e}")))?;
 
-    // Check if result is a promise and resolve it
-    let resolved = runtime
-        .resolve(result)
-        .await
-        .map_err(|e| ScriptError::Execution(format!("Promise resolution error: {e}")))?;
+        // Check if result is a promise and resolve it
+        let resolved = runtime
+            .resolve(result)
+            .await
+            .map_err(|e| ScriptError::Execution(format!("Promise resolution error: {e}")))?;
 
-    // Extract the JSON string using scope! macro
-    let extracted = {
-        scope!(scope, runtime);
-        let local = v8::Local::new(scope, &resolved);
-        deno_core::serde_v8::from_v8::<String>(scope, local)
-    };
-    // The handle scope is gone with the block and the JSON is already a Rust
-    // `String`, so nothing V8 is left alive: release the isolate here instead
-    // of at the end of the function, in the same order the scope would have
-    // (`resolved` borrows `runtime`'s isolate, so it goes first). A failed
-    // deserialize took the whole isolate with it to the `?` below either way;
-    // now the successful path does not hold one across the JSON parse.
-    drop(resolved);
-    drop(runtime);
+        // Extract the JSON string using scope! macro
+        let extracted = {
+            scope!(scope, runtime);
+            let local = v8::Local::new(scope, &resolved);
+            deno_core::serde_v8::from_v8::<String>(scope, local)
+        };
+        // The handle scope is gone with the block and the JSON is already a Rust
+        // `String`, so nothing V8 is left alive: release the isolate here instead
+        // of at the end of the function, in the same order the scope would have
+        // (`resolved` borrows `runtime`'s isolate, so it goes first). A failed
+        // deserialize took the whole isolate with it to the `?` below either way;
+        // now the successful path does not hold one across the JSON parse.
+        drop(resolved);
+        drop(runtime);
 
-    let json_str = extracted
-        .map_err(|e| ScriptError::Execution(format!("Failed to deserialize: {e}")))?;
+        let json_str = extracted
+            .map_err(|e| ScriptError::Execution(format!("Failed to deserialize: {e}")))?;
 
-    // Parse JSON to Value
-    serde_json::from_str(&json_str)
-        .map_err(|e| ScriptError::Execution(format!("Failed to parse JSON: {e}")))
+        // Parse JSON to Value
+        serde_json::from_str(&json_str)
+            .map_err(|e| ScriptError::Execution(format!("Failed to parse JSON: {e}")))
+    })
 }
 
 /// Transpile TypeScript to JavaScript using `deno_ast`

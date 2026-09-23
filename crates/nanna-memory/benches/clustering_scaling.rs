@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Dream-time clustering: how `cluster_memories` scales with store size.
 //!
 //! Run with: `cargo bench -p nanna-memory --bench clustering_scaling`
@@ -46,15 +47,15 @@ fn vector_for(topic: usize, index: usize, spread: f32) -> Vec<f32> {
     let mut norm_sq = 0.0f32;
     for d in 0..DIM {
         // Topic component: identical for every member of a topic.
-        let t = ((topic.wrapping_mul(2_654_435_761) ^ d.wrapping_mul(40_503)) % 1000) as f32
+        let t = nanna_numeric::f32_from_usize((topic.wrapping_mul(2_654_435_761) ^ d.wrapping_mul(40_503)) % 1000)
             / 1000.0
             - 0.5;
         // Member jitter: small, deterministic, unique per (topic, index, d).
-        let j = ((index.wrapping_mul(2_246_822_519) ^ d.wrapping_mul(3_266_489_917)) % 1000) as f32
+        let j = nanna_numeric::f32_from_usize((index.wrapping_mul(2_246_822_519) ^ d.wrapping_mul(3_266_489_917)) % 1000)
             / 1000.0
             - 0.5;
-        let x = t + j * spread;
-        norm_sq += x * x;
+        let x = j.mul_add(spread, t);
+        norm_sq = x.mul_add(x, norm_sq);
         v.push(x);
     }
     let norm = norm_sq.sqrt().max(f32::MIN_POSITIVE);
@@ -85,8 +86,8 @@ fn unrelated_vector(index: usize) -> Vec<f32> {
         x ^= x >> 27;
         x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
         x ^= x >> 31;
-        let f = (x % 2_000_000) as f32 / 1_000_000.0 - 1.0; // -1.0 ..= 1.0
-        norm_sq += f * f;
+        let f = nanna_numeric::f32_from_u64(x % 2_000_000) / 1_000_000.0 - 1.0; // -1.0 ..= 1.0
+        norm_sq = f.mul_add(f, norm_sq);
         v.push(f);
     }
     let norm = norm_sq.sqrt().max(f32::MIN_POSITIVE);
@@ -111,7 +112,7 @@ fn corpus(count: usize, topics: usize, spread: f32, related: bool) -> Vec<Memory
                 embedding_model: None,
                 embeddings: HashMap::new(),
                 metadata: HashMap::new(),
-                timestamp: 1_700_000_000 + i as i64,
+                timestamp: 1_700_000_000 + i64::try_from(i).expect("index fits i64"),
                 fsrs: FsrsState::default(),
                 workspace_id: None,
             }
@@ -238,12 +239,14 @@ fn aged_corpus(count: usize) -> Vec<MemoryEntry> {
                 metadata: HashMap::new(),
                 // Spread evenly across the whole span, so pair age gaps cover
                 // the full 0..1 range of `age_proximity`.
-                timestamp: 1_700_000_000 + (i as i64) * SPAN_SECS / (count.max(1) as i64),
+                timestamp: 1_700_000_000
+                        + i64::try_from(i).expect("index fits i64") * SPAN_SECS
+                            / i64::try_from(count.max(1)).expect("count fits i64"),
                 fsrs: FsrsState::default(),
                 workspace_id: None,
             };
-            entry.fsrs.access_count = (i % 17) as u32;
-            entry.fsrs.importance = 1.0 + (i % 5) as f32;
+            entry.fsrs.access_count = u32::try_from(i % 17).expect("fits u32");
+            entry.fsrs.importance = 1.0 + nanna_numeric::f32_from_usize(i % 5);
             entry
         })
         .collect()
@@ -257,7 +260,7 @@ fn with_store_timescale(memories: &[MemoryEntry], config: &ConsolidationConfig) 
         memories.iter().map(|e| e.timestamp).min(),
         memories.iter().map(|e| e.timestamp).max(),
     ) {
-        (Some(first), Some(last)) => (last - first) as f32 / 60.0,
+        (Some(first), Some(last)) => nanna_numeric::f32_from_i64(last - first) / 60.0,
         _ => 0.0,
     };
     config.clustering_weights.time_span_minutes = span_minutes.max(1.0);
@@ -280,12 +283,12 @@ fn run_aged_case(count: usize, base: &ConsolidationConfig) {
     let ns_per_pair = if pairs == 0 {
         0.0
     } else {
-        elapsed.as_secs_f64() * 1e9 / pairs as f64
+        elapsed.as_secs_f64() * 1e9 / nanna_numeric::f64_from_u64(pairs)
     };
     let pct = if pairs == 0 {
         0.0
     } else {
-        pruned as f64 * 100.0 / pairs as f64
+        nanna_numeric::f64_from_u64(pruned) * 100.0 / nanna_numeric::f64_from_u64(pairs)
     };
     println!(
         "{count:>8} {count:>8} {:>10} {pairs:>14} {wall_ms:>12.1} {ns_per_pair:>12.1}           pruned {pruned:>12} ({pct:.1}%)",
@@ -355,7 +358,7 @@ fn run_case(count: usize, topics: usize, spread: f32, related: bool, config: &Co
     let ns_per_pair = if pairs == 0 {
         0.0
     } else {
-        elapsed.as_secs_f64() * 1e9 / pairs as f64
+        elapsed.as_secs_f64() * 1e9 / nanna_numeric::f64_from_u64(pairs)
     };
     println!(
         "{count:>8} {topics:>8} {:>10} {pairs:>14} {wall_ms:>12.1} {ns_per_pair:>12.1}",

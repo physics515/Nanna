@@ -1,5 +1,9 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+// Solver depth only, as on the daemon crate roots: proving these futures
+// `Send` walks the wgpu/daemon type graph past the default limit of 128.
+#![recursion_limit = "256"]
 //! Quick GPU vs SIMD crossover benchmark (reduced matrix for faster runs)
-//! Run with: cargo bench -p nanna-gpu --bench gpu_vs_simd_quick
+//! Run with: cargo bench -p nanna-gpu --bench `gpu_vs_simd_quick`
 
 use std::time::{Duration, Instant};
 
@@ -26,7 +30,7 @@ fn generate_vectors(count: usize, dim: usize) -> Vec<Vec<f32>> {
                     let mut h = DefaultHasher::new();
                     (i * dim + j).hash(&mut h);
                     let bits = h.finish();
-                    (bits as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32
+                    nanna_numeric::f32_from_f64((nanna_numeric::f64_from_u64(bits) / nanna_numeric::f64_from_u64(u64::MAX)).mul_add(2.0, -1.0))
                 })
                 .collect();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -53,7 +57,7 @@ impl Stats {
     fn from(times: &[Duration]) -> Self {
         let sum: Duration = times.iter().sum();
         Self {
-            mean: sum / times.len() as u32,
+            mean: sum / u32::try_from(times.len()).expect("sample count fits u32"),
             min: *times.iter().min().unwrap(),
             max: *times.iter().max().unwrap(),
         }
@@ -85,7 +89,7 @@ where F: FnMut() -> Fut, Fut: std::future::Future<Output = Vec<f32>>
 }
 
 fn fmt_dur(d: Duration) -> String {
-    let us = d.as_nanos() as f64 / 1000.0;
+    let us = d.as_secs_f64() * 1e6;
     if us < 1000.0 { format!("{us:>8.1}µs") }
     else { format!("{:>8.2}ms", us / 1000.0) }
 }
@@ -95,7 +99,7 @@ fn fmt_dur(d: Duration) -> String {
 /// A ratio, not two more durations, because the column answers one question
 /// at a glance: is the gap between these two means bigger than the noise? A
 /// crossover read off means whose ranges overlap is not a crossover, and this
-/// bench is where the GPU_THRESHOLD number comes from.
+/// bench is where the `GPU_THRESHOLD` number comes from.
 ///
 /// A zero mean is guarded rather than assumed away: it would divide by zero
 /// and print `inf`, which reads as a measurement instead of an absence.
@@ -104,8 +108,8 @@ fn fmt_spread(s: &Stats) -> String {
     if mean_ns == 0 {
         return "  n/a".to_string();
     }
-    let range_ns = s.max.as_nanos().saturating_sub(s.min.as_nanos());
-    let percent = (range_ns as f64 / mean_ns as f64) * 100.0;
+    let range = s.max.saturating_sub(s.min);
+    let percent = range.as_secs_f64() / s.mean.as_secs_f64() * 100.0;
     format!("{percent:>4.0}%")
 }
 
@@ -155,7 +159,7 @@ fn main() {
         if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
             let gpu_stats = bench_async_fn(&rt, || gpu_batch_search(pipeline, ctx, query, &flat), warmup, iters);
 
-            let ratio = gpu_stats.mean.as_nanos() as f64 / simd.mean.as_nanos() as f64;
+            let ratio = gpu_stats.mean.as_secs_f64() * 1e9 / simd.mean.as_secs_f64() * 1e9;
             let winner = if ratio < 1.0 { "GPU" } else { "SIMD" };
 
             if ratio < 1.0 && crossover.is_none() {
@@ -202,7 +206,7 @@ fn main() {
 
             if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
                 let gpu_stats = bench_async_fn(&rt, || gpu_batch_search(pipeline, ctx, query, &flat), warmup, iters);
-                let ratio = gpu_stats.mean.as_nanos() as f64 / simd.mean.as_nanos() as f64;
+                let ratio = gpu_stats.mean.as_secs_f64() * 1e9 / simd.mean.as_secs_f64() * 1e9;
                 let winner = if ratio < 1.0 { "GPU" } else { "SIMD" };
                 println!(
                     "  {:>7} │ {} │ {} │ {} │ {} │ {:>6.2}× │ {winner}",
@@ -219,21 +223,34 @@ fn main() {
         println!();
     }
 
-    // GPU overhead measurement
     if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
-        println!("  GPU Fixed Overhead (1 vector, 768-dim):");
-        let q = &generate_vectors(1, 768)[0];
-        let sv = flatten_vectors(&generate_vectors(1, 768));
-        let overhead = bench_async_fn(&rt, || gpu_batch_search(pipeline, ctx, q, &sv), 3, 20);
-        let simd1 = bench_sync(|| { std::hint::black_box(nanna_simd::cosine_similarity_f32(q, &sv)); }, 3, 20);
-        println!("    GPU dispatch: {} (±{})", fmt_dur(overhead.mean), fmt_spread(&overhead).trim());
-        println!("    SIMD single:  {} (±{})", fmt_dur(simd1.mean), fmt_spread(&simd1).trim());
-        println!("    Overhead ratio: {:.0}×", overhead.mean.as_nanos() as f64 / simd1.mean.as_nanos() as f64);
-        println!();
+        measure_gpu_overhead(&rt, ctx, pipeline);
     }
 
     // Summary
     println!("══════════════════════════════════════════════════════════════");
+    print_summary(crossover, ctx.is_some());
+}
+
+/// The fixed cost of one GPU dispatch, against one SIMD cosine of the same size.
+fn measure_gpu_overhead(
+    rt: &tokio::runtime::Runtime,
+    ctx: &nanna_gpu::GpuContext,
+    pipeline: &nanna_gpu::CosineSimilaritySearch,
+) {
+    println!("  GPU Fixed Overhead (1 vector, 768-dim):");
+    let q = &generate_vectors(1, 768)[0];
+    let sv = flatten_vectors(&generate_vectors(1, 768));
+    let overhead = bench_async_fn(rt, || gpu_batch_search(pipeline, ctx, q, &sv), 3, 20);
+    let simd1 = bench_sync(|| { std::hint::black_box(nanna_simd::cosine_similarity_f32(q, &sv)); }, 3, 20);
+    println!("    GPU dispatch: {} (±{})", fmt_dur(overhead.mean), fmt_spread(&overhead).trim());
+    println!("    SIMD single:  {} (±{})", fmt_dur(simd1.mean), fmt_spread(&simd1).trim());
+    println!("    Overhead ratio: {:.0}×", overhead.mean.as_secs_f64() * 1e9 / simd1.mean.as_secs_f64() * 1e9);
+    println!();
+}
+
+/// The verdict the crossover (or its absence) supports.
+fn print_summary(crossover: Option<usize>, gpu_available: bool) {
     match crossover {
         Some(n) => {
             println!("  CROSSOVER: GPU becomes faster at ~{n} vectors (768-dim)");
@@ -243,7 +260,7 @@ fn main() {
                 println!("  → Threshold of 1000 is appropriate or aggressive.");
             }
         }
-        None if ctx.is_some() => {
+        None if gpu_available => {
             println!("  GPU never beat SIMD in tested range (up to 10,000 vectors).");
             println!("  → GPU dispatch overhead dominates. Consider removing GPU path");
             println!("    or only using it for very large batches (>10k).");

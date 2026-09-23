@@ -1,14 +1,15 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Behavioral tests for the `code_search` default skill, executed for real
 //! through the Boa engine with a bridge scoped to a temp directory.
 //!
 //! The contract under test (the same failure class PR #149 fixed in `explore`:
 //! an unbounded walk that marshals a whole workspace into Boa and blows the
-//! 30s script deadline before producing anything) — code_search additionally
+//! 30s script deadline before producing anything) — `code_search` additionally
 //! READ every candidate file to prove a negative, so it had two unbounded
 //! costs, not one:
 //!
 //! - discovery is level-by-level and non-recursive, honors `depth`, and never
-//!   descends into the noise dirs (node_modules, .git, target, ...);
+//!   descends into the noise dirs (`node_modules`, .git, target, ...);
 //! - a whole-file regex prefilter keeps non-matching files out of the per-line
 //!   pass, which measured ~99% of the cost, without dropping anchored matches;
 //! - the files that DO reach that pass are split in bounded ~4 KiB slices, so
@@ -36,7 +37,7 @@ fn skill_path() -> PathBuf {
         .join("../nanna-tools/default-skills/code_search/tool.ts")
 }
 
-/// Execute the real code_search tool.ts against `input`, sandboxed to `dir`.
+/// Execute the real `code_search` tool.ts against `input`, sandboxed to `dir`.
 async fn run_search(input: Value, dir: &Path) -> Result<Value, String> {
     let tool = ScriptedTool::from_file(skill_path())
         .expect("read code_search tool.ts")
@@ -692,7 +693,7 @@ fn tail(s: &str) -> &str {
 /// why the skill bounds wall-clock directly and caps the file size it will
 /// render context from, rather than budgeting bytes.
 ///
-/// Run: cargo test -p nanna-scripting --features boa --test code_search_skill \
+/// Run: cargo test -p nanna-scripting --features boa --test `code_search_skill` \
 ///        -- --ignored --nocapture throughput
 #[tokio::test]
 #[ignore = "throughput measurement, not an assertion"]
@@ -797,9 +798,9 @@ export default { name: "probe", execute: function(input) {
 }
 
 /// Manual timing check against a REAL large tree (the nanna repo root,
-/// including node_modules/.git/target). Ignored by default: wall-time on a
+/// including `node_modules/.git/target`). Ignored by default: wall-time on a
 /// shared box is not a stable assertion.
-/// Run: cargo test -p nanna-scripting --features boa --test code_search_skill \
+/// Run: cargo test -p nanna-scripting --features boa --test `code_search_skill` \
 ///        -- --ignored --nocapture timing
 #[tokio::test]
 #[ignore = "manual timing check against the real repo tree"]

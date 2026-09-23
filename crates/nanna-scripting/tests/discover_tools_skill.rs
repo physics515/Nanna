@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Behavioral tests for the `discover_tools` default skill, executed for real
 //! through the Boa engine.
 //!
@@ -65,7 +66,7 @@ fn defs() -> Value {
     ])
 }
 
-/// Execute the real discover_tools tool.ts against `input`, with tool
+/// Execute the real `discover_tools` tool.ts against `input`, with tool
 /// definitions attached but no tool-search fn (the fallback environment).
 async fn run_discover(input: Value) -> Result<Value, String> {
     let tool = ScriptedTool::from_file(skill_path())

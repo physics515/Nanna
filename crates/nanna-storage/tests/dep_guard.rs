@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Dependency guard: Turso is the *only* database engine.
 //!
 //! Nanna committed to a pure-Rust, SQLite-compatible embedded DB (`turso`) and
@@ -7,7 +8,7 @@
 //! enforces it.
 //!
 //! Note: `libsqlite3-sys` is intentionally *not* banned here — it arrives
-//! transitively through RustPython in `nanna-scripting` and is a separate
+//! transitively through `RustPython` in `nanna-scripting` and is a separate
 //! concern from the database engine choice.
 
 use std::path::PathBuf;

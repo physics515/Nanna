@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Child-process lifetime containment, shared by the exec tool
 //! (`nanna-scripting`), the acceptance runner (`nanna-agent`), and the daemon
 //! (`nanna-daemon`). One implementation because the contract is subtle and a
@@ -56,35 +57,49 @@ use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, GetCurrentProcess}
 /// (the `foo &` shape); pair it with a [`ChildJob`] to cover that. The Unix
 /// group kill has no such gap: background jobs of a non-interactive shell
 /// stay in the shell's process group even after the shell dies.
+#[cfg(windows)]
 pub async fn kill_process_tree(pid: u32) {
-    #[cfg(windows)]
-    {
-        let _ = tokio::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            // A windows-subsystem caller (the GUI tree-killing its daemon
-            // sidecar) must not flash a console for the walk; console
-            // callers can't tell — output is nulled either way.
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-    }
-    #[cfg(not(windows))]
-    {
-        // pid is a fresh process-group id from the kernel (the child leads
-        // its own group), so it fits pid_t and negating it cannot overflow. A
-        // pid that does not fit names no group we created: skip the signal,
-        // the same no-op a failed signal (group already gone) is.
-        let Ok(group_leader) = libc::pid_t::try_from(pid) else {
-            return;
-        };
-        // SAFETY: kill(2) with a negative pgid signals a process group we
-        // created; `process_group(0)` at spawn put the child in its own
-        // group, so this can never reach our own.
-        unsafe {
-            libc::kill(-group_leader, libc::SIGKILL);
-        }
+    let _ = tokio::process::Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        // A windows-subsystem caller (the GUI tree-killing its daemon
+        // sidecar) must not flash a console for the walk; console
+        // callers can't tell — output is nulled either way.
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+}
+
+/// See the Windows variant above for the contract.
+///
+/// The Unix walk is one `kill(2)`, so there is nothing to await; it still
+/// returns a future — run when polled, like the Windows walk — so every
+/// caller keeps the one call shape (`kill_process_tree(pid).await`) on both
+/// platforms.
+#[cfg(not(windows))]
+pub fn kill_process_tree(pid: u32) -> impl Future<Output = ()> + Send {
+    std::future::poll_fn(move |_| {
+        kill_process_group(pid);
+        std::task::Poll::Ready(())
+    })
+}
+
+/// `kill(-pgid, SIGKILL)` on the group `pid` leads.
+#[cfg(not(windows))]
+fn kill_process_group(pid: u32) {
+    // pid is a fresh process-group id from the kernel (the child leads
+    // its own group), so it fits pid_t and negating it cannot overflow. A
+    // pid that does not fit names no group we created: skip the signal,
+    // the same no-op a failed signal (group already gone) is.
+    let Ok(group_leader) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // SAFETY: kill(2) with a negative pgid signals a process group we
+    // created; `process_group(0)` at spawn put the child in its own
+    // group, so this can never reach our own.
+    unsafe {
+        libc::kill(-group_leader, libc::SIGKILL);
     }
 }
 
@@ -248,8 +263,10 @@ impl Drop for ChildJob {
     }
 }
 
-/// On Unix the per-spawn containment is the process group created at spawn
-/// (`process_group(0)`): background jobs of a non-interactive shell stay in
+/// The Unix stand-in for a job object: nothing, because the process group
+/// created at spawn already contains every descendant.
+///
+/// With `process_group(0)` background jobs of a non-interactive shell stay in
 /// that group, so [`kill_process_tree`]'s `kill(-pgid, SIGKILL)` reaps them
 /// even after the shell itself has exited. No job object exists or is
 /// needed; [`ChildJob::assign`] always returns `None` and callers keep the
@@ -262,15 +279,15 @@ impl ChildJob {
     /// Always `None`: see the type docs — the Unix process group already
     /// covers the detached-grandchild shape.
     #[must_use]
-    pub fn assign(_child: &tokio::process::Child) -> Option<Self> {
+    pub const fn assign(_child: &tokio::process::Child) -> Option<Self> {
         None
     }
 
     /// Unreachable (no value of `ChildJob` is ever constructed on Unix).
-    pub fn terminate(self) {}
+    pub const fn terminate(self) {}
 
     /// Unreachable (no value of `ChildJob` is ever constructed on Unix).
-    pub fn disarm(self) {}
+    pub const fn disarm(self) {}
 }
 
 #[cfg(test)]

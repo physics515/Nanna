@@ -3,7 +3,8 @@
 //! Every lossy or range-changing conversion the daemon needs lives here, each
 //! with the reason it is sound at the call sites that use it, so a reader
 //! auditing precision or truncation has one file to read instead of casts
-//! scattered through the crate.
+//! scattered through the crate. The float conversions are `nanna_numeric`'s,
+//! re-exported so the crate keeps this single import path.
 
 use std::time::Duration;
 
@@ -44,45 +45,4 @@ pub fn u32_clamped(value: i64) -> u32 {
     u32::try_from(value).unwrap_or(if value < 0 { 0 } else { u32::MAX })
 }
 
-/// `value` as an `f32`, rounding to the nearest representable value.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "f64 -> f32 has no lossless conversion; the callers pass importance \
-              weights and cosine similarities, which the memory store keeps as f32"
-)]
-pub const fn f32_from_f64(value: f64) -> f32 {
-    value as f32
-}
-
-/// `value` as an `f64`, rounding to the nearest representable value.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "u64 -> f64 has no lossless conversion; the callers compute rates and \
-              display averages from request counts and latencies, far below 2^52"
-)]
-pub const fn f64_from_u64(value: u64) -> f64 {
-    value as f64
-}
-
-/// `value` as an `i64`: truncates toward zero, clamps to the `i64` range, and
-/// maps NaN to 0.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "f64 -> i64 has no lossless conversion; the caller only converts whole \
-              values within 2^53, which are exact, and `as` saturates otherwise"
-)]
-pub const fn i64_from_f64(value: f64) -> i64 {
-    value as i64
-}
-
-/// `value` as a `u64`: truncates toward zero, clamps to `0..=u64::MAX`, and
-/// maps NaN to 0.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "f64 -> u64 has no lossless conversion; the callers round an estimated \
-              count first, and `as` already saturates at both ends"
-)]
-pub const fn u64_from_f64(value: f64) -> u64 {
-    value as u64
-}
+pub use nanna_numeric::{f32_from_f64, f64_from_u64, i64_from_f64, u64_from_f64};

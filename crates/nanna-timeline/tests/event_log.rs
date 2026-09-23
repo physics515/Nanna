@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! The properties the episodic log must hold against a real database, not a
 //! mock: the wall-clock ordering, the half-open window that lets adjacent
 //! buckets tile the axis, idempotent append under redelivery, workspace
@@ -14,7 +15,7 @@ fn temp_db_path(tag: &str) -> String {
     let dir = std::env::temp_dir().join(format!(
         "nanna_timeline_{tag}_{}_{:p}",
         std::process::id(),
-        &tag as *const _
+        &raw const tag
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -177,7 +178,7 @@ async fn oversized_content_is_capped_and_says_so() {
     assert_eq!(stored.content.chars().count(), MAX_EVENT_CONTENT_CHARS);
     assert_eq!(
         stored.content_len_chars,
-        (MAX_EVENT_CONTENT_CHARS + 250) as i64,
+        i64::try_from(MAX_EVENT_CONTENT_CHARS + 250).expect("length fits i64"),
         "the pre-truncation length is what makes the loss visible"
     );
     assert!(was_truncated(stored));
@@ -269,7 +270,7 @@ async fn every_kind_survives_a_round_trip_through_the_database() {
     ];
     for (i, kind) in kinds.iter().enumerate() {
         timeline
-            .append(&episode(*kind, i as i64, "k"))
+            .append(&episode(*kind, i64::try_from(i).expect("index fits i64"), "k"))
             .await
             .expect("append");
     }

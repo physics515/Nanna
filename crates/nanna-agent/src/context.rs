@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::numeric::{f32_to_usize, f64_to_usize, usize_to_f32, usize_to_f64};
+use crate::numeric::{usize_from_f32, usize_from_f64, f32_from_usize, f64_from_usize};
 
 /// Minimum content size (chars) to consider for deduplication
 const DEDUP_MIN_SIZE: usize = 4_000; // Lowered since CDC handles small chunks well
@@ -49,7 +49,7 @@ fn dedup_coverage(content: &str, known_hashes: &HashSet<u64>) -> f32 {
         return 0.0;
     }
     let known_count = chunks.iter().filter(|c| known_hashes.contains(&c.hash)).count();
-    usize_to_f32(known_count) / usize_to_f32(chunks.len())
+    f32_from_usize(known_count) / f32_from_usize(chunks.len())
 }
 
 /// Get chunk hashes for content (for dedup tracking after summarization).
@@ -959,7 +959,7 @@ impl AgentContext {
     /// above the token budget it came from. Reuses `nanna-llm`'s own ratio
     /// rather than restating one.
     fn chars_for_tokens(tokens: usize) -> usize {
-        f32_to_usize(usize_to_f32(tokens) * nanna_llm::CHARS_PER_TOKEN_CODE)
+        usize_from_f32(f32_from_usize(tokens) * nanna_llm::CHARS_PER_TOKEN_CODE)
     }
 
     /// Shrink `consolidated_summary` without an LLM so the preamble fits
@@ -1392,8 +1392,8 @@ impl AgentContext {
         let priority_bonus = if num_agents > 1 {
             let remaining_priority = (distributable * 10) / 100; // 10% for priority distribution
             let position_factor =
-                usize_to_f64(num_agents - 1 - agent_index) / usize_to_f64(num_agents - 1);
-            f64_to_usize((usize_to_f64(remaining_priority) * position_factor) / usize_to_f64(num_agents))
+                f64_from_usize(num_agents - 1 - agent_index) / f64_from_usize(num_agents - 1);
+            usize_from_f64((f64_from_usize(remaining_priority) * position_factor) / f64_from_usize(num_agents))
         } else {
             0
         };
@@ -1907,7 +1907,7 @@ impl AgentContext {
             request_tokens_saved = before.saturating_sub(after),
             compression = format!(
                 "{:.1}x",
-                usize_to_f64(consumed) / usize_to_f64(summary.len().max(1))
+                f64_from_usize(consumed) / f64_from_usize(summary.len().max(1))
             ),
             "Content summarized successfully"
         );

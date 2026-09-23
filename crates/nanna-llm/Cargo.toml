@@ -11,6 +11,7 @@ auto-refresh = ["nanna-config"]
 tiktoken = ["dep:tiktoken-rs"]
 
 [dependencies]
+nanna-numeric = { path = "../nanna-numeric" }
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true

@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! A 2026-07-28 MCP server built on the official Rust SDK (`rmcp`), over
 //! stdio: a second, independent implementation for nanna-mcp's live interop
 //! suite, next to the TypeScript SDK fixtures.

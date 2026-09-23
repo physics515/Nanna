@@ -1,9 +1,13 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+// Solver depth only, as on the daemon crate roots: proving these futures
+// `Send` walks the wgpu/daemon type graph past the default limit of 128.
+#![recursion_limit = "256"]
 //! What raising the clustering bar actually costs.
 //!
 //! Run with: `cargo bench -p nanna-memory --bench clustering_threshold_sweep`
 //!
 //! The 2026 agent-memory literature puts the clustering similarity bar around
-//! **θ_sim ≈ 0.7**; after the 2026-09-09 similarity-veto fix Nanna's composite
+//! **`θ_sim` ≈ 0.7**; after the 2026-09-09 similarity-veto fix Nanna's composite
 //! still only demands **cosine 0.10**, because the non-semantic floor (0.50)
 //! consumes most of the 0.55 threshold. Closing that gap is a
 //! compression-versus-fidelity trade, and this is the instrument for choosing

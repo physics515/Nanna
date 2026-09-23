@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Per-model embedding buckets and the durable queue.
 //!
 //! The property under test throughout: **a model's vectors are never destroyed
@@ -12,7 +13,7 @@ fn temp_db_path(tag: &str) -> String {
     let dir = std::env::temp_dir().join(format!(
         "nanna_buckets_{tag}_{}_{:p}",
         std::process::id(),
-        &tag as *const _
+        &raw const tag
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -52,7 +53,7 @@ fn memory(id: &str) -> NewMemory {
 /// turso 0.6.1 keeps every committed page in the WAL and does not checkpoint on
 /// close, so a test that reads only the `.db` file proves nothing — the bytes
 /// it is looking for have simply not been written there yet.
-async fn file_contains(db_path: &str, needle: &[u8]) -> bool {
+fn file_contains(db_path: &str, needle: &[u8]) -> bool {
     let bytes = std::fs::read(db_path).unwrap_or_default();
     let wal = std::fs::read(format!("{db_path}-wal")).unwrap_or_default();
     bytes.windows(needle.len()).any(|w| w == needle)
@@ -61,7 +62,7 @@ async fn file_contains(db_path: &str, needle: &[u8]) -> bool {
 
 /// A distinctive vector whose little-endian bytes will not occur by chance.
 fn sentinel() -> Vec<f32> {
-    (0..96).map(|i| (i as f32) * 7.531_9 + 3.140_1 + 404.5).collect()
+    (0..96_u16).map(|i| f32::from(i).mul_add(7.531_9, 3.140_1) + 404.5).collect()
 }
 
 fn chunk(parent: &str, ordinal: i64, text: &str) -> NewMemoryChunk {
@@ -70,7 +71,7 @@ fn chunk(parent: &str, ordinal: i64, text: &str) -> NewMemoryChunk {
         ordinal,
         content: text.to_string(),
         char_start: ordinal * 100,
-        char_end: ordinal * 100 + text.len() as i64,
+        char_end: ordinal * 100 + i64::try_from(text.len()).expect("chunk text length fits i64"),
         embedding: None,
         embedding_model: None,
         chunk_max_chars: 3200,
@@ -240,9 +241,9 @@ async fn deleting_a_memory_takes_its_buckets_and_queue_with_it() {
 
     assert!(repo.delete("m1").await.expect("delete"));
 
-    assert!(repo.memory_vectors("m1").await.expect("read").is_empty());
+    assert_eq!(repo.memory_vectors("m1").await.expect("read"), [] as [(std::string::String, std::vec::Vec<f32>); 0]);
     assert_eq!(repo.bucket_counts().await.expect("census").len(), 0);
-    assert!(repo.pending_embeddings("model", 10).await.expect("pending").is_empty());
+    assert_eq!(repo.pending_embeddings("model", 10).await.expect("pending"), [] as [(std::string::String, i64); 0]);
 }
 
 /// Ghost Vectors (arXiv 2606.18497): an embedding inverts back to its source
@@ -263,14 +264,14 @@ async fn deleting_a_memory_zeroes_every_bucket_not_just_one() {
 
     let needle: Vec<u8> = secret.iter().flat_map(|f| f.to_le_bytes()).collect();
     assert!(
-        file_contains(&db, &needle).await,
+        file_contains(&db, &needle),
         "precondition: the vector is on disk before the delete"
     );
 
     repo.delete("m1").await.expect("delete");
 
     assert!(
-        !file_contains(&db, &needle).await,
+        !file_contains(&db, &needle),
         "a surviving bucket inverts back to the deleted memory's text — zeroing          one model's vector while another remains is not a delete"
     );
 }
@@ -411,10 +412,10 @@ async fn rewriting_content_discards_every_stale_bucket() {
 
     repo.clear_memory_buckets("m1").await.expect("clear");
 
-    assert!(repo.memory_vectors("m1").await.expect("read").is_empty());
+    assert_eq!(repo.memory_vectors("m1").await.expect("read"), [] as [(std::string::String, std::vec::Vec<f32>); 0]);
     let needle: Vec<u8> = secret.iter().flat_map(|f| f.to_le_bytes()).collect();
     assert!(
-        !file_contains(&db, &needle).await,
+        !file_contains(&db, &needle),
         "a superseded vector is a copy of the superseded text, so it must be zeroed, not just unlinked"
     );
 }
@@ -488,7 +489,7 @@ async fn a_rewrite_destroys_the_old_chunk_vectors_on_disk() {
 
     let needle: Vec<u8> = secret.iter().flat_map(|f| f.to_le_bytes()).collect();
     assert!(
-        !file_contains(&db, &needle).await,
+        !file_contains(&db, &needle),
         "the superseded vector inverts back to the superseded text"
     );
 }
@@ -533,7 +534,7 @@ async fn pruning_keeps_configured_models_and_refuses_to_wipe() {
         .expect("retain");
     assert_eq!(dropped, 1);
     assert_eq!(repo.pending_embeddings("kept-model", 10).await.expect("kept").len(), 1);
-    assert!(repo.pending_embeddings("retired-model", 10).await.expect("gone").is_empty());
+    assert_eq!(repo.pending_embeddings("retired-model", 10).await.expect("gone"), [] as [(std::string::String, i64); 0]);
 
     let storage_for_panic = open(&db).await;
     let wipe = tokio::spawn(async move {

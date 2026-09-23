@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Suite 2c — the recall path: SQL exact k-NN vs the in-RAM SIMD scan.
 //!
 //! P13's "indexed clustering" item sequences the ANN question behind one
@@ -27,7 +28,7 @@
 //! credits the in-RAM path with a load it never paid for.
 //!
 //! Run with:
-//!   cargo bench -p nanna-bench --bench recall_path
+//!   cargo bench -p nanna-bench --bench `recall_path`
 //!
 //! The in-RAM arm is reproduced here from `nanna-memory`'s scan rather than
 //! calling `VectorStore` itself: `VectorStore::new` probes for a GPU adapter and

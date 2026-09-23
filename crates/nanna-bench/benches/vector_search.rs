@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Suite 2 — Vector search (SIMD default path).
 //!
 //! Criterion body that unifies the ad-hoc `nanna-gpu` benches onto the
@@ -6,7 +7,7 @@
 //! (`GPU_THRESHOLD = 50_000` in production).
 //!
 //! Run with:
-//!   cargo bench -p nanna-bench --bench vector_search
+//!   cargo bench -p nanna-bench --bench `vector_search`
 //!
 //! GPU half of the crossover stays in `nanna-gpu` benches (needs a live
 //! adapter); this body is the deterministic, hardware-independent SIMD gate.
