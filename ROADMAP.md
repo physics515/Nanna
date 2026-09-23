@@ -7593,6 +7593,175 @@ Each of these was proposed, tested against the evidence, and killed. Where a rea
 P24.6 items (1) and (2) must land before (4); P24.16's counter merge must land before its display change; P24.4's removal note should ship before its hold. P24.1 is an open PR and blocks nothing.
 ---
 
+### P25 — Task-driven Nanna: the board replaces the chat 🌱 (new — 2026-09-22, owner directive)
+
+**Direction.** Nanna stops being a chat with a task store behind it and becomes a task board with
+agents on it. The mental model is Todoist: the human creates a card, and creating a card assigns
+it. Agents are ordinary members of the board and look exactly like other humans. Conversations
+exist only as the forum-style thread on a card. The chat surface, the session concept and the
+channel adapters are removed. The design source of truth is the Figma file
+`N2M6tr7JQLg89RLM1O0reH` (page "Page 2", group `global`, with a *Decisions so far* card beside
+it); this section is the code-facing transcription of that card. It supersedes P19's framing
+("long-horizon IS the chat interface") and, for now, the North Star's "reachable from any
+channel" line — the board is the only surface until collaboration features bring remote access
+back through the board itself, not through chat.
+
+**What already exists (do not rebuild).** The task store is already Todoist-shaped: hierarchy via
+one optional `parent_id`, `depends_on` with *derived* `blocked`, `p1..p4`, labels, cron
+`recurrence`, an `acceptance` check of three kinds, a `task_activity` log with an actor per row,
+and "done is a verdict" enforced in `TaskRepository` (`crates/nanna-storage/src/tasks.rs`,
+`models.rs:175`). The filter parser already reads the Todoist subset (`task_filter.rs`). The
+IPC already has `TaskAction::{Create, Update, Done, Query, StartRun, RunStatus, CancelRun}`
+(`crates/nanna-daemon/src/protocol.rs:87`) — the GUI never called `Create`. `ModelChain`, the
+`StepKind` routing, the two-tier tool discovery, the withheld-services check, the scheduler
+(`Cron/At/Delayed`, `task_recurrence_sweep`) and dreaming all carry over unchanged. What changes
+is *direction of causality*: today `ChatAction::Send` is the only ingress and a task lives as long
+as its turn (`TurnAdmission`, scope default `session`).
+
+#### Decisions (owner-confirmed 2026-09-22 — treat as settled)
+
+1. **Kanban board, no chat.** Quick-add is the only free-text entry and it creates a card. It
+   parses Todoist-style tokens (`#label`, `p1-p4`, `@member`, natural dates); unrecognised text
+   stays in the title.
+2. **A conversation is the card's thread**, forum-style: asynchronous posts (comment, progress,
+   question, verdict) by a member. Nobody waits, nothing streams to the UI. Every post has a
+   member and a task; there are no orphan posts.
+3. **Members.** The human, every agent and the Task Management Agent share one entity:
+   `Member { id, name, avatar, kind: human | agent, owner: workspace | human, status }`. No agent
+   lanes, no agents page, no visible queue — you see only that a member is busy.
+4. **The Task Management Agent (router) is the only special member.** It takes no work. It wakes
+   on: card created, clarification completed, failed verdict, recurring card reopened, stalled,
+   heartbeat. It reads the card, each member's profile (model tier, capability tags, tools,
+   skills, cost), member status and outcome history, and decides: assign to a member, split into
+   sub-tasks, assign a clarification card to the human, or park with a reason. Every decision is a
+   thread post. It may change fields the human set, exactly as another human could. Its model is
+   the same priority list + fallback as any agent, configured on its profile.
+5. **The human fills in as much or as little as they like; the router completes the rest.** When
+   acceptance is blank the router writes the check and it stands unless the human edits it. No
+   approval step; work starts at once (owner rule: no permission gates).
+6. **Clarifications are cards assigned to the human** that the work card `depends_on`, so the work
+   is *blocked* (derived) until the human completes it. No new state, no modal, no timeout.
+7. **Failed verdict → back to the router** with the failure posted. **Reopened recurring card →
+   back to the router** (the sweep clears the assignee before firing `created`). A card that is
+   `in_progress` *with a live run* is never reassigned; `in_progress` with no live run past a
+   stall threshold is the `stalled` trigger.
+8. **Sub-task depth is unbounded** (one optional parent, never more). Flat vs nested is a board
+   toggle. The depth-32 cap stays as a safety bound, never as a product rule.
+9. **`Task.scope` defaults to `workspace`.** A card outlives every run and every thread. Session
+   scope and `TurnAdmission` are deleted.
+10. **Date vs deadline.** A *date* defers a card (out of the inbox until it arrives). A *deadline*
+    bounds it (must be complete by). Independent fields; `overdue` is measured against the
+    deadline; reminders hang off the deadline by default.
+11. **Inbox = assigned to me AND (no date OR date ≤ now).** No date means now. A global
+    *Upcoming* list shows everything assigned to me across workspaces, grouped by date. No Global
+    board.
+12. **One board per workspace** with an assignee filter. Humans share the whole workspace (board,
+    folders, memory, agents); on top, any human may add their own agents. One human today; many
+    later (collaboration is expected) — Member has its own identity and per-member inbox/
+    notifications from day one.
+13. **Memory and folders belong to the workspace**, shared by all members; never per-agent. A
+    personal agent carries its *owner's* memory between workspaces. One store + workspace scope
+    filter; dreaming once per workspace.
+14. **Every task is a memory. Every thread post is a memory.** Threads are *never* compacted — the
+    thread is the permanent record; dreaming consolidates and compacts the memory copies only.
+    Memories carry a pointer back to their source card/post.
+15. **Capability tags** are free text, set by the human when creating an agent; the router may
+    override them at the moment a task's success is evaluated (the verdict), so tags drift toward
+    what each agent actually passes.
+16. **Skills vs tools.** Skills are markdown files that teach an agent how to do something (a new
+    tier; the heartbeat prompt and scheduled prompts are the first candidates). Tools are little
+    programs the agent can run. Today's 47 `default-skills/*/tool.ts` **are tools and get
+    renamed**; the registry, discovery and `requires:` are untouched.
+17. **Heartbeat = a recurring card assigned to the router** that does all three: review stale
+    cards, re-nudge, trigger dreaming. It is not a chat turn.
+18. **Channels (Telegram, Discord, Slack) are removed entirely for now.**
+19. **Migration:** promote session-scoped tasks and memories to their session's workspace (label
+    the promoted cards so they can be filtered or bulk-closed; sessions without a workspace go to
+    `global`). **Delete the chat code up front** — session table, chat IPC verbs, GUI chat pages.
+    No hidden bridge; one path.
+
+#### Work (in build order)
+
+**Stage 1 — store and events (no UI yet).**
+- [ ] `members` table + `Member` model (`id, name, avatar, kind, owner_kind, owner_id, status,
+      profile JSON`); `tasks.assignee` becomes a foreign key to it. Seed one human member and the
+      per-workspace router member on migration.
+- [ ] `tasks.deadline_at` alongside `due_at` (which becomes the defer date); `overdue` computed
+      against the deadline; reminder default rebased onto it.
+- [ ] Default `scope = 'workspace'`; migration promotes `session`-scoped rows (tasks + memories) to
+      the session's `workspace_id`, else `global`, and stamps label `promoted`. Delete
+      `TurnAdmission` (`crates/nanna-daemon/src/tasks.rs:1210`) and its call sites in
+      `chat_harness.rs`.
+- [ ] Task lifecycle events on the broadcast bus: `created, assigned, status_changed, blocked,
+      unblocked, posted, due, overdue, verdict`. Run events stay. Consumers must not block the bus
+      (see the event-bus rule in memory).
+- [ ] Thread = `task_notes` with `author_member_id` and `kind ∈ {comment, progress, question,
+      verdict}` + attachments; never rewritten.
+- [ ] Memory write-through: on card create/close and on every post, write a workspace-scoped
+      memory carrying `source_task_id` / `source_note_id`. Dreaming operates only on these copies.
+- [ ] Per-member-per-label verdict rollup (a query over `task_activity` is enough) for the router.
+
+**Stage 2 — the router as a daemon role.**
+- [ ] `RouterService` per workspace subscribed to the bus; decisions are small structured outputs
+      (assign / split / clarify / park), each mirrored as a thread post. It runs on the router
+      member's `ModelChain`.
+- [ ] Triggers: `created` (skip cards the router itself created), clarification `done`, `verdict`
+      failed (bounded retries, then a clarification to the human), recurring reopen, `stalled`
+      (`in_progress` with no live run past threshold), heartbeat.
+- [ ] Completion rules: fill blank assignee / labels / acceptance / sub-tasks; may override
+      human-set fields; never reassign a card with a live run.
+- [ ] Capability-tag adjustment at verdict time; posts the change on the agent's profile thread.
+- [ ] Heartbeat becomes a recurring card assigned to the router; the `heartbeat_prompt` config and
+      the scheduler's chat-turn path are removed.
+
+**Stage 3 — runs started by assignment.**
+- [ ] `assigned` → start a harness run for that member on that card (reuse `AgentStepRunner` and
+      `TaskRunManager`); progress → `progress` posts; completion → the acceptance check → a
+      `verdict` post. No streaming to the UI.
+- [ ] Sub-agent spawning is replaced by "create a sub-task assigned to another member". Delete
+      `sub_agent`/`task` tool and `SubSessionInfo`.
+- [ ] `ask_user` becomes "create a clarification card assigned to the human, depended on by this
+      card"; the 30-minute wait and the channel broadcast go away.
+- [ ] Skills tier: markdown files with name + description, matched to cards by label and to
+      members by allow-list, loaded into the run's context. Rename `default-skills/` → tools
+      (directory, `DEFAULT_SKILLS`, build.rs, tests) in one mechanical PR.
+
+**Stage 4 — the board client, then the cut-over.**
+- [ ] Board per workspace (columns = states; filters: assignee, label, due, priority; flat/nested
+      toggle), Inbox, Upcoming, quick-add with the token parser (reuse `task_filter`; add
+      `@member`), card view with thread and profile pages for members.
+- [ ] Delete: session table + `SessionManager`, `ChatAction::*`, `chat_harness.rs` continuation
+      loop, empty-bubble gating, per-session pinned model, GUI chat pages and commands, channel
+      adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
+      target_session`. Update `docs/` and the North Star channel line.
+- [ ] One release carries the migration and the deletion together.
+
+#### Considered and rejected — do not re-raise
+
+- **Keep chat as a hidden bridge while the board is built.** Rejected by the owner: one path.
+- **A Conversation entity or a "chat with no task".** Rejected: the thread on a card is the only
+  conversation; quick-add is the only free-text entry.
+- **Per-agent memory.** Rejected: a coworker does not forget what the team knows.
+- **Swimlanes per agent / visible agent queues.** Rejected: agents are treated as humans; you see
+  busy, nothing more.
+- **A Global board.** Rejected: Inbox + Upcoming cover global-scope cards.
+- **A `waiting_on_user` status.** Unnecessary: a clarification is a card the work depends on, so
+  the work is `blocked` (derived).
+- **A special model chain for the router.** Rejected: same priority list + fallback as any agent.
+- **A fixed capability-tag vocabulary.** Not chosen: free text, human-set, router-adjusted at
+  verdict time.
+- **Compacting threads.** Rejected: threads are the permanent record; only their memory copies
+  are dreamed.
+- **A split-depth limit.** Rejected: unbounded; flat vs nested is a view toggle.
+
+#### Sequencing note
+
+Stage 1 must land before Stage 2 (the router needs members and events); Stage 3 needs Stage 2's
+`assigned` event; Stage 4's deletion PR must be the same release as the migration. The
+`default-skills` → tools rename is independent and can land any time after the decision.
+
+---
+
 ## Feature backlog (grouped — lower priority, pull as capacity allows)
 
 These are aspirational per-subsystem enhancements distilled from the old planning docs. Grouped to
