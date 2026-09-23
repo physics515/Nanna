@@ -7742,6 +7742,22 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [ ] Task lifecycle events on the broadcast bus: `created, assigned, status_changed, blocked,
       unblocked, posted, due, overdue, verdict`. Run events stay. Consumers must not block the bus
       (see the event-bus rule in memory).
+      *(2026-09-23 — scouted, deliberately not started, so the next run can go straight at it.)*
+      Add ONE variant beside the `TaskRun*` family in `crates/nanna-daemon/src/protocol.rs:1065`
+      (`TaskRunStarted`/`Progress`/`Completed` are about a **run**; these are store mutations).
+      `Event::session_id()` is exhaustive with no wildcard arm **on purpose** — a new variant will
+      not compile until it is classified there, and a task event belongs in the `None` group. Give
+      the variant a **typed** `TaskEventKind` rather than `TaskRunProgress`'s `String` kind: the
+      router will match on it, and `#[serde(rename_all = "snake_case")]` keeps the wire JSON the
+      same shape a JS client already expects.
+      **Four of the nine need machinery that does not exist yet — do not fake them.** `created`,
+      `assigned`, `status_changed`, `posted` and `verdict` have obvious emit points today
+      (`task_create`, the assignee/status arms of `apply_patch`, `post`, `complete`).
+      `blocked`/`unblocked` are *derived*, so they are transitions to be computed when a dependency
+      closes, not a field to read. `due`/`overdue` are time-driven and need a sweep — the natural
+      home is beside `task_recurrence_sweep`. Emitting five and calling the item done would leave
+      four kinds declared and never sent, which is the failure mode the dead-fields rule is about.
+      Land the five with their emit points, then the derived pair, then the sweep pair.
 - [x] Thread = `task_notes` with `author_member_id` and `kind ∈ {comment, progress, question,
       verdict}` + attachments; never rewritten.
       *(2026-09-23)* Migration `019_task_thread`. `TaskRepository::post` is the new write shape —
