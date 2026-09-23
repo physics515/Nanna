@@ -7780,6 +7780,22 @@ as its turn (`TurnAdmission`, scope default `session`).
       durability question, not a schema one. Filed below.
 - [ ] Memory write-through: on card create/close and on every post, write a workspace-scoped
       memory carrying `source_task_id` / `source_note_id`. Dreaming operates only on these copies.
+- [ ] **DSP timeline compression — feed the North Star's moat.** *(owner 2026-09-23: "add that to
+      the roadmap".)* `nanna-timeline` (`EventKind{Message,ToolCall,Recall,Outcome}`, `Episode`,
+      `Timeline`) and migration 014's `memory_events` exist with **no consumer**; the dreaming item
+      at the top of this file still lists phase (e) as open. The board gives it a natural feed: a
+      card's thread *is* an event series (post kind, member, time, salience) and so are the card's
+      state transitions. Build in this order, each step useful on its own: (1) write posts and
+      status/verdict transitions into `memory_events` with `source_ids` = the card and the post
+      (append-only, bounded content, truncation visible — the crate's three properties); (2) a
+      pure `compress_episode(events) -> Episode` in `nanna-timeline` that keeps salience peaks and
+      transitions and downsamples the rest (piecewise, deterministic, no LLM), with a fixed-seed
+      test corpus; (3) dream phase (e): per workspace, fold each closed card's episode into one
+      memory carrying the source pointers, leaving the thread untouched (decision 14); (4) add
+      `memory_events` to `SALVAGE_TABLES` (review finding) and a `dreaming.timeline_compression`
+      budget beside `dreaming.compression`. Not a dream on/off switch: dreaming has none, by design
+      (owner 2026-09-23) — the GUI's `set_dreaming_enabled` and `set_similarity_threshold` no-ops
+      are deleted in Stage 4.
 - [ ] Per-member-per-label verdict rollup (a query over `task_activity` is enough) for the router.
 
 **Stage 2 — the router as a daemon role.**
@@ -7816,6 +7832,191 @@ as its turn (`TurnAdmission`, scope default `session`).
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
       target_session`. Update `docs/` and the North Star channel line.
 - [ ] One release carries the migration and the deletion together.
+- [ ] Delete the memory settings that were never real: `set_dreaming_enabled` and
+      `set_similarity_threshold` are no-ops today. Dreaming is a core feature with no switch
+      (owner 2026-09-23); the recall threshold stays the calibrated `min_score` 0.40.
+
+#### Code review 2026-09-22 — what P25 deletes, what it must carry
+
+The full-workspace review (`nanna-code-review-2026-09-22.md`, 23 crates) landed the same day as
+this phase. Its findings split cleanly along P25's cut line, so they are filed here rather than as
+point fixes that would be deleted a stage later.
+
+**Deleted by P25 (do not fix, delete):** Discord inbound dead for humans and no gateway
+heartbeat; Telegram token in logs and GUI status text; the listener/sender `reply_to` id
+mismatch; Discord byte-chunking and Telegram legacy Markdown (all `nanna-channels` — decision 18);
+`SessionManager::update` losing or duplicating messages across a restart, `Fork` dropping
+workspace/model/tools, `History` ignoring `before` (session table — decision 19); a timed-out
+sub-session pinning `active_chats` forever and `KillSubSession` that kills nothing (sub-agents
+become sub-tasks — Stage 3); the park-waiter hot loop in `chat_harness.rs` (the continuation loop
+goes with the chat path); the per-channel pinned model and `subscribe_channel_status` task leak in
+the GUI.
+
+**Must carry into a stage (the board inherits these code paths):**
+- *Stage 1 / store:* `VectorStore::update_content` clears the bucket tables but not
+  `memories.embedding`, so an edited memory matches its old text after a restart (**high**); rows
+  parked without a vector by `update_content` never wake the drain; a NaN-scored row passes the
+  similarity gate; scoped recall drops global memories found only by chunk evidence;
+  `MemoryAction::Clear{scope:None}` clears RAM only and reports success; migrations run without a
+  transaction and `ADD COLUMN` is not idempotent; `prune_tool_call_log` compares RFC 3339 against
+  `datetime('now')` and always deletes the whole cutoff day.
+- *Stage 2 / router and scheduler:* the heartbeat executor is awaited inline in the scheduler's
+  `select!` loop (every other due task stalls behind a local-model turn) and its first
+  `interval()` tick fires immediately at boot — both must go before the heartbeat becomes the
+  router's recurring card; `llm_router::model_health` recomputes `retry_after` on every call so a
+  cooldown never expires; `ipc::send_response` holds the clients read guard across a bounded send.
+- *Stage 3 / runs:* `pin_live_request()` has no caller, so compression protects the oldest
+  message instead of the live request (**high**); `deduplicate_messages` replaces a re-read file
+  with a placeholder for the rest of the run once its first read was summarised (**high**); the
+  never-compressed `verified_outcomes` preamble grows without a reduction path; `is_context_length_error`
+  matches any 400 that mentions tokens and halves the conversation; concurrent `dispatch_tool_calls`
+  presented as sequential; native Anthropic stream errors yielded as `Ok(StreamEvent::…)` that the
+  only consumer ignores (**high**); engine timeouts report but never kill (Boa regex, Python
+  `while True`), `exec` timeout uncapped; `tools.update` can rewrite bundled skills and skips
+  `check_syntax`; manifest skills run without `kill_on_drop`.
+- *Stage 4 / client:* `search_memory` slices on non-char boundaries and aborts the GUI
+  (**high**); ~15 Tauri commands hold the `AppState` write lock across a daemon round trip;
+  `unsafe set_var` from commands; `update_skill` has no name validation. The new board client
+  starts from none of this code, so these are a checklist for what not to port, plus the one
+  shared surface (memory page) that survives.
+- *Independent of P25, fix when in the file:* `nanna-simd` does not compile on aarch64 (trailing
+  semicolon in the NEON arm — the macOS release target); the REST reply returns the oldest
+  message; `nanna server` runs two schedulers; Slack/Discord webhook handlers run a full turn before
+  acking.
+
+The review's cross-cutting pattern — lifecycle bookkeeping released by hand at a function's tail —
+is the reason Stage 2's router and Stage 3's run start should register and release through RAII
+guards from the first commit.
+
+#### Filed from the review — every finding that survives the cut, as work items
+
+Each line is one finding from the 2026-09-22 review, kept only if the code path exists after
+P25. Grouped by the stage that owns the path; "delete" lines are here so nobody fixes them.
+
+**Delete with the chat, sessions and channels (Stage 4 cut-over) — do not fix:**
+- [ ] `nanna-channels` in full: Discord `author.bot` short-circuit, missing gateway heartbeat,
+      Telegram token in error Display, composite `reply_to` ids, byte chunking, legacy Markdown,
+      Signal/WhatsApp 120 s SSE cut, dead signald/Slack upload paths, queue write-lock send.
+- [ ] `nanna-server` webhooks (`slack.rs`, `discord.rs`, `telegram.rs`, `signal.rs`): full turn
+      before ack, own replay check, webhook-reply Markdown, Signal bypassing `process_message`,
+      unbounded `AppState.agents`. What stays of `nanna-server` is decided when remote board access
+      is designed (collaboration); until then it is not a supported surface.
+- [ ] `session.rs`: `update()` persisting the row but not the messages, `Fork` copying messages
+      only, `History` ignoring `before`, write guard held across `persist_message`,
+      `recover_checkpoints` reporting success into a missing session.
+- [ ] `control/session.rs`: sub-session timeout leaking `active_chats`, `KillSubSession` flag
+      nobody reads, `SubSessionInfo` state overwritten on finish; `agent_service.rs` `try_write`
+      dropping stream deltas into the recovery buffers.
+- [ ] `chat_harness.rs` park-waiter hot loop and the continuation loop; GUI
+      `subscribe_channel_status` task leak, per-channel pinned model, `daemon_client.rs` dead
+      "not connected" path.
+- [ ] Exported-but-unused subsystems the review flagged as rotting: `AgentRegistry` (lock-order
+      inversion), `Supervisor` (health check every 5 s, never runs an agent), `MultiAgent`
+      (`cancel_task` overwritten), the Rust built-in tools (`..` traversal, `ListDirTool` ignores
+      `base_dir`, substring denylist, `max_size` unenforced), the Deno path, `WorkspaceManager`
+      stale cache, old MCP `HttpTransport`/`McpManager`, `re_embed_mismatched`, `tool_stats`
+      per-session half. Delete rather than fix; sub-agents are sub-tasks, tools are `tool.ts`.
+
+**Stage 1 — store, memory, storage:**
+- [ ] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and
+      call `note_vector_queued` (the durable half of the 2026-08 fix; `nanna-memory/src/lib.rs:1268`,
+      `service.rs:1949,1059`).
+- [ ] `rank_and_assemble`: keep global memories that matched only by chunk under a scoped recall;
+      reject NaN scores before the gate and sort with a total order (`service.rs:1634-1662`).
+- [ ] `MemoryAction::Clear{scope:None}` must be durable or refuse; `save_entry`'s conflict
+      fallback must propagate its three errors (`control/memory.rs:194`, `memory_persistence.rs:189`).
+- [ ] `memory.search` and `memory_in_scope` disagree on `scope:"global"`; one meaning
+      (`control/memory.rs:14,125`). The board's memory page is the surviving consumer.
+- [ ] Migrations: wrap each in a transaction where turso allows, or make `ADD COLUMN` idempotent
+      by probing `pragma_table_info` first; add `memory_events` to `SALVAGE_TABLES`; salvage by
+      column name, not position (`migrations.rs:111`, `recovery.rs:51,383`).
+- [ ] `prune_tool_call_log` cutoff format; hourly vs daily tool aggregates disagree on
+      short-circuited calls; `create_gui_session_with_workspace` unescaped JSON; `tasks.rs:828`
+      `clear` treating a read error as "already deleted" (`nanna-storage/src/lib.rs:1226,1034,229`).
+- [ ] `chunks_needing_embedding` returns fabricated `MemoryChunk` fields — narrow the type;
+      `consolidated_metadata` doc says first-writer-wins and implements unanimity; the two dream
+      gates are verbatim duplicates (`repositories.rs:1211`, `consolidation.rs:1027`, `dreaming.rs:321`).
+- [ ] `memory.get` performs three full `list_all()` clones (`server.rs:1162`).
+
+**Stage 2 — router, scheduler, IPC, config:**
+- [ ] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
+      `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
+      table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
+- [ ] `llm_router::model_health` cooldown never expires (`retry_after` recomputed per call);
+      `dream_summarizer` double-waits and exits without waiting on the last round
+      (`llm_router.rs:508`, `dream_summarizer.rs:228`).
+- [ ] `ipc::send_response` clones the `Sender` out of the guard before awaiting; `Action`'s
+      `Debug` must redact `ValidateApiKey.key` and `ConfigAction::Set` secret values
+      (`ipc.rs:396,664`, `protocol.rs:711`).
+- [ ] `SchedulerAction::Update` reports success for unknown ids; `reminder_service` bound check
+      under a read guard; `windows_service` reports Running after an early daemon exit; service
+      plist/unit paths unquoted (`control/scheduler.rs:37`, `reminder_service.rs:218`,
+      `windows_service.rs:362`, `service.rs:297`).
+- [ ] Config: `file_encryption_key` must pick one key source and stick to it; `SecureStore::set`
+      must remove the file copy like `delete` does; `save_to` writes atomically (tmp + rename)
+      because the daemon watches the file; document env precedence (`credentials.rs:639,224`,
+      `lib.rs:975,1667`); `hydrate_ollama_token` binds a blank token (`lib.rs:1195`).
+- [ ] `ParentChannelImpl.model` is a boot-time clone; the router member's profile replaces
+      `ask_parent` entirely (Stage 3), so delete rather than reconcile (`server.rs:4779`).
+
+**Stage 3 — runs, context, LLM, tools:**
+- [ ] Call `pin_live_request()` when the card's prompt is appended, and make the run's tests
+      drive compression through the real entry path (`context.rs:457`, `agent_service.rs:1347`).
+- [ ] `deduplicate_messages` must never replace the newest tool result, and chunk hashes must
+      clear when their summary is dropped (`context.rs:779-866`, `2272`).
+- [ ] `verified_outcomes` needs a reduction path (fold read-only successes, cap by budget) and
+      must be pruned when an item is reopened as regressed (`loop_runner.rs:7188`, `harness.rs:3574`).
+- [ ] `is_context_length_error` must not match provider 400s about `max_tokens`; the token-budget
+      check must run after the paid-for reply is stored; a cancel after a finalised `tool_use` must
+      pair it with "[Skipped]" results (`loop_runner.rs:8130,4587,4592`).
+- [ ] `dispatch_tool_calls` runs a turn's calls concurrently but presents them sequentially:
+      either serialise writes-before-execs or say so in the results (`loop_runner.rs:7442`).
+- [ ] Model routing strips the provider prefix but always calls the primary provider
+      (`loop_runner.rs:5361`); the per-member `ModelChain` replaces this path.
+- [ ] LLM: native Anthropic stream errors and `overloaded_error` must surface as `Err` to the
+      chain walk, not `Ok(StreamEvent::…)`; OpenAI stream error envelopes must classify (429) rather
+      than close as an empty reply; `complete_ollama` needs `<think>` stripping and `done:false`
+      detection like the streaming path; `embed_ollama_one` must read the error body before falling
+      back; `x-ratelimit-reset-*` parsing, `think` on the stream body, `done:true` without newline
+      (`nanna-llm/src/lib.rs:5096,7165,6593,3977,4815,4364,5603,6330`).
+- [ ] Engines: a timeout must kill — Boa `runtime_limits` + a cancellable thread, Python engine
+      the same; cap the model-supplied `exec` timeout; `js_to_json` needs a depth bound and a
+      visited set; `SystemExit` must carry its status; manifest skills with `kill_on_drop`; the
+      registry backstop must extend for undeclared timeouts too (`boa_impl.rs:43,779`,
+      `python.rs:147,374`, `engine.rs:414,203`, `skills/executable.rs:150`).
+- [ ] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
+      `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
+      move with the `default-skills` → tools rename.
+- [ ] Smaller: `strip_ansi_escapes` OSC/non-CSI; missing `workdir` misreported as missing command;
+      `Nanna.readFile` size ceiling; `timeout_secs * 1000` overflow; `run_git` buffers before the
+      cap; `dump_empty_step` unbounded log outside the data dir; strict `as_u64` where Boa hands
+      over `f64`; `fit_image_to_limit` ignores `quality` (`bridge.rs`, `scripted.rs:83`,
+      `git.rs:206`, `tasks.rs:2344`, `server.rs:916`, `image_util.rs`).
+- [ ] MCP (kept, healthiest crate): transport timeout must honour the advertised 60 s and not cut
+      SSE bodies; `ToolContent` must accept `resource_link`/`audio`; drain `pending` on EOF; follow
+      `next_cursor`; log `tools/list` failures; drop the dead duplicates
+      (`transport.rs:480,404,823`, `protocol.rs:409`, `client.rs:296,378`).
+- [ ] Browser (kept as tools): `navigate` needs a deadline and must not hold the browser lock
+      across it; `close` must close the target; `wait_for_selector` must wait; escape selectors
+      (`cdp.rs:140,489`, `playwright.rs:254`).
+
+**Stage 4 — the board client and what it must not port:**
+- [ ] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
+      (`scheduler.rs:28`, `settings.rs:454,519,550` and siblings); no `unsafe set_var` from
+      commands; `import_config` must reload secrets; `search_memory` must slice on char
+      boundaries (or be replaced by the daemon's `memory.search`).
+- [ ] CLI: `nanna sessions/chat/run` ignore `[general] data_dir` (`cli.rs:390`, `setup.rs:241`);
+      `register_discover_tools` `.expect` on a user-editable file (`setup.rs:319`). The CLI's chat
+      commands go with the chat; `run` becomes "create a card and watch it".
+- [ ] `nanna-client`: `auto_reconnect`/`max_reconnect_attempts`/`Reconnecting` are declared and
+      never read; a failed send leaves a `pending` entry (`connection.rs:28,327`). The board client
+      needs reconnect for real.
+
+**Independent — fix when in the file:**
+- [ ] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
+      (`lib.rs:174,204`); `nanna-gpu` `search` must check buffer limits, `append` dirty index
+      off-by-one; `nanna-bench` fixture divides by 24 576 instead of 2^24; `src/installer/windows/
+      Cargo.toml` declares a missing `build.rs`.
 
 #### Considered and rejected — do not re-raise
 
