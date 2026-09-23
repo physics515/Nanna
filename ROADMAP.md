@@ -9402,6 +9402,16 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  should now pass — but two embedded database engines in one binary is its own
                  cost, and the standing rule "never a pre-release on an exact pin" blocks moving
                  Nanna's own pin to `0.8.0-pre.x`. So:
+                 **But Mummu has to move first, and it has not.** Checked its real
+                 lockfile 2026-09-23, not its manifest: `/mnt/deepmem/Development/mummu`
+                 pins `burn 0.22.0-pre.3` (and `burn-cubecl =0.22.0-pre.3`), which
+                 resolves `cubecl-environment 0.11.0-pre.3` and therefore
+                 **`rusqlite 0.40.2` is still in Mummu's lock today**. So "cubecl is
+                 fixed" does **not** yet mean "adding mummu works" — the ordering is
+                 Mummu bumps burn `0.22.0-pre.3 → pre.4`, *then* Nanna can re-try. File
+                 the burn bump in Mummu's roadmap; do not spend a Nanna build on the
+                 integration before it lands, because the guard will fail for a reason
+                 that is not Nanna's.
                  - [ ] **Once `turso 0.8.0` goes stable, move Nanna's pin to it and re-try adding
                        `mummu`** — that is the single step that collapses the split and makes P12
                        item 4 (Mummu's MiniLM embedder behind the memory `embed_fn`) buildable.
