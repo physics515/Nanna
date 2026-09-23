@@ -7780,6 +7780,22 @@ as its turn (`TurnAdmission`, scope default `session`).
       durability question, not a schema one. Filed below.
 - [ ] Memory write-through: on card create/close and on every post, write a workspace-scoped
       memory carrying `source_task_id` / `source_note_id`. Dreaming operates only on these copies.
+- [ ] **DSP timeline compression — feed the North Star's moat.** *(owner 2026-09-23: "add that to
+      the roadmap".)* `nanna-timeline` (`EventKind{Message,ToolCall,Recall,Outcome}`, `Episode`,
+      `Timeline`) and migration 014's `memory_events` exist with **no consumer**; the dreaming item
+      at the top of this file still lists phase (e) as open. The board gives it a natural feed: a
+      card's thread *is* an event series (post kind, member, time, salience) and so are the card's
+      state transitions. Build in this order, each step useful on its own: (1) write posts and
+      status/verdict transitions into `memory_events` with `source_ids` = the card and the post
+      (append-only, bounded content, truncation visible — the crate's three properties); (2) a
+      pure `compress_episode(events) -> Episode` in `nanna-timeline` that keeps salience peaks and
+      transitions and downsamples the rest (piecewise, deterministic, no LLM), with a fixed-seed
+      test corpus; (3) dream phase (e): per workspace, fold each closed card's episode into one
+      memory carrying the source pointers, leaving the thread untouched (decision 14); (4) add
+      `memory_events` to `SALVAGE_TABLES` (review finding) and a `dreaming.timeline_compression`
+      budget beside `dreaming.compression`. Not a dream on/off switch: dreaming has none, by design
+      (owner 2026-09-23) — the GUI's `set_dreaming_enabled` and `set_similarity_threshold` no-ops
+      are deleted in Stage 4.
 - [ ] Per-member-per-label verdict rollup (a query over `task_activity` is enough) for the router.
 
 **Stage 2 — the router as a daemon role.**
@@ -7816,6 +7832,61 @@ as its turn (`TurnAdmission`, scope default `session`).
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
       target_session`. Update `docs/` and the North Star channel line.
 - [ ] One release carries the migration and the deletion together.
+- [ ] Delete the memory settings that were never real: `set_dreaming_enabled` and
+      `set_similarity_threshold` are no-ops today. Dreaming is a core feature with no switch
+      (owner 2026-09-23); the recall threshold stays the calibrated `min_score` 0.40.
+
+#### Code review 2026-09-22 — what P25 deletes, what it must carry
+
+The full-workspace review (`nanna-code-review-2026-09-22.md`, 23 crates) landed the same day as
+this phase. Its findings split cleanly along P25's cut line, so they are filed here rather than as
+point fixes that would be deleted a stage later.
+
+**Deleted by P25 (do not fix, delete):** Discord inbound dead for humans and no gateway
+heartbeat; Telegram token in logs and GUI status text; the listener/sender `reply_to` id
+mismatch; Discord byte-chunking and Telegram legacy Markdown (all `nanna-channels` — decision 18);
+`SessionManager::update` losing or duplicating messages across a restart, `Fork` dropping
+workspace/model/tools, `History` ignoring `before` (session table — decision 19); a timed-out
+sub-session pinning `active_chats` forever and `KillSubSession` that kills nothing (sub-agents
+become sub-tasks — Stage 3); the park-waiter hot loop in `chat_harness.rs` (the continuation loop
+goes with the chat path); the per-channel pinned model and `subscribe_channel_status` task leak in
+the GUI.
+
+**Must carry into a stage (the board inherits these code paths):**
+- *Stage 1 / store:* `VectorStore::update_content` clears the bucket tables but not
+  `memories.embedding`, so an edited memory matches its old text after a restart (**high**); rows
+  parked without a vector by `update_content` never wake the drain; a NaN-scored row passes the
+  similarity gate; scoped recall drops global memories found only by chunk evidence;
+  `MemoryAction::Clear{scope:None}` clears RAM only and reports success; migrations run without a
+  transaction and `ADD COLUMN` is not idempotent; `prune_tool_call_log` compares RFC 3339 against
+  `datetime('now')` and always deletes the whole cutoff day.
+- *Stage 2 / router and scheduler:* the heartbeat executor is awaited inline in the scheduler's
+  `select!` loop (every other due task stalls behind a local-model turn) and its first
+  `interval()` tick fires immediately at boot — both must go before the heartbeat becomes the
+  router's recurring card; `llm_router::model_health` recomputes `retry_after` on every call so a
+  cooldown never expires; `ipc::send_response` holds the clients read guard across a bounded send.
+- *Stage 3 / runs:* `pin_live_request()` has no caller, so compression protects the oldest
+  message instead of the live request (**high**); `deduplicate_messages` replaces a re-read file
+  with a placeholder for the rest of the run once its first read was summarised (**high**); the
+  never-compressed `verified_outcomes` preamble grows without a reduction path; `is_context_length_error`
+  matches any 400 that mentions tokens and halves the conversation; concurrent `dispatch_tool_calls`
+  presented as sequential; native Anthropic stream errors yielded as `Ok(StreamEvent::…)` that the
+  only consumer ignores (**high**); engine timeouts report but never kill (Boa regex, Python
+  `while True`), `exec` timeout uncapped; `tools.update` can rewrite bundled skills and skips
+  `check_syntax`; manifest skills run without `kill_on_drop`.
+- *Stage 4 / client:* `search_memory` slices on non-char boundaries and aborts the GUI
+  (**high**); ~15 Tauri commands hold the `AppState` write lock across a daemon round trip;
+  `unsafe set_var` from commands; `update_skill` has no name validation. The new board client
+  starts from none of this code, so these are a checklist for what not to port, plus the one
+  shared surface (memory page) that survives.
+- *Independent of P25, fix when in the file:* `nanna-simd` does not compile on aarch64 (trailing
+  semicolon in the NEON arm — the macOS release target); the REST reply returns the oldest
+  message; `nanna server` runs two schedulers; Slack/Discord webhook handlers run a full turn before
+  acking.
+
+The review's cross-cutting pattern — lifecycle bookkeeping released by hand at a function's tail —
+is the reason Stage 2's router and Stage 3's run start should register and release through RAII
+guards from the first commit.
 
 #### Considered and rejected — do not re-raise
 
