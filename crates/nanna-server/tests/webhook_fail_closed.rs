@@ -1,3 +1,7 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+// Solver depth only, as on the daemon crate roots: proving these futures
+// `Send` walks the wgpu/daemon type graph past the default limit of 128.
+#![recursion_limit = "256"]
 //! `nanna serve`'s inbound webhook surface must fail CLOSED.
 //!
 //! The `nanna-daemon` copy of this surface has had an end-to-end harness since
@@ -62,7 +66,7 @@ const DISCORD_PING: &str = r#"{"id":"1","type":1,"token":"t"}"#;
 const SLACK_URL_VERIFICATION: &str = r#"{"type":"url_verification","challenge":"c0ffee"}"#;
 
 /// Every webhook route, paired with a body that deserializes on it.
-fn routes() -> [(&'static str, &'static str); 5] {
+const fn routes() -> [(&'static str, &'static str); 5] {
     [
         ("/webhooks/telegram", TELEGRAM_NO_MESSAGE),
         ("/webhooks/discord", DISCORD_PING),
@@ -359,14 +363,13 @@ async fn slack_admits_only_a_correctly_signed_request() {
 async fn discord_admits_only_a_fresh_correctly_signed_request() {
     // A deterministic signing key, and the hex public key an operator pastes
     // into config.
-    let signing = SigningKey::from_bytes(&[7u8; 32]);
-    let public_key = hex::encode(signing.verifying_key().to_bytes());
-
     async fn armed(public_key: &str) -> AppState {
         let mut state = unconfigured_state().await;
         state.discord_public_key = Some(public_key.to_string());
         state
     }
+    let signing = SigningKey::from_bytes(&[7u8; 32]);
+    let public_key = hex::encode(signing.verifying_key().to_bytes());
     let sign = |timestamp: &str| {
         hex::encode(
             signing

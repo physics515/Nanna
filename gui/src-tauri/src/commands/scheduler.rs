@@ -170,8 +170,7 @@ pub async fn list_cron_jobs(
     let jobs = result
         .get("jobs")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(cron_job_info_from_daemon).collect())
-        .unwrap_or_default();
+        .map_or_default(|arr| arr.iter().filter_map(cron_job_info_from_daemon).collect());
     Ok(jobs)
 }
 
@@ -309,13 +308,12 @@ pub async fn delete_cron_jobs_by_name(
     let ids: Vec<String> = result
         .get("jobs")
         .and_then(|v| v.as_array())
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter(|j| j.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
                 .filter_map(|j| j.get("id").and_then(|v| v.as_str()).map(str::to_string))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let mut removed = 0;
     for id in &ids {
         let result = backend.scheduler_remove(id).await?;
@@ -371,7 +369,7 @@ pub async fn get_cron_job_history(
     let runs = result
         .get("history")
         .and_then(|v| v.as_array())
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .map(|r| JobRunInfo {
                     id: r.get("run_id").and_then(serde_json::Value::as_i64).unwrap_or(0),
@@ -384,8 +382,7 @@ pub async fn get_cron_job_history(
                     duration_ms: None,
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     Ok(runs)
 }
 

@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! The four `browser.*` services against a real Chromium and a real page.
 //!
 //! Every other service this run wired — `vision.analyze`, `audio.*` — could be
@@ -142,7 +143,7 @@ async fn the_browser_services_drive_a_real_page() {
         bytes.len()
     );
     assert_eq!(
-        shot["size"].as_u64().unwrap_or_default() as usize,
+        usize::try_from(shot["size"].as_u64().unwrap_or_default()).expect("size fits usize"),
         bytes.len(),
         "the reported size does not match the file"
     );

@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Behavioral tests for the `write_file` default skill (v0.1.4), executed
 //! for real through the Boa engine. Covers the structured guidance
 //! failures, the versioned-copy-name refusal, and the shrink guard. The

@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Every service a bundled skill declares must be one the daemon can register.
 //!
 //! A scripted skill declares its daemon-side dependencies as

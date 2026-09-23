@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Build script for nanna-tools: generates embedded default skills for release builds.
 //!
 //! Scans `default-skills/` and emits a Rust source file containing all skill files
@@ -35,10 +36,10 @@ fn main() {
     {
         let mut dirs: Vec<_> = fs::read_dir(skills_dir)
             .expect("cannot read default-skills/")
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.path().is_dir())
             .collect();
-        dirs.sort_by_key(|e| e.file_name());
+        dirs.sort_by_key(std::fs::DirEntry::file_name);
 
         for entry in &dirs {
             let skill_name = entry.file_name();
@@ -48,21 +49,21 @@ fn main() {
             // Each file in the skill directory gets embedded
             let mut files: Vec<_> = fs::read_dir(&skill_path)
                 .unwrap()
-                .filter_map(|f| f.ok())
+                .filter_map(std::result::Result::ok)
                 .filter(|f| f.path().is_file())
                 .collect();
-            files.sort_by_key(|f| f.file_name());
+            files.sort_by_key(std::fs::DirEntry::file_name);
 
             for file in &files {
                 let file_name = file.file_name();
                 let file_name = file_name.to_string_lossy();
-                let rel_path = format!("default-skills/{}/{}", skill_name, file_name);
+                let rel_path = format!("default-skills/{skill_name}/{file_name}");
 
                 entries.push((skill_name.to_string(), file_name.to_string(), rel_path));
             }
 
             // Also rerun if any individual skill file changes
-            println!("cargo:rerun-if-changed=default-skills/{}", skill_name);
+            println!("cargo:rerun-if-changed=default-skills/{skill_name}");
         }
     }
 
@@ -82,12 +83,11 @@ fn main() {
 
     for (skill_name, file_name, rel_path) in &entries {
         writeln!(out, "    EmbeddedSkillFile {{").unwrap();
-        writeln!(out, "        skill_name: \"{}\",", skill_name).unwrap();
-        writeln!(out, "        file_name: \"{}\",", file_name).unwrap();
+        writeln!(out, "        skill_name: \"{skill_name}\",").unwrap();
+        writeln!(out, "        file_name: \"{file_name}\",").unwrap();
         writeln!(
             out,
-            "        content: include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/{}\")),",
-            rel_path
+            "        content: include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/{rel_path}\")),"
         )
         .unwrap();
         writeln!(out, "    }},").unwrap();

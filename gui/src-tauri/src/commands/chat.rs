@@ -60,7 +60,7 @@ pub async fn send_message(
     let tool_calls = result
         .get("tool_calls")
         .and_then(|v| v.as_array())
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(|tc| {
                     Some(ToolCallInfo {
@@ -74,8 +74,7 @@ pub async fn send_message(
                     })
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
 
     Ok(ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),

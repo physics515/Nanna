@@ -25,6 +25,10 @@ pub type ServiceFn = Arc<
         + Sync,
 >;
 
+/// The services a skill can reach, keyed by the name scripts pass to
+/// `Nanna.service(name, params)`.
+pub type ServiceMap = HashMap<String, ServiceFn>;
+
 /// A synchronous ranked tool-search function backing `Nanna.searchTools(query)`.
 ///
 /// Receives `(query, limit)` and returns a JSON array of

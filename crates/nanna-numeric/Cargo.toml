@@ -1,0 +1,12 @@
+[package]
+name = "nanna-numeric"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Numeric conversions std only offers as `as` casts, rebuilt from lossless pieces"
+
+# Deliberately dependency-free: every crate in the workspace can take it
+# without a cycle, which is what lets the conversions live in exactly one place.
+[dependencies]

@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 // An integration test is its own crate root: the daemon crate's
 // `recursion_limit` does not reach it, and driving `DaemonServer::run` walks
 // the same deep `Send` proof (see `crates/nanna-client/tests/e2e_daemon.rs`).

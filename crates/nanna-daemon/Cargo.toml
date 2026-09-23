@@ -15,6 +15,7 @@ name = "nanna_daemon"
 path = "src/lib.rs"
 
 [dependencies]
+nanna-numeric = { path = "../nanna-numeric" }
 # Internal crates
 nanna-core = { path = "../nanna-core" }
 nanna-agent = { path = "../nanna-agent" }

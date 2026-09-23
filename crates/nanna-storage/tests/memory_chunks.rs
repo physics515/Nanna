@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! `memory_chunks` behaviour: replacement, paging, the backfill queue, k-NN,
 //! and the two properties that would otherwise silently rot — cascade delete
 //! and secure delete.
@@ -15,7 +16,7 @@ fn temp_db_path(tag: &str) -> String {
     let dir = std::env::temp_dir().join(format!(
         "nanna_chunks_{tag}_{}_{:p}",
         std::process::id(),
-        &tag as *const _
+        &raw const tag
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -56,7 +57,7 @@ fn chunk(parent: &str, ordinal: i64, text: &str, embedding: Option<Vec<f32>>) ->
         ordinal,
         content: text.to_string(),
         char_start: ordinal * 100,
-        char_end: ordinal * 100 + text.len() as i64,
+        char_end: ordinal * 100 + i64::try_from(text.len()).expect("chunk text length fits i64"),
         embedding,
         embedding_model: Some("probe".to_string()),
         chunk_max_chars: 3200,
@@ -68,10 +69,10 @@ fn chunk(parent: &str, ordinal: i64, text: &str, embedding: Option<Vec<f32>>) ->
 /// A distinctive vector whose little-endian bytes are very unlikely to occur by
 /// chance elsewhere in the file.
 fn sentinel(seed: f32) -> Vec<f32> {
-    (0..96).map(|i| (i as f32) * 7.531_9 + 3.140_1 + seed * 101.7).collect()
+    (0..96_u16).map(|i| seed.mul_add(101.7, f32::from(i).mul_add(7.531_9, 3.140_1))).collect()
 }
 
-async fn file_contains(db_path: &str, needle: &[u8]) -> bool {
+fn file_contains(db_path: &str, needle: &[u8]) -> bool {
     let bytes = std::fs::read(db_path).unwrap_or_default();
     let wal = std::fs::read(format!("{db_path}-wal")).unwrap_or_default();
     bytes.windows(needle.len()).any(|w| w == needle)
@@ -118,7 +119,7 @@ async fn pages_are_ordinal_ordered_and_one_based() {
     let repo = storage.memories();
     repo.create(memory("m1")).await.expect("create");
     let set: Vec<NewMemoryChunk> = (0..5)
-        .map(|i| chunk("m1", i, &format!("chunk {i}"), Some(vec![i as f32, 0.0, 0.0, 0.0])))
+        .map(|i| chunk("m1", i, &format!("chunk {i}"), Some(vec![nanna_numeric::f32_from_i64(i), 0.0, 0.0, 0.0])))
         .collect();
     repo.replace_chunks("m1", &set).await.expect("write");
 
@@ -223,7 +224,7 @@ async fn chunk_knn_returns_parent_and_ordinal_nearest_first() {
         .search_chunks_by_embedding_sql(&[1.0, 0.0, 0.0, 0.0], "probe", 10, None)
         .await
         .expect("knn");
-    assert!(!hits.is_empty());
+    assert_ne!(hits, [] as [(std::string::String, i64, f64); 0]);
     assert_eq!(hits[0].0, "m2", "nearest chunk's parent comes first");
     assert_eq!(hits[0].1, 3, "the winning chunk's ordinal is reported");
 }
@@ -293,7 +294,7 @@ async fn deleting_a_memory_destroys_its_chunk_embeddings_on_disk() {
             .expect("write");
     }
     assert!(
-        file_contains(&db_path, &vec_bytes).await,
+        file_contains(&db_path, &vec_bytes),
         "precondition: the chunk vector must be on disk before the delete, \
          or the assertion below proves nothing"
     );
@@ -304,7 +305,7 @@ async fn deleting_a_memory_destroys_its_chunk_embeddings_on_disk() {
     }
 
     assert!(
-        !file_contains(&db_path, &vec_bytes).await,
+        !file_contains(&db_path, &vec_bytes),
         "the chunk embedding survived the delete — a Vec2Text-class model can \
          invert it back to the source text"
     );
@@ -325,7 +326,7 @@ async fn deleting_a_memory_destroys_its_chunk_text_on_disk() {
             .expect("write");
     }
     assert!(
-        file_contains(&db_path, secret.as_bytes()).await,
+        file_contains(&db_path, secret.as_bytes()),
         "precondition: chunk text must be on disk first"
     );
 
@@ -337,7 +338,7 @@ async fn deleting_a_memory_destroys_its_chunk_text_on_disk() {
     let db = Builder::new_local(&db_path).build().await.expect("reopen");
     drop(db);
     assert!(
-        !file_contains(&db_path, secret.as_bytes()).await,
+        !file_contains(&db_path, secret.as_bytes()),
         "chunk plaintext survived the delete"
     );
 }

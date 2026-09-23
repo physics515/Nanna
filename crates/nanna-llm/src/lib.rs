@@ -28,36 +28,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Integer <-> float conversions for the VRAM fit and the token estimate, where
-/// std has no lossless route. Each is exactly the `as` cast it replaced, kept in
-/// one place so the precision trade-off is stated once.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "std has no lossless u64 -> f64 or usize -> f32 conversion and no f32 -> usize \
-              conversion at all; the inputs are VRAM byte counts (exact in f64 below 8 PiB) and \
-              character counts feeding a deliberately approximate token estimate, whose result \
-              is the saturating truncation of a non-negative ceil"
-)]
-mod lossy {
-    /// A byte count as the nearest `f64`, exactly as `as f64`.
-    pub const fn u64_to_f64(n: u64) -> f64 {
-        n as f64
-    }
-
-    /// A character count as the nearest `f32`, exactly as `as f32`.
-    pub const fn usize_to_f32(n: usize) -> f32 {
-        n as f32
-    }
-
-    /// `x` truncated toward zero, saturating at the bounds and mapping NaN to 0,
-    /// exactly as `as usize`.
-    pub const fn f32_to_usize(x: f32) -> usize {
-        x as usize
-    }
-}
-
 /// A provider-reported token count as the `u32` the usage events carry,
 /// saturating: no single request reports four billion tokens, so this never
 /// differs from the old truncating cast in practice.
@@ -2681,10 +2651,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
                 ))
             })?;
         let fitted = Self::fit_context_for_budget(
-            lossy::u64_to_f64(free_bytes),
-            lossy::u64_to_f64(weights_bytes),
-            lossy::u64_to_f64(ours_resident),
-            lossy::u64_to_f64(others_resident),
+            nanna_numeric::f64_from_u64(free_bytes),
+            nanna_numeric::f64_from_u64(weights_bytes),
+            nanna_numeric::f64_from_u64(ours_resident),
+            nanna_numeric::f64_from_u64(others_resident),
         );
         // Floor-fit on an EMPTY server is the orphaned-runner signature, so
         // name it instead of latching quietly. `ollama ps` reports the
@@ -4163,9 +4133,9 @@ pub fn estimate_tokens_for_family(text: &str, family: TokenContentFamily) -> usi
         0
     } else {
         // ceil(ascii_chars / ratio) without float hacks in the hot edge cases.
-        lossy::f32_to_usize((lossy::usize_to_f32(ascii_chars) / ratio).ceil())
+        nanna_numeric::usize_from_f32((nanna_numeric::f32_from_usize(ascii_chars) / ratio).ceil())
     };
-    let wide_tokens = lossy::f32_to_usize((lossy::usize_to_f32(wide_chars) * TOKENS_PER_WIDE_CHAR).ceil());
+    let wide_tokens = nanna_numeric::usize_from_f32((nanna_numeric::f32_from_usize(wide_chars) * TOKENS_PER_WIDE_CHAR).ceil());
     // At least 1 token for non-empty input.
     (ascii_tokens + wide_tokens).max(1)
 }

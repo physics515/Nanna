@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Behavioral tests for the `file_buffer` default skill, executed for real
 //! through the Boa engine with a bridge scoped to a temp directory.
 //!

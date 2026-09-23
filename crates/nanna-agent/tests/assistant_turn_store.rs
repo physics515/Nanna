@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Regression tests for how the loop stores the assistant turn in context.
 //!
 //! Two bugs, one seam. The run loop stores every LLM response into context
@@ -13,10 +14,10 @@
 //!    once.
 //!
 //! 2. When EVERY structured tool call in a round had malformed JSON, the
-//!    stream assembler synthesizes placeholder tool_use blocks plus paired
-//!    error tool_results — but `tool_uses` is empty, so the round took the
+//!    stream assembler synthesizes placeholder `tool_use` blocks plus paired
+//!    error `tool_results` — but `tool_uses` is empty, so the round took the
 //!    tool-free exit and the error results were silently dropped: the stored
-//!    assistant turn kept tool_use blocks with no tool_result, and the model
+//!    assistant turn kept `tool_use` blocks with no `tool_result`, and the model
 //!    never learned its call was unparseable. The second test streams exactly
 //!    that shape and asserts the retry request carries the paired error
 //!    result.
@@ -30,7 +31,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Read one HTTP/1.1 request off the socket; returns (request_line, body).
+/// Read one HTTP/1.1 request off the socket; returns (`request_line`, body).
 async fn read_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -153,6 +154,7 @@ async fn a_narration_nudged_round_stores_the_assistant_turn_exactly_once() {
     );
 
     let messages = request_messages(&bodies[1]);
+    drop(bodies);
     // The branch actually fired: the nudge follows the stored turn.
     assert!(
         messages.iter().any(|m| m["content"]
@@ -179,7 +181,7 @@ async fn a_narration_nudged_round_stores_the_assistant_turn_exactly_once() {
 
 /// A round whose structured tool calls ALL had malformed JSON must return the
 /// synthesized error results to the model, paired with the stored turn's
-/// placeholder tool_use blocks — not exit as if the round were tool-free and
+/// placeholder `tool_use` blocks — not exit as if the round were tool-free and
 /// drop them.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_all_malformed_round_returns_the_error_results_to_the_model() {
@@ -254,6 +256,7 @@ async fn an_all_malformed_round_returns_the_error_results_to_the_model() {
     );
 
     let messages = request_messages(&bodies[1]);
+    drop(bodies);
     // The stored assistant turn carries the placeholder call exactly once...
     let placeholder_turns = messages
         .iter()

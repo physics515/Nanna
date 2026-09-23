@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Unified benchmark harness for Nanna's six performance suites.
 //!
 //! Performance is a **gate**: a change ships only when a reproducible benchmark

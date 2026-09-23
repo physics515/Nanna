@@ -1,5 +1,9 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+// Solver depth only, as on the daemon crate roots: proving these futures
+// `Send` walks the wgpu/daemon type graph past the default limit of 128.
+#![recursion_limit = "256"]
 //! Extended GPU vs SIMD benchmark — find the TRUE crossover point
-//! Run with: cargo bench -p nanna-gpu --bench gpu_vs_simd_extended
+//! Run with: cargo bench -p nanna-gpu --bench `gpu_vs_simd_extended`
 
 use std::time::{Duration, Instant};
 
@@ -30,9 +34,9 @@ fn generate_flat(count: usize, dim: usize) -> Vec<f32> {
         for j in 0..dim {
             let mut h = DefaultHasher::new();
             (i * dim + j).hash(&mut h);
-            let val = (h.finish() as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32;
+            let val = nanna_numeric::f32_from_f64((nanna_numeric::f64_from_u64(h.finish()) / nanna_numeric::f64_from_u64(u64::MAX)).mul_add(2.0, -1.0));
             buf.push(val);
-            norm_sq += val * val;
+            norm_sq = val.mul_add(val, norm_sq);
         }
         let inv_norm = 1.0 / norm_sq.sqrt();
         for x in &mut buf[start..] {
@@ -50,7 +54,7 @@ fn bench_sync<F: FnMut()>(mut f: F, iters: usize) -> Duration {
         std::hint::black_box(&mut f)();
         total += t.elapsed();
     }
-    total / iters as u32
+    total / u32::try_from(iters).expect("iteration count fits u32")
 }
 
 fn bench_async_fn<F, Fut>(rt: &tokio::runtime::Runtime, mut f: F, iters: usize) -> Duration
@@ -63,11 +67,11 @@ where F: FnMut() -> Fut, Fut: std::future::Future<Output = Vec<f32>>
         std::hint::black_box(rt.block_on(f()));
         total += t.elapsed();
     }
-    total / iters as u32
+    total / u32::try_from(iters).expect("iteration count fits u32")
 }
 
 fn fmt_dur(d: Duration) -> String {
-    let us = d.as_nanos() as f64 / 1000.0;
+    let us = d.as_secs_f64() * 1e6;
     if us < 1000.0 { format!("{us:>8.1}µs") }
     else { format!("{:>8.2}ms", us / 1000.0) }
 }
@@ -120,7 +124,7 @@ fn main() {
             2,
         );
 
-        let ratio = gpu_mean.as_nanos() as f64 / simd_mean.as_nanos() as f64;
+        let ratio = gpu_mean.as_secs_f64() * 1e9 / simd_mean.as_secs_f64() * 1e9;
         let winner = if ratio < 1.0 { "GPU ✓" } else { "SIMD" };
 
         println!("  {:>7} │ {} │ {} │ {:>6.2}× │ {winner}",
@@ -155,7 +159,7 @@ fn main() {
             2,
         );
 
-        let ratio = gpu_mean.as_nanos() as f64 / simd_mean.as_nanos() as f64;
+        let ratio = gpu_mean.as_secs_f64() * 1e9 / simd_mean.as_secs_f64() * 1e9;
         let winner = if ratio < 1.0 { "GPU ✓" } else { "SIMD" };
 
         println!("  {:>7} │ {} │ {} │ {:>6.2}× │ {winner}",

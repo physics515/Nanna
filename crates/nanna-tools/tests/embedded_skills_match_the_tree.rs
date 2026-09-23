@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! The release binary must ship every skill the source tree has.
 //!
 //! `build.rs` walks `default-skills/` and emits `DEFAULT_SKILLS`, which is what
@@ -28,7 +29,7 @@ fn skills_dir() -> PathBuf {
 fn skills_on_disk() -> BTreeSet<String> {
     std::fs::read_dir(skills_dir())
         .expect("read default-skills")
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| entry.path().is_dir())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect()

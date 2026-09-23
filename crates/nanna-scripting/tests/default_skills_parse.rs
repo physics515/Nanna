@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Real-data guard: every bundled default skill must **parse** in the engine that
 //! runs it.
 //!

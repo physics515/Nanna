@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! SQL-side exact k-NN parity on a realistic, topic-clustered corpus.
 //!
 //! `crates/nanna-storage/tests/vector_knn.rs` proves `search_by_embedding_sql`
@@ -100,8 +101,7 @@ async fn sql_knn_matches_in_ram_scan_on_a_topic_clustered_corpus() {
         let top_topic = reference
             .iter()
             .find(|(id, _, _)| *id == sql[0].0)
-            .map(|(_, _, topic)| topic.as_str())
-            .unwrap_or("");
+            .map_or("", |(_, _, topic)| topic.as_str());
         assert_eq!(
             top_topic, probe.topic,
             "the nearest memory should be in the probe's topic cluster"

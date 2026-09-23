@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::numeric::{millis_u64, u64_to_f32};
+use crate::numeric::{millis_u64, f32_from_u64};
 
 /// A finished background task as reported on the completion channel: the
 /// task id and the agent run's outcome.
@@ -332,7 +332,7 @@ impl CriticalPathMetrics {
         
         let critical_path_ms: u64 = level_max_durations.iter().sum();
         let parallelism_ratio = if wall_clock_ms > 0 {
-            u64_to_f32(sequential_ms) / u64_to_f32(wall_clock_ms)
+            f32_from_u64(sequential_ms) / f32_from_u64(wall_clock_ms)
         } else {
             1.0
         };

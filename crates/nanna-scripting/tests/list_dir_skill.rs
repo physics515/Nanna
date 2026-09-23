@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Behavioral tests for the `list_dir` default skill, executed for real
 //! through the Boa engine with a bridge scoped to a temp directory.
 //!

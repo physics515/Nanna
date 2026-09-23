@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! The agent loop's span tree (P6), asserted through the real loop.
 //!
 //! One run against a scripted Ollama stub: the model calls a tool, then
@@ -262,8 +263,33 @@ async fn a_run_opens_the_documented_span_tree_and_records_its_outcomes() {
         .cloned()
         .collect();
 
+    assert_run_span(&spans);
+    assert_iteration_spans(&spans);
+    assert_llm_call_spans(&spans);
+    assert_tool_call_span(&spans);
+
+    // Opened is not entered: a span created but never entered would still
+    // close with every field above, while the tool's own log lines ran
+    // outside it. The loop logs "Executing tool" from inside the call.
+    let executing: Vec<_> = capture
+        .events
+        .lock()
+        .expect("capture lock")
+        .iter()
+        .filter(|(m, _)| m == "Executing tool")
+        .cloned()
+        .collect();
+    assert_eq!(executing.len(), 1, "{executing:?}");
+    assert_eq!(
+        executing[0].1,
+        Some(TOOL_CALL_SPAN),
+        "the tool ran outside its span"
+    );
+}
+
+fn assert_run_span(spans: &[CapturedSpan]) {
     // agent_run: exactly one, closed, carrying how the run ended.
-    let runs = spans_named(&spans, RUN_SPAN);
+    let runs = spans_named(spans, RUN_SPAN);
     assert_eq!(runs.len(), 1, "one run, one agent_run span: {runs:?}");
     let run = &runs[0];
     assert!(run.closed, "the run span must close when run() returns");
@@ -280,9 +306,11 @@ async fn a_run_opens_the_documented_span_tree_and_records_its_outcomes() {
         run.fields.get("output_tokens").map(String::as_str),
         Some("17")
     );
+}
 
+fn assert_iteration_spans(spans: &[CapturedSpan]) {
     // agent_iteration: one per LLM round, each a child of the run.
-    let iterations = spans_named(&spans, ITERATION_SPAN);
+    let iterations = spans_named(spans, ITERATION_SPAN);
     assert_eq!(
         iterations.len(),
         2,
@@ -306,9 +334,11 @@ async fn a_run_opens_the_documented_span_tree_and_records_its_outcomes() {
         ["1", "2"],
         "iterations are numbered from 1, matching the loop's count"
     );
+}
 
+fn assert_llm_call_spans(spans: &[CapturedSpan]) {
     // llm_call: one per iteration, under it, with the settled outcome.
-    let calls = spans_named(&spans, LLM_CALL_SPAN);
+    let calls = spans_named(spans, LLM_CALL_SPAN);
     assert_eq!(calls.len(), 2, "{calls:?}");
     for call in &calls {
         assert_eq!(
@@ -341,9 +371,11 @@ async fn a_run_opens_the_documented_span_tree_and_records_its_outcomes() {
         ["0", "1"],
         "the first round called one tool, the second none"
     );
+}
 
+fn assert_tool_call_span(spans: &[CapturedSpan]) {
     // tool_call: the one dispatched call, under its iteration, with its IO size.
-    let tools = spans_named(&spans, TOOL_CALL_SPAN);
+    let tools = spans_named(spans, TOOL_CALL_SPAN);
     assert_eq!(tools.len(), 1, "{tools:?}");
     let tool = &tools[0];
     assert_eq!(
@@ -366,19 +398,4 @@ async fn a_run_opens_the_documented_span_tree_and_records_its_outcomes() {
         Some(TOOL_OUTPUT.len().to_string().as_str())
     );
     assert!(tool.fields.contains_key("duration_ms"));
-
-    // Opened is not entered: a span created but never entered would still
-    // close with every field above, while the tool's own log lines ran
-    // outside it. The loop logs "Executing tool" from inside the call.
-    let events = capture.events.lock().expect("capture lock");
-    let executing: Vec<_> = events
-        .iter()
-        .filter(|(m, _)| m == "Executing tool")
-        .collect();
-    assert_eq!(executing.len(), 1, "{executing:?}");
-    assert_eq!(
-        executing[0].1,
-        Some(TOOL_CALL_SPAN),
-        "the tool ran outside its span"
-    );
 }

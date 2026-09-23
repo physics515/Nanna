@@ -35,22 +35,19 @@ fn count_field(reply: &serde_json::Value, key: &str) -> usize {
 }
 
 /// Share of `content_len` taken up by `matches` query hits, capped at 1.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "relevance is f32 on the wire and usize has no lossless conversion to f32; both counts are exact up to 2^24 (16 MiB of message content), past which the score only loses precision it cannot display"
-)]
+///
+/// Relevance is `f32` on the wire; both counts are exact in `f32` up to 2^24
+/// (16 MiB of message content), past which the score only loses precision it
+/// cannot display.
 fn match_density(matches: usize, content_len: usize) -> f32 {
-    (matches as f32 / content_len.max(1) as f32).min(1.0)
+    (nanna_numeric::f32_from_usize(matches) / nanna_numeric::f32_from_usize(content_len.max(1))).min(1.0)
 }
 
 /// Narrow a daemon-reported `f64` score to the `f32` the memory page's wire
-/// type carries.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "std has no f64-to-f32 conversion but `as`; the daemon's scores are f32 widened to f64 in its JSON, so narrowing them back restores the exact value"
-)]
-const fn score_to_f32(score: f64) -> f32 {
-    score as f32
+/// type carries. The daemon's scores are `f32` widened to `f64` in its JSON,
+/// so narrowing them back restores the exact value.
+fn score_to_f32(score: f64) -> f32 {
+    nanna_numeric::f32_from_f64(score)
 }
 
 /// Search across all sessions (substring match over daemon-stored history).
@@ -79,7 +76,7 @@ pub async fn search_memory(
         result
             .get("sessions")
             .and_then(|v| v.as_array())
-            .map(|arr| {
+            .map_or_default(|arr| {
                 arr.iter()
                     .filter_map(|s| {
                         let id = s.get("id")?.as_str()?.to_string();
@@ -92,7 +89,6 @@ pub async fn search_memory(
                     })
                     .collect()
             })
-            .unwrap_or_default()
     };
 
     let mut results = Vec::new();
@@ -107,7 +103,7 @@ pub async fn search_memory(
                     result
                         .get("messages")
                         .and_then(|v| v.as_array())
-                        .map(|msgs| {
+                        .map_or_default(|msgs| {
                             msgs.iter()
                                 .filter_map(|m| {
                                     Some((
@@ -119,7 +115,6 @@ pub async fn search_memory(
                                 })
                                 .collect()
                         })
-                        .unwrap_or_default()
                 },
             );
 
@@ -395,8 +390,7 @@ pub async fn trigger_consolidation(
         errors: result
             .get("errors")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-            .unwrap_or_default(),
+            .map_or_default(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()),
     })
 }
 
@@ -503,8 +497,7 @@ pub async fn list_memories(
     let mut items: Vec<MemoryItem> = result
         .get("memories")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(memory_item_from_json).collect())
-        .unwrap_or_default();
+        .map_or_default(|arr| arr.iter().filter_map(memory_item_from_json).collect());
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(items)
 }

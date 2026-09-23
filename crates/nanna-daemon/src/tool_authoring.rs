@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
-use nanna_scripting::{ServiceFn, extract_manifest};
+use nanna_scripting::{ServiceFn, ServiceMap, extract_manifest};
 use nanna_tools::ToolRegistry;
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -145,7 +145,7 @@ fn write_tool(dir: &Path, source: &str) -> Result<PathBuf, String> {
 /// to the only question the caller asked.
 async fn register_live(
     registry: &Weak<ToolRegistry>,
-    services: &Arc<OnceLock<HashMap<String, ServiceFn>>>,
+    services: &Arc<OnceLock<ServiceMap>>,
     dir: &Path,
 ) -> Result<(), String> {
     let Some(registry) = registry.upgrade() else {
@@ -171,16 +171,11 @@ async fn register_live(
 /// is loaded with the same services every bundled skill gets — without the
 /// slot it would silently be the only tool in the daemon that cannot call one,
 /// and the map cannot contain a closure that captures the finished map.
-#[expect(
-    clippy::implicit_hasher,
-    reason = "the slot is read back into `ToolRegistry::load_skills_with_services`, \
-              which takes the default-hasher map, so a generic hasher cannot flow through"
-)]
 pub fn build_tool_authoring_services(
     tools_dir: PathBuf,
     registry: Weak<ToolRegistry>,
-    services: Arc<OnceLock<HashMap<String, ServiceFn>>>,
-) -> HashMap<String, ServiceFn> {
+    services: Arc<OnceLock<ServiceMap>>,
+) -> ServiceMap {
     let mut built: HashMap<String, ServiceFn> = HashMap::new();
 
     // --- tools.create ----------------------------------------------------

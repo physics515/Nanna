@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Migration 012 must actually apply, and stay applied.
 //!
 //! Migrations run OUTSIDE a transaction, are split naively on `;` with no
@@ -23,7 +24,7 @@ fn temp_db_path(tag: &str) -> String {
     let dir = std::env::temp_dir().join(format!(
         "nanna_m012_{tag}_{}_{:p}",
         std::process::id(),
-        &tag as *const _
+        &raw const tag
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -39,8 +40,12 @@ async fn open(db_path: &str) -> Storage {
 }
 
 async fn table_columns(db_path: &str, table: &str) -> Vec<String> {
-    let db = Builder::new_local(db_path).build().await.expect("open raw");
-    let conn = db.connect().expect("connect raw");
+    let conn = Builder::new_local(db_path)
+        .build()
+        .await
+        .expect("open raw")
+        .connect()
+        .expect("connect raw");
     let mut rows = conn
         .query(&format!("PRAGMA table_info({table})"), ())
         .await
@@ -84,8 +89,12 @@ async fn memory_chunks_table_and_indexes_exist_after_migration() {
         );
     }
 
-    let db = Builder::new_local(&db_path).build().await.expect("open raw");
-    let conn = db.connect().expect("connect raw");
+    let conn = Builder::new_local(&db_path)
+        .build()
+        .await
+        .expect("open raw")
+        .connect()
+        .expect("connect raw");
     let mut rows = conn
         .query(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'memory_chunks'",
@@ -128,8 +137,12 @@ async fn reopening_does_not_rerun_the_migration() {
         let _second = open(&db_path).await;
     }
 
-    let db = Builder::new_local(&db_path).build().await.expect("open raw");
-    let conn = db.connect().expect("connect raw");
+    let conn = Builder::new_local(&db_path)
+        .build()
+        .await
+        .expect("open raw")
+        .connect()
+        .expect("connect raw");
     let mut rows = conn
         .query(
             "SELECT COUNT(*) FROM _migrations WHERE name = '012_memory_chunks'",
@@ -184,8 +197,12 @@ async fn a_memory_with_no_chunks_is_still_valid() {
     let found = memories.get("mem-no-chunks").await.expect("memory exists");
     assert_eq!(found.content, "a memory that predates chunking");
 
-    let db = Builder::new_local(&db_path).build().await.expect("open raw");
-    let conn = db.connect().expect("connect raw");
+    let conn = Builder::new_local(&db_path)
+        .build()
+        .await
+        .expect("open raw")
+        .connect()
+        .expect("connect raw");
     let mut rows = conn
         .query(
             "SELECT COUNT(*) FROM memory_chunks WHERE memory_id = 'mem-no-chunks'",

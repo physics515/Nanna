@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! The dual-era client against the REAL reference SDK servers, not a fixture
 //! written from our own reading of the spec.
 //!
@@ -281,10 +282,10 @@ async fn start_http(args: &[&str], env: &[(&str, String)]) -> HttpServer {
     let port = free_port();
     let mut command = std::process::Command::new("node");
     for arg in args {
-        command.arg(arg.replace("{port}", &port.to_string()));
+        command.arg(arg.replace("@port@", &port.to_string()));
     }
     for (key, value) in env {
-        command.env(key, value.replace("{port}", &port.to_string()));
+        command.env(key, value.replace("@port@", &port.to_string()));
     }
     // Owned by the guard from the start, so every path (including the
     // panic below) kills and reaps it.
@@ -342,7 +343,7 @@ async fn call_text(
 async fn a_modern_http_server_answering_json_and_sse_is_spoken_to_statelessly() {
     let modern = script("modern-http.mjs");
     for mode in ["json", "sse"] {
-        let server = start_http(&[modern.as_str(), "{port}", mode], &[]).await;
+        let server = start_http(&[modern.as_str(), "@port@", mode], &[]).await;
         let client = McpClient::connect_streamable(&server.url, None)
             .await
             .expect("connect");
@@ -387,7 +388,7 @@ async fn a_modern_http_server_answering_json_and_sse_is_spoken_to_statelessly() 
 #[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
 async fn a_bearer_token_is_sent_and_a_wrong_one_is_named_not_retried_as_legacy() {
     let modern = script("modern-http.mjs");
-    let server = start_http(&[modern.as_str(), "{port}", "json", "s3cret"], &[]).await;
+    let server = start_http(&[modern.as_str(), "@port@", "json", "s3cret"], &[]).await;
     let client = McpClient::connect_streamable(&server.url, Some("s3cret".into()))
         .await
         .expect("connect");
@@ -409,7 +410,7 @@ async fn the_legacy_everything_http_server_falls_back_to_a_session() {
     let everything = script("node_modules/@modelcontextprotocol/server-everything/dist/index.js");
     let server = start_http(
         &[everything.as_str(), "streamableHttp"],
-        &[("PORT", "{port}".into())],
+        &[("PORT", "@port@".into())],
     )
     .await;
     let client = McpClient::connect_streamable(&server.url, None)
@@ -430,7 +431,7 @@ async fn the_legacy_everything_http_server_falls_back_to_a_session() {
 #[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
 async fn the_deprecated_http_sse_transport_still_works() {
     let everything = script("node_modules/@modelcontextprotocol/server-everything/dist/index.js");
-    let server = start_http(&[everything.as_str(), "sse"], &[("PORT", "{port}".into())]).await;
+    let server = start_http(&[everything.as_str(), "sse"], &[("PORT", "@port@".into())]).await;
     let sse_url = server.url.replace("/mcp", "/sse");
 
     // What the daemon sees first: the Streamable HTTP probe gets a bare 404.
@@ -537,7 +538,7 @@ mod registry {
     #[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
     async fn a_tool_added_by_a_modern_http_server_reaches_the_registry() {
         let modern = script("modern-http.mjs");
-        let server = start_http(&[modern.as_str(), "{port}", "json"], &[]).await;
+        let server = start_http(&[modern.as_str(), "@port@", "json"], &[]).await;
         let client = McpClient::connect_streamable(&server.url, None)
             .await
             .expect("connect");

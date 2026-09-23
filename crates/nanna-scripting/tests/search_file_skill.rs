@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Behavioral tests for the `search_file` default skill, executed for real
 //! through the Boa engine with a bridge scoped to a temp directory.
 //!
@@ -35,7 +36,7 @@ fn skill_path() -> PathBuf {
         .join("../nanna-tools/default-skills/search_file/tool.ts")
 }
 
-/// Execute the real search_file tool.ts against `input`, sandboxed to `dir`.
+/// Execute the real `search_file` tool.ts against `input`, sandboxed to `dir`.
 async fn run_search(input: Value, dir: &Path) -> Result<Value, String> {
     let tool = ScriptedTool::from_file(skill_path())
         .expect("read search_file tool.ts")
@@ -130,7 +131,7 @@ async fn finds_matches_with_line_numbers_and_context() {
 /// per-line pass must never drop a file the per-line pass would have matched.
 /// Anchored patterns are the case that catches it: `^needle` matches line 3 of
 /// this file, but against the whole file text `^` would anchor to byte 0 —
-/// which is exactly the bug caught and fixed in code_search. The prefilter is
+/// which is exactly the bug caught and fixed in `code_search`. The prefilter is
 /// therefore built with "m".
 #[tokio::test]
 async fn anchored_patterns_still_match_mid_file() {
@@ -326,7 +327,8 @@ async fn output_budget_trips_and_announces_itself() {
     for _ in 0..4 {
         for j in 0..10 {
             if j == 4 {
-                body.push_str(&format!("{pad} needle\n"));
+                use std::fmt::Write as _;
+                writeln!(body, "{pad} needle").expect("a String never refuses a write");
             } else {
                 body.push_str(&pad);
                 body.push('\n');
@@ -597,8 +599,8 @@ async fn file_over_the_read_budget_is_refused_with_a_way_through() {
 /// source file — the agent loop, the largest file in the repo — to check the
 /// rendering holds up on ordinary code and that a real search is fast.
 /// Ignored by default: wall-time on a shared box is not a stable assertion.
-/// Run: cargo test -p nanna-scripting --features boa --test search_file_skill \
-///        -- --ignored --nocapture against_a_real
+/// Run: cargo test -p nanna-scripting --features boa --test `search_file_skill` \
+///        -- --ignored --nocapture `against_a_real`
 #[tokio::test]
 #[ignore = "manual check against a real repo file"]
 async fn against_a_real_source_file() {
@@ -657,8 +659,8 @@ async fn against_a_real_source_file() {
 ///   128 KiB / 65,536 lines: one split  82.53s -> 4 KiB slices 2.68s (31x)
 ///   128 KiB /  2,428 lines: one split   2.26s -> 4 KiB slices 0.13s (17x)
 ///
-/// Run: cargo test -p nanna-scripting --features boa --test search_file_skill \
-///        -- --ignored --nocapture split_cost
+/// Run: cargo test -p nanna-scripting --features boa --test `search_file_skill` \
+///        -- --ignored --nocapture `split_cost`
 #[tokio::test]
 #[ignore = "throughput measurement, not an assertion"]
 async fn split_cost_model_and_the_slicing_that_breaks_it() {

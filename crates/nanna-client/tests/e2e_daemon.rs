@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 // An integration test is its OWN crate root, so the crate-level attribute the
 // six library roots carry does not reach it. This target drives a real daemon,
 // so proving its futures are `Send` walks the same
@@ -32,7 +33,7 @@ use std::time::Duration;
 /// A daemon running on its own port and data dir for the duration of one test.
 struct TestDaemon {
     port: u16,
-    _data_dir: tempfile::TempDir,
+    data_dir: tempfile::TempDir,
     handle: tokio::task::JoinHandle<Result<(), String>>,
 }
 
@@ -82,7 +83,8 @@ async fn wait_until_ready(
     handle: &mut tokio::task::JoinHandle<Result<(), String>>,
 ) -> u16 {
     loop {
-        if let Some(addr) = *bound.borrow_and_update() {
+        let current = *bound.borrow_and_update();
+        if let Some(addr) = current {
             return addr.port();
         }
 
@@ -102,10 +104,9 @@ async fn wait_until_ready(
 
         assert!(
             started.elapsed() < READY_HANG_CEILING,
-            "daemon is still running but never bound after {:?} — \
+            "daemon is still running but never bound after {READY_HANG_CEILING:?} — \
              this is the hang ceiling, not a latency assertion, so treat it as a \
-             wedged daemon rather than a slow one",
-            READY_HANG_CEILING
+             wedged daemon rather than a slow one"
         );
 
         // Wake on the bind, or come back to re-check the task. A closed channel
@@ -169,13 +170,13 @@ impl TestDaemon {
                 Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
                 other => panic!("daemon task ended before building the server: {other:?}"),
             },
-            Err(_) => panic!(
-                "daemon is still building after {READY_HANG_CEILING:?} — this is the hang \
+            Err(elapsed) => panic!(
+                "daemon is still building after {READY_HANG_CEILING:?} ({elapsed}) — this is the hang \
                  ceiling, not a latency assertion, so treat it as a wedged boot"
             ),
         };
         let port = wait_until_ready(started, &mut bound, &mut handle).await;
-        Self { port, _data_dir: data_dir, handle }
+        Self { port, data_dir, handle }
     }
 
     fn url(&self) -> String {
@@ -207,7 +208,7 @@ impl TestDaemon {
     /// Stop the daemon, releasing the port.
     fn stop(self) -> tempfile::TempDir {
         self.handle.abort();
-        self._data_dir
+        self.data_dir
     }
 }
 
@@ -532,8 +533,8 @@ async fn sessions_persist_across_a_daemon_restart() {
 /// kept its user tools beside some other install's store (observed 2026-09-21:
 /// a scratch daemon created `$XDG_DATA_HOME/nanna/user_tools`).
 #[tokio::test]
-async fn a_user_tool_is_kept_in_the_daemons_own_data_dir() {
-    const NAME: &str = "e2e_data_dir_probe";
+async fn a_user_tool_is_kept_in_the_daemons_owndata_dir() {
+    const NAME: &str = "e2edata_dir_probe";
     let data_dir = tempfile::tempdir().expect("temp dir");
     let tools_dir = data_dir.path().join("user_tools");
     let daemon = TestDaemon::start(data_dir).await;
@@ -967,15 +968,14 @@ impl ScriptedOllama {
         let steps: std::sync::Arc<Vec<(u64, String)>> = std::sync::Arc::new(
             steps
                 .iter()
-                .map(|text| match text.strip_prefix("WAIT ") {
-                    Some(rest) => {
-                        let (ms, script) = rest.split_once(' ').unwrap_or((rest, ""));
-                        (
-                            ms.parse().expect("WAIT takes milliseconds"),
-                            script.to_string(),
-                        )
-                    }
-                    None => (0, text.clone()),
+                .map(|text| {
+                    text.strip_prefix("WAIT ").map_or_else(
+                        || (0, text.clone()),
+                        |rest| {
+                            let (ms, script) = rest.split_once(' ').unwrap_or((rest, ""));
+                            (ms.parse().expect("WAIT takes milliseconds"), script.to_string())
+                        },
+                    )
                 })
                 .collect(),
         );
@@ -1049,8 +1049,9 @@ impl ScriptedOllama {
 /// One scripted model message as an Ollama NDJSON line. `CALL <tool> <json>`
 /// is a tool call with those arguments; anything else is reply text.
 fn scripted_reply(script: &str) -> String {
-    let message = match script.strip_prefix("CALL ") {
-        Some(call) => {
+    let message = script.strip_prefix("CALL ").map_or_else(
+        || serde_json::json!({ "role": "assistant", "content": script }),
+        |call| {
             let (name, arguments) = call.split_once(' ').unwrap_or((call, "{}"));
             let arguments: serde_json::Value =
                 serde_json::from_str(arguments).expect("scripted tool arguments are JSON");
@@ -1059,9 +1060,8 @@ fn scripted_reply(script: &str) -> String {
                 "content": "",
                 "tool_calls": [{ "function": { "name": name, "arguments": arguments } }],
             })
-        }
-        None => serde_json::json!({ "role": "assistant", "content": script }),
-    };
+        },
+    );
     serde_json::json!({
         "model": STUB_MODEL,
         "message": message,
@@ -2164,9 +2164,11 @@ async fn a_clarifying_question_is_answered_by_the_next_message() {
 /// the model's own tool call with a "history shortened" notice.
 #[tokio::test]
 async fn a_huge_tool_argument_does_not_evict_the_call_that_made_it() {
-    let big: String = (0..6000)
-        .map(|i| format!("line {i}: the quick brown fox\n"))
-        .collect();
+    let big = (0..6000).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write as _;
+            writeln!(acc, "line {i}: the quick brown fox").expect("a String never refuses a write");
+            acc
+        });
     let call = format!("CALL echo {}", serde_json::json!({ "text": big }));
     let ollama = ScriptedOllama::start(vec![call, "Done.\nTASK COMPLETE".to_string()]).await;
     let host = ollama.base_url.clone();
@@ -2932,7 +2934,7 @@ async fn a_blank_message_is_refused_and_starts_no_turn() {
 }
 
 /// A pasted log far longer than the model's window fails honestly. It used
-/// to blame "num_ctx was demoted under GPU memory pressure … free GPU memory
+/// to blame "`num_ctx` was demoted under GPU memory pressure … free GPU memory
 /// and resume" — a demotion that never happened, and a remedy that cannot
 /// help: the request itself does not fit.
 #[tokio::test]

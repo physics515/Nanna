@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Behavioral tests for the `edit_file` default skill, executed for real
 //! through the Boa engine with a bridge scoped to a temp directory.
 //!
@@ -24,7 +25,7 @@ fn skill_path() -> PathBuf {
         .join("../nanna-tools/default-skills/edit_file/tool.ts")
 }
 
-/// Execute the real edit_file tool.ts against `input`, sandboxed to `dir`.
+/// Execute the real `edit_file` tool.ts against `input`, sandboxed to `dir`.
 /// Returns `Ok(result_value)` or `Err(error_string)`.
 async fn run_edit(input: Value, dir: &Path) -> Result<Value, String> {
     let tool = ScriptedTool::from_file(skill_path())
@@ -574,7 +575,11 @@ async fn a_large_edit_is_capped_and_says_so() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let body: String = (0..100).map(|i| format!("old {i}\n")).collect();
+    let body = (0..100).fold(String::new(), |mut acc, i| {
+        use std::fmt::Write as _;
+        writeln!(acc, "old {i}").expect("a String never refuses a write");
+        acc
+    });
     let path = seed(dir.path(), "big.txt", &format!("head\n{body}tail\n"));
 
     let result = run_edit(

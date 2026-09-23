@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 //! Guard: the daemon IPC port has exactly one definition.
 //!
 //! History, and why a test rather than a comment. The port was once a literal

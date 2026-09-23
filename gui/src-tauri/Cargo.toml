@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build.workspace = true
 
 [dependencies]
+nanna-numeric = { path = "../../crates/nanna-numeric" }
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-shell.workspace = true
 tauri-plugin-notification = "2"
