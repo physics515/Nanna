@@ -1,15 +1,15 @@
 {
-  "version": "0.3.28",
-  "notes": "Every crate is now built under Clippy's strictest lint groups with no suppressions, and every number conversion is exact by construction.",
-  "pub_date": "2026-09-23T05:44:06Z",
+  "version": "0.3.29",
+  "notes": "The board's foundations: members, real deadlines, and a thread on every card.",
+  "pub_date": "2026-09-23T12:57:54.136Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXBTMEhmWWlLSUw1MHAzV3BTOWRlbURkQStoaGUzb01zUkFBOXQ4VE45TUV4UDhRUFRkN2ljOFRyL3FJbmI4Q0ExOHFtNXBIdnJXRXFYMy9sWm1TTkF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMTQ1MTExCWZpbGU6TmFubmFfMC4zLjI4X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMjgKVk9kVDlKeVdKZHRwV1lUeHJXOWxxUWNXN2dyZFJSOWo5OUZIREJ3Y1VIR0psOFpjR2IwRU5HTisyOEhtczVRdWlRcHpXWnJ4MTR3c0RYajBzVGl1RGc9PQo=",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.28-beta.37/Nanna_0.3.28_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXRmbzRTbmRsSmRocmsrc3FNcTQrb0dqc3NnU1BVTE5iT29tcnBTR3kvUHU2QmxETVU0aWhRdDZzMXh1R2tQQzhubjRLcU5yOFpMUW5VTEFZSzVUOUE0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMTY4MTY2CWZpbGU6TmFubmFfMC4zLjI5X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMjkKVGxPM3F6ak1uYllYN2U0eWpZRENGTTlkR2dROUtvRk9aTHR4WHRsL1VGSk4rY3plS1pLcDcxK3hnWEpVaUIxZHM5Ym9kY3MrenNvV25tdStqZ0dDQUE9PQo=",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.29-beta.38/Nanna_0.3.29_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaW1HYXdGbWVORWFZeVhwRWpFSjlmTHE2c0x3YlI0dU9ER2JFUm1BeURuN3dYd3ZlbWpUK3NTamIwQUcxaGxDaHhHTlQvZHIyajllTCtYcW40OStyU2c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMTQ0Nzg1CWZpbGU6TmFubmFfMC4zLjI4X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjI4CjN1M3VkeEVIWURoZnhhWWZGb1cxajROaVhoVU5FbmtnamJ3aTY0eklHYmJJUWpLREoxczNHZ1hZQzZyYkZ1aUc3aXp4MlhQNWFpLzg0YWo5bVpuK0JBPT0K",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.28-beta.37/Nanna_0.3.28_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWduTmdKR3g0SUNqM09KZkxlY3Z4SVlaVjlzWjVaeFp1WGxUOWxhK1VONkdhSnhTc1pZeXBESkJkdmNUdm5RY0xLMmtvbnlPZFB0V3cyNlBzTm1IWlFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMTY3MzExCWZpbGU6TmFubmFfMC4zLjI5X2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjI5CmVoNXFsQ0lpaFhwSEwwMUVaVU5lVDJvTDhBd25yeEUrYmRSdHptbFQxNlNEZzFvZExPTGJpWktpZXZxZVNnS2hHTjVXR3pWdGdMaDUrRVA3ZDZyekNBPT0K",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.29-beta.38/Nanna_0.3.29_amd64.AppImage"
     }
   }
 }
