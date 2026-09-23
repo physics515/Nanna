@@ -188,7 +188,12 @@ pub struct Task {
     pub labels: Vec<String>,
     /// Tool names the current item scopes the agent to (P14 per-item tool hint)
     pub tool_scope: Vec<String>,
+    /// The DEFER date (P25 decision 10): the card stays out of the inbox until
+    /// this arrives. `None` means now.
     pub due_at: Option<String>,
+    /// The bound: the card must be complete by then. `overdue` is measured
+    /// against this and never against [`Self::due_at`].
+    pub deadline_at: Option<String>,
     /// Cron expression executed by the existing scheduler (one recurrence engine)
     pub recurrence: Option<String>,
     pub depends_on: Vec<i64>,
@@ -218,7 +223,10 @@ pub struct NewTask {
     pub priority: i64,
     pub labels: Vec<String>,
     pub tool_scope: Vec<String>,
+    /// Defer date — see [`Task::due_at`].
     pub due_at: Option<String>,
+    /// Completion bound — see [`Task::deadline_at`].
+    pub deadline_at: Option<String>,
     pub recurrence: Option<String>,
     pub depends_on: Vec<i64>,
     pub acceptance: Option<serde_json::Value>,
@@ -242,6 +250,7 @@ pub struct TaskPatch {
     pub labels: Option<Vec<String>>,
     pub tool_scope: Option<Vec<String>>,
     pub due_at: Option<Option<String>>,
+    pub deadline_at: Option<Option<String>>,
     pub recurrence: Option<Option<String>>,
     pub depends_on: Option<Vec<i64>>,
     pub acceptance: Option<Option<serde_json::Value>>,
@@ -249,12 +258,61 @@ pub struct TaskPatch {
     pub sort_order: Option<i64>,
 }
 
-/// Append-only working note on a task
+/// What a thread post is doing (P25 decision 2). The four kinds are what let
+/// the router read a thread without re-deriving intent from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskNoteKind {
+    /// Ordinary prose from a member.
+    Comment,
+    /// A step happened; noise to everyone but the board.
+    Progress,
+    /// Blocks: someone needs an answer.
+    Question,
+    /// The acceptance check's outcome.
+    Verdict,
+}
+
+impl TaskNoteKind {
+    /// The token stored in `task_notes.kind`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Comment => "comment",
+            Self::Progress => "progress",
+            Self::Question => "question",
+            Self::Verdict => "verdict",
+        }
+    }
+
+    /// Parse a stored token. `None` for a kind this version does not know, so
+    /// a post written by a newer schema is rejected rather than flattened into
+    /// a comment.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "comment" => Some(Self::Comment),
+            "progress" => Some(Self::Progress),
+            "question" => Some(Self::Question),
+            "verdict" => Some(Self::Verdict),
+            _ => None,
+        }
+    }
+}
+
+/// One post in a card's thread. Append-only: there is no update path, because
+/// the thread is the permanent record (P25 decision 14).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskNote {
     pub id: i64,
     pub task_id: i64,
+    /// Pre-members actor string (`gui`, `harness`, an agent name). Legacy —
+    /// Stage 4 removes it once every writer names a member.
     pub author: Option<String>,
+    /// The board member who posted. `None` on rows written before members
+    /// existed, which reads correctly: those posts predate the entity.
+    pub author_member_id: Option<String>,
+    pub kind: TaskNoteKind,
     pub content: String,
     pub created_at: String,
 }
@@ -362,4 +420,148 @@ pub struct NewMemoryEvent {
     pub embedding_model: Option<String>,
     pub salience: f32,
     pub source_ids: Vec<String>,
+}
+
+/// What a board member *is*. The human and every agent are the same entity
+/// (P25 decision 3); this is the only place the difference is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberKind {
+    Human,
+    Agent,
+}
+
+impl MemberKind {
+    /// The token stored in `members.kind`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+        }
+    }
+
+    /// Parse a stored token. `None` for anything this version does not know,
+    /// so a row written by a newer schema is rejected rather than coerced.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "human" => Some(Self::Human),
+            "agent" => Some(Self::Agent),
+            _ => None,
+        }
+    }
+}
+
+/// Who a member belongs to — not what it is. A `Workspace` member is shared by
+/// everyone on that board; a `Human` member travels with its owner between
+/// workspaces (P25 decisions 12 and 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberOwner {
+    Workspace,
+    Human,
+}
+
+impl MemberOwner {
+    /// The token stored in `members.owner_kind`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Human => "human",
+        }
+    }
+
+    /// Parse a stored token; `None` for an unknown one.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "workspace" => Some(Self::Workspace),
+            "human" => Some(Self::Human),
+            _ => None,
+        }
+    }
+}
+
+/// All the board ever shows about a member's availability (P25 decision 3: you
+/// see busy, never a queue).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberStatus {
+    Idle,
+    Busy,
+    Offline,
+}
+
+impl MemberStatus {
+    /// The token stored in `members.status`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Busy => "busy",
+            Self::Offline => "offline",
+        }
+    }
+
+    /// Parse a stored token; `None` for an unknown one.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "idle" => Some(Self::Idle),
+            "busy" => Some(Self::Busy),
+            "offline" => Some(Self::Offline),
+            _ => None,
+        }
+    }
+}
+
+/// A board member: the human, an agent, or the per-workspace Task Management
+/// Agent. `tasks.assignee` holds one of these ids.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Member {
+    pub id: String,
+    pub name: String,
+    /// A reference (URL, emoji, short token) — never image bytes, see
+    /// `MEMBER_AVATAR_MAX_BYTES`.
+    pub avatar: Option<String>,
+    pub kind: MemberKind,
+    pub owner_kind: MemberOwner,
+    /// `workspaces.id` for a workspace member, a human `members.id` for a
+    /// personal agent, `None` for the install's own human.
+    pub owner_id: Option<String>,
+    pub status: MemberStatus,
+    /// The router's input: model tier, capability tags, tools, skills, cost.
+    pub profile: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// New member input.
+#[derive(Debug, Clone)]
+pub struct NewMember {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<String>,
+    pub kind: MemberKind,
+    pub owner_kind: MemberOwner,
+    pub owner_id: Option<String>,
+    pub status: MemberStatus,
+    pub profile: serde_json::Value,
+}
+
+/// Partial member update; `None` fields are left untouched.
+///
+/// `id`, `kind` and `owner_kind` are absent on purpose: a member's identity and
+/// what it is do not change. Re-creating the member is the honest way to say
+/// that, and it leaves the cards pointing at the old id visible instead of
+/// silently re-attributed.
+#[derive(Debug, Clone, Default)]
+pub struct MemberPatch {
+    pub name: Option<String>,
+    pub avatar: Option<Option<String>>,
+    pub owner_id: Option<Option<String>>,
+    pub status: Option<MemberStatus>,
+    pub profile: Option<serde_json::Value>,
 }

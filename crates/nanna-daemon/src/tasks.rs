@@ -104,6 +104,7 @@ fn task_to_json(task: &Task) -> Value {
         "labels": task.labels,
         "tools": task.tool_scope,
         "due_at": task.due_at,
+        "deadline_at": task.deadline_at,
         "recurrence": task.recurrence,
         "depends_on": task.depends_on,
         "acceptance": task.acceptance,
@@ -522,8 +523,10 @@ fn task_next_service(
 }
 
 // tasks.add {title, scope?, session_id?, parent_id?, priority?, labels?,
-//            tools?, due_at?, recurrence?, depends_on?, acceptance?,
-//            project?, assignee?, description?}
+//            tools?, due_at?, deadline_at?, recurrence?, depends_on?,
+//            acceptance?, project?, assignee?, description?}
+//
+// `due_at` defers the card, `deadline_at` bounds it (P25 decision 10).
 fn task_add_service(
     storage: &Arc<Storage>,
     workspace_id: &Arc<RwLock<Option<String>>>,
@@ -653,6 +656,7 @@ fn task_add_service(
                 labels: opt_string_vec(&params, "labels")?.unwrap_or_default(),
                 tool_scope: opt_string_vec(&params, "tools")?.unwrap_or_default(),
                 due_at: opt_string(&params, "due_at"),
+                deadline_at: opt_string(&params, "deadline_at"),
                 recurrence: opt_string(&params, "recurrence"),
                 depends_on: opt_i64_vec(&params, "depends_on")?.unwrap_or_default(),
                 // Acceptance inheritance: a subtask that declares no
@@ -788,6 +792,10 @@ fn task_update_service(storage: &Arc<Storage>) -> ServiceFn {
                 tool_scope: opt_string_vec(&params, "tools")?,
                 due_at: params
                     .get("due_at")
+                    .and_then(Value::as_str)
+                    .map(|s| Some(s.to_string())),
+                deadline_at: params
+                    .get("deadline_at")
                     .and_then(Value::as_str)
                     .map(|s| Some(s.to_string())),
                 recurrence: params
@@ -968,9 +976,25 @@ fn task_note_service(storage: &Arc<Storage>) -> ServiceFn {
                 .or_else(|| opt_string(&params, "text"))
                 .ok_or_else(|| "content is required".to_string())?;
             let author = opt_string(&params, "author");
+            let author_member_id = opt_string(&params, "author_member_id");
+            // An unknown kind is refused rather than silently posted as a
+            // comment: a caller that meant `verdict` must not have it read as
+            // prose.
+            let kind = match opt_string(&params, "kind") {
+                Some(token) => nanna_storage::TaskNoteKind::parse(&token).ok_or_else(|| {
+                    format!("unknown note kind '{token}' (comment|progress|question|verdict)")
+                })?,
+                None => nanna_storage::TaskNoteKind::Comment,
+            };
             let note = storage
                 .tasks()
-                .add_note(id, author.as_deref(), &content)
+                .post(
+                    id,
+                    author.as_deref(),
+                    author_member_id.as_deref(),
+                    kind,
+                    &content,
+                )
                 .await
                 .map_err(err_str)?;
             Ok(json!({ "note_id": note.id }))
@@ -3888,6 +3912,7 @@ pub async fn seed_plan(
             labels: vec!["chat".to_string()],
             tool_scope: task.tool_scope.clone(),
             due_at: None,
+            deadline_at: None,
             recurrence: None,
             depends_on: Vec::new(),
             acceptance: task.acceptance.clone(),
@@ -7650,6 +7675,7 @@ mod acceptance_canonicalization_tests {
             labels: Vec::new(),
             tool_scope: Vec::new(),
             due_at: None,
+            deadline_at: None,
             recurrence: None,
             depends_on: Vec::new(),
             acceptance: Some(canonical),

@@ -5,6 +5,7 @@
 //!
 //! Turso is a Rust-native `SQLite` implementation.
 
+mod members;
 mod migrations;
 mod models;
 mod recovery;
@@ -12,6 +13,7 @@ mod repositories;
 pub mod task_filter;
 mod tasks;
 
+pub use members::*;
 pub use models::*;
 pub use recovery::*;
 pub use repositories::*;
@@ -188,6 +190,13 @@ impl Storage {
     #[must_use]
     pub fn workspaces(&self) -> WorkspaceRepository {
         WorkspaceRepository::new(self.conn.clone())
+    }
+
+    /// Board members: the human, every agent, and each board's Task Management
+    /// Agent. `tasks.assignee` holds one of their ids.
+    #[must_use]
+    pub fn members(&self) -> MemberRepository {
+        MemberRepository::new(self.conn.clone())
     }
 
     #[must_use]
