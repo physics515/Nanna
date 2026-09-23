@@ -7,8 +7,13 @@
 //! - `p1`..`p4` — priority
 //! - `@label` — has label
 //! - `#project` — in project
-//! - `overdue`, `today`, `no date`, `no label`, `subtask`
+//! - `overdue`, `today`, `no date`, `no deadline`, `no label`, `subtask`
 //! - `due before: YYYY-MM-DD`, `due after: YYYY-MM-DD`
+//! - `deadline before: YYYY-MM-DD`, `deadline after: YYYY-MM-DD`
+//!
+//! `due` is the **defer** date and `deadline` is the completion bound (P25
+//! decision 10). `overdue` is measured against the deadline and nothing else —
+//! a card whose defer date has passed is merely *startable*, not late.
 //! - `search: text` — substring match over title + description
 //! - status atoms: `pending`, `in_progress`, `done`, `cancelled`, `blocked`
 //!   (`blocked` matches the *derived* blocked flag, never a stored value)
@@ -51,12 +56,15 @@ pub enum FilterAtom {
     Label(String),
     /// `#project`
     Project(String),
-    /// `overdue` — due date strictly before today and not done/cancelled
+    /// `overdue` — DEADLINE strictly before today and not done/cancelled. A
+    /// passed defer date does not make a card overdue.
     Overdue,
     /// `today` — due date equals today
     Today,
-    /// `no date`
+    /// `no date` — no defer date, i.e. startable now
     NoDate,
+    /// `no deadline`
+    NoDeadline,
     /// `no label`
     NoLabel,
     /// `subtask` — has a parent
@@ -65,6 +73,10 @@ pub enum FilterAtom {
     DueBefore(String),
     /// `due after: YYYY-MM-DD` (exclusive)
     DueAfter(String),
+    /// `deadline before: YYYY-MM-DD` (exclusive)
+    DeadlineBefore(String),
+    /// `deadline after: YYYY-MM-DD` (exclusive)
+    DeadlineAfter(String),
     /// `search: text` — case-insensitive substring over title + description
     Search(String),
     /// `pending` | `in_progress` | `done` | `cancelled`
@@ -161,14 +173,17 @@ impl FilterAtom {
             Self::Overdue => {
                 task.status != "done"
                     && task.status != "cancelled"
-                    && due_date(task).is_some_and(|d| d.as_str() < today)
+                    && deadline_date(task).is_some_and(|d| d.as_str() < today)
             }
             Self::Today => due_date(task).is_some_and(|d| d == today),
             Self::NoDate => task.due_at.is_none(),
+            Self::NoDeadline => task.deadline_at.is_none(),
             Self::NoLabel => task.labels.is_empty(),
             Self::Subtask => task.parent_id.is_some(),
             Self::DueBefore(date) => due_date(task).is_some_and(|d| d < *date),
             Self::DueAfter(date) => due_date(task).is_some_and(|d| d > *date),
+            Self::DeadlineBefore(date) => deadline_date(task).is_some_and(|d| d < *date),
+            Self::DeadlineAfter(date) => deadline_date(task).is_some_and(|d| d > *date),
             Self::Search(text) => {
                 let needle = text.to_lowercase();
                 task.title.to_lowercase().contains(&needle)
@@ -183,11 +198,21 @@ impl FilterAtom {
     }
 }
 
-/// Extract the date part (`YYYY-MM-DD`) of a task's due timestamp.
+/// Extract the date part (`YYYY-MM-DD`) of a task's defer timestamp.
 fn due_date(task: &Task) -> Option<String> {
-    task.due_at
-        .as_deref()
-        .map(|d| d.chars().take(10).collect::<String>())
+    task.due_at.as_deref().map(iso_day)
+}
+
+/// Extract the date part of a task's deadline.
+fn deadline_date(task: &Task) -> Option<String> {
+    task.deadline_at.as_deref().map(iso_day)
+}
+
+/// The `YYYY-MM-DD` prefix of an ISO timestamp, which is what every date
+/// comparison here is on — the store has required ISO since P15, so the first
+/// ten characters order correctly as text.
+fn iso_day(value: &str) -> String {
+    value.chars().take(10).collect()
 }
 
 struct Parser {
@@ -350,6 +375,7 @@ fn lex_word(chars: &[char], start: usize, tokens: &mut Vec<Token>) -> Result<usi
             let (follow, after) = take_word(chars, skip_ws(chars, i));
             match follow.to_lowercase().as_str() {
                 "date" => tokens.push(Token::Atom(FilterAtom::NoDate)),
+                "deadline" => tokens.push(Token::Atom(FilterAtom::NoDeadline)),
                 "label" => tokens.push(Token::Atom(FilterAtom::NoLabel)),
                 other => {
                     return Err(FilterError::UnknownKeyword(format!("no {other}")));
@@ -357,25 +383,30 @@ fn lex_word(chars: &[char], start: usize, tokens: &mut Vec<Token>) -> Result<usi
             }
             i = after;
         }
-        "due" => {
-            // Accept `due before: DATE` / `due after:DATE` — the
+        "due" | "deadline" => {
+            // Accept `due before: DATE` / `deadline after:DATE` — the
             // colon may or may not be followed by a space.
             let (text, after) = take_until_operator(chars, i);
             i = after;
+            let on_deadline = lower == "deadline";
             let lower_rest = text.to_lowercase();
             let (build, raw_date): (fn(String) -> FilterAtom, &str) =
                 if lower_rest.starts_with("before:") {
-                    (
-                        FilterAtom::DueBefore,
-                        text.get("before:".len()..).unwrap_or(""),
-                    )
+                    let build = if on_deadline {
+                        FilterAtom::DeadlineBefore
+                    } else {
+                        FilterAtom::DueBefore
+                    };
+                    (build, text.get("before:".len()..).unwrap_or(""))
                 } else if lower_rest.starts_with("after:") {
-                    (
-                        FilterAtom::DueAfter,
-                        text.get("after:".len()..).unwrap_or(""),
-                    )
+                    let build = if on_deadline {
+                        FilterAtom::DeadlineAfter
+                    } else {
+                        FilterAtom::DueAfter
+                    };
+                    (build, text.get("after:".len()..).unwrap_or(""))
                 } else {
-                    return Err(FilterError::UnknownKeyword(format!("due {text}")));
+                    return Err(FilterError::UnknownKeyword(format!("{lower} {text}")));
                 };
             let date = raw_date.trim().to_string();
             if !is_iso_date(&date) {
@@ -450,6 +481,7 @@ mod tests {
             labels: vec!["rust".to_string(), "p14".to_string()],
             tool_scope: vec![],
             due_at: Some("2026-07-20".to_string()),
+            deadline_at: None,
             recurrence: None,
             depends_on: vec![],
             acceptance: None,
@@ -504,9 +536,9 @@ mod tests {
     }
 
     #[test]
-    fn overdue_requires_past_due_and_open_status() {
+    fn overdue_requires_a_past_deadline_and_an_open_status() {
         let mut t = task();
-        t.due_at = Some("2026-07-10".to_string());
+        t.deadline_at = Some("2026-07-10".to_string());
         assert!(parse("overdue").unwrap().matches(&t, TODAY));
         t.status = "done".to_string();
         assert!(
@@ -514,10 +546,52 @@ mod tests {
             "done tasks are never overdue"
         );
         t.status = "pending".to_string();
-        t.due_at = Some(TODAY.to_string());
+        t.deadline_at = Some(TODAY.to_string());
         assert!(
             !parse("overdue").unwrap().matches(&t, TODAY),
             "due today is not overdue"
+        );
+    }
+
+    /// The whole point of splitting the two fields (P25 decision 10): a card
+    /// whose *defer* date has passed is startable, not late. Before the split
+    /// this task read as overdue.
+    #[test]
+    fn a_passed_defer_date_does_not_make_a_card_overdue() {
+        let mut t = task();
+        t.due_at = Some("2026-07-10".to_string());
+        t.deadline_at = None;
+        assert!(
+            !parse("overdue").unwrap().matches(&t, TODAY),
+            "a deferred card with no deadline is never overdue"
+        );
+        t.deadline_at = Some("2026-07-25".to_string());
+        assert!(
+            !parse("overdue").unwrap().matches(&t, TODAY),
+            "its deadline has not arrived"
+        );
+    }
+
+    #[test]
+    fn deadline_atoms_read_the_deadline_and_due_atoms_read_the_defer_date() {
+        let mut t = task();
+        t.due_at = Some("2026-07-20".to_string());
+        t.deadline_at = Some("2026-08-01".to_string());
+
+        assert!(parse("deadline after: 2026-07-25").unwrap().matches(&t, TODAY));
+        assert!(parse("deadline before: 2026-08-05").unwrap().matches(&t, TODAY));
+        assert!(!parse("deadline before: 2026-07-25").unwrap().matches(&t, TODAY));
+
+        // The same dates read through `due` see the defer date instead.
+        assert!(parse("due before: 2026-07-25").unwrap().matches(&t, TODAY));
+        assert!(!parse("due after: 2026-07-25").unwrap().matches(&t, TODAY));
+
+        assert!(!parse("no deadline").unwrap().matches(&t, TODAY));
+        t.deadline_at = None;
+        assert!(parse("no deadline").unwrap().matches(&t, TODAY));
+        assert!(
+            !parse("no date").unwrap().matches(&t, TODAY),
+            "`no date` is still about the defer date"
         );
     }
 

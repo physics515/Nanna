@@ -7683,11 +7683,58 @@ as its turn (`TurnAdmission`, scope default `session`).
 #### Work (in build order)
 
 **Stage 1 — store and events (no UI yet).**
-- [ ] `members` table + `Member` model (`id, name, avatar, kind, owner_kind, owner_id, status,
+- [x] `members` table + `Member` model (`id, name, avatar, kind, owner_kind, owner_id, status,
       profile JSON`); `tasks.assignee` becomes a foreign key to it. Seed one human member and the
       per-workspace router member on migration.
-- [ ] `tasks.deadline_at` alongside `due_at` (which becomes the defer date); `overdue` computed
+      *(2026-09-23)* Migration `017_members` + `crates/nanna-storage/src/members.rs`.
+      `MemberKind`/`MemberOwner`/`MemberStatus` are real enums with explicit `as_str`/`parse`
+      rather than the `String` columns `Task` uses: an unknown token is a row from a newer
+      schema, so it errors instead of coercing to a default and silently changing what a member
+      *is*. Seeds `human` and `router:global` directly, plus `router:<id>` for every workspace
+      already registered (`INSERT … SELECT FROM workspaces`); `ensure_router` covers workspaces
+      registered afterwards, so both paths produce the same id.
+      **The foreign key is enforced in `TaskRepository`, not in SQL** — SQLite cannot add a
+      constraint to an existing column and `PRAGMA foreign_keys` is off on this connection, so a
+      declared FK would have been decorative. `ensure_assignee_resolves` runs on create and on
+      update, under the same connection guard as the write. Consequence worth stating: an
+      `assignee` that is not a member id is now rejected where it used to be a free-text label —
+      which is the point, but it means `tasks.add {assignee}` from a model fails until the member
+      exists, with a message that says so. Bounds: id 128 B, name 200 B, avatar 512 B (a
+      reference, never image data — the bound is what makes that rule enforceable), profile 8 KiB
+      (~2k tokens, since the router reads every profile into its decision prompt), roster 1000.
+      11 tests.
+      **Trap the migration-split guard caught:** a `;` inside a `--` comment in the new migration.
+      `every_shipped_migration_splits_exactly_as_it_did_before` compares the lexer against the old
+      `split(';')` and failed on it — exactly the class migration 014 nearly shipped. Migration
+      comments must not contain semicolons.
+- [x] `tasks.deadline_at` alongside `due_at` (which becomes the defer date); `overdue` computed
       against the deadline; reminder default rebased onto it.
+      *(2026-09-23)* Migration `018_task_deadline`. `overdue` now reads `deadline_at` and nothing
+      else, so a card whose defer date has passed is *startable*, not late — the exact case that
+      read as overdue before the split, now pinned by
+      `a_passed_defer_date_does_not_make_a_card_overdue`. New filter atoms `deadline before:` /
+      `deadline after:` / `no deadline` so the field is queryable rather than merely stored; `due
+      before:` / `due after:` / `today` / `no date` stay on the defer date. New invariant: a
+      deadline earlier than the defer date is rejected on write (the card could never be worked);
+      same-day is admitted, since the comparison is on the `YYYY-MM-DD` prefix. Wired through
+      `TaskAction::Create`, the `task.update` patch, `tasks.add`/`tasks.update` and
+      `task_to_json`, so it is reachable from IPC and from the model's own write surface.
+      **Not done — the reminder half.** "Reminder default rebased onto it" has nothing to rebase:
+      `reminder_service` schedules session-scoped `TaskType::At` one-shots and never reads a
+      task's `due_at`. A task→reminder binding does not exist yet, so inventing one here would
+      have been a new feature wearing this item's clothes. Filed below.
+- [ ] **Thread attachments.** `post` takes text only. Decide where the bytes live before adding
+      a column: in-row blobs bound the thread's size against the "never compacted" rule,
+      on-disk paths make a card non-portable, content-addressed storage needs a GC story that
+      "threads are permanent" already complicates. Whichever wins, the memory copy of a post
+      (Stage 1's write-through) must carry a reference, not the bytes.
+- [ ] **A task→reminder binding** (`deadline_at` → a scheduled nudge). P25 decision 10 says
+      "reminders hang off the deadline by default", but nothing binds the two today:
+      `reminder_service` only schedules session-scoped one-shots a human or the model asked for
+      explicitly, and it reads no task field. Needs a decision first — who is reminded (the
+      assignee's member inbox, not a session, once Stage 4 lands), and whether a deadline nudge is
+      a *reminder* or simply the `due`/`overdue` bus event Stage 1 already lists. Do not build it
+      before the event list exists, or it will be a second notification path.
 - [ ] Default `scope = 'workspace'`; migration promotes `session`-scoped rows (tasks + memories) to
       the session's `workspace_id`, else `global`, and stamps label `promoted`. Delete
       `TurnAdmission` (`crates/nanna-daemon/src/tasks.rs:1210`) and its call sites in
@@ -7695,8 +7742,42 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [ ] Task lifecycle events on the broadcast bus: `created, assigned, status_changed, blocked,
       unblocked, posted, due, overdue, verdict`. Run events stay. Consumers must not block the bus
       (see the event-bus rule in memory).
-- [ ] Thread = `task_notes` with `author_member_id` and `kind ∈ {comment, progress, question,
+      *(2026-09-23 — scouted, deliberately not started, so the next run can go straight at it.)*
+      Add ONE variant beside the `TaskRun*` family in `crates/nanna-daemon/src/protocol.rs:1065`
+      (`TaskRunStarted`/`Progress`/`Completed` are about a **run**; these are store mutations).
+      `Event::session_id()` is exhaustive with no wildcard arm **on purpose** — a new variant will
+      not compile until it is classified there, and a task event belongs in the `None` group. Give
+      the variant a **typed** `TaskEventKind` rather than `TaskRunProgress`'s `String` kind: the
+      router will match on it, and `#[serde(rename_all = "snake_case")]` keeps the wire JSON the
+      same shape a JS client already expects.
+      **Four of the nine need machinery that does not exist yet — do not fake them.** `created`,
+      `assigned`, `status_changed`, `posted` and `verdict` have obvious emit points today
+      (`task_create`, the assignee/status arms of `apply_patch`, `post`, `complete`).
+      `blocked`/`unblocked` are *derived*, so they are transitions to be computed when a dependency
+      closes, not a field to read. `due`/`overdue` are time-driven and need a sweep — the natural
+      home is beside `task_recurrence_sweep`. Emitting five and calling the item done would leave
+      four kinds declared and never sent, which is the failure mode the dead-fields rule is about.
+      Land the five with their emit points, then the derived pair, then the sweep pair.
+- [x] Thread = `task_notes` with `author_member_id` and `kind ∈ {comment, progress, question,
       verdict}` + attachments; never rewritten.
+      *(2026-09-23)* Migration `019_task_thread`. `TaskRepository::post` is the new write shape —
+      it names the member and the kind; `add_note` stays as a thin `Comment` wrapper so the
+      harness's existing calls keep working unchanged. `author_member_id` gets the same
+      enforcement as `assignee` (`ensure_member_exists`, now shared by both, with the field named
+      in the error so a bad assignee and a bad post author do not read identically). An unknown
+      `kind` on read is an error, not a fallback to `comment`: flattening one would silently
+      demote a question or a verdict to prose. A GUI note now posts as the human member;
+      `tasks.note` gained `kind` and `author_member_id` and refuses an unknown kind rather than
+      accepting it as a comment. **Append-only is enforced by absence** — there is no update
+      path, and the migration adds none.
+      **`author` is kept, not renamed.** It holds the pre-members actor string (`gui`, `harness`,
+      an agent name) and is NULL-free history that a rename would lose. It is legacy that Stage 4
+      removes once every writer names a member; inherited rows carry `author_member_id = NULL`,
+      which reads correctly — those posts predate the entity.
+      **Not done: attachments.** The item lists them and nothing here stores one. They need a
+      blob/path decision (in-row, on disk beside the workspace, or content-addressed) that Stage 1
+      does not force, and a thread that is "the permanent record" makes where the bytes live a
+      durability question, not a schema one. Filed below.
 - [ ] Memory write-through: on card create/close and on every post, write a workspace-scoped
       memory carrying `source_task_id` / `source_note_id`. Dreaming operates only on these copies.
 - [ ] Per-member-per-label verdict rollup (a query over `task_activity` is enough) for the router.
@@ -8314,6 +8395,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-09-23 sweep)* `cargo update` → 4 compatible bumps (`aegis 0.9.16 → 0.9.19`,
+     `glib 0.22.9 → 0.22.10`, `libredox 0.1.24 → 0.1.25`, plus `libc`'s usual walk).
+     `cargo upgrade --incompatible` offered **nothing at all** — 80 non-local packages already at
+     their latest req, 19 local, and for the second sweep running neither downgrade trap
+     (`criterion`, `lopdf`) was reported, which continues to look like a registry artifact rather
+     than a standing offer. Both pin-backs were needed again: `libc` 0.2.189 → 0.2.186, and
+     `malachite-bigint` arrived at a **fourth** version — 0.12.0 this time (0.10.0 on 2026-08-25,
+     0.11.0 on 2026-09-14, 0.12.0 now) — so the disambiguated spec really is version-specific
+     every run: read it out of `cargo update`'s own "Adding" lines.
+     GUI: `pnpm outdated` had exactly **two** rows and one was the known TS-7 block. Applied
+     `marked 18.0.13 → 18.0.14` (a patch; the 26-test characterization suite from the marked-18
+     bump is what makes that cheap). TypeScript 7 still blocked and the cheap gate still answers
+     it without a migration attempt: npm `typescript` latest is **still 7.0.2** and `vue-tsc`
+     **still 3.3.11**, unchanged since the 2026-08-27 failure — so the earliest realistic retry
+     remains TS 7.1 (~Q4 2026).
    - *(2026-09-20 sweep)* `cargo update` → 8 compatible bumps (`cc 1.4.7`, `find-msvc-tools 0.1.13`,
      `generator 0.8.10`, `rand 0.10.3`, `tauri 2.11.6`, `tauri-plugin-updater 2.12.0`,
      `unicode-id-start 1.5.0`). `cargo upgrade --incompatible` offered **nothing** — 79 non-local
@@ -9303,6 +9399,53 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                    `cubecl-environment`'s unconditional SQLite cache forces `libsqlite3-sys` on
                    every consumer. Worth having the issue number too — #1608 is the remedy, #1488 is
                    the defect, and a future run may find one closed without the other.
+                 *(2026-09-23 — **#1608 IS CLOSED AND THE C SQLITE IS GONE FROM THE PUBLISHED
+                 CRATE.** This watch is over. Verified at the manifest level, which is the check
+                 the 2026-09-20 note insisted on rather than a PR title:
+                 `crates.io/api/v1/crates/cubecl-environment/0.11.0-pre.3/dependencies` →
+                 `rusqlite ^0.40`; `…/0.11.0-pre.4/dependencies` → `turso ^0.8.0-pre.8`, and
+                 **no sqlite-family dependency at all**. `cubecl-environment 0.11.0-pre.4` was
+                 published 2026-09-22T13:57Z, the same day #1608 closed. The chain is aligned:
+                 `burn-cubecl 0.22.0-pre.4` (2026-09-22) requires `cubecl =0.11.0-pre.4`, so a
+                 Mummu on burn 0.22-pre.4 links no bundled C engine. Note #1643 ("Refactor/async
+                 turso storage") was **closed unmerged** on 2026-09-21 — the work landed by
+                 another route, which is why checking the crate beats checking the PR.
+                 **The blocker has not vanished, it has changed shape — and the new one is much
+                 softer.** cubecl-environment now wants `turso ^0.8.0-pre.8` while Nanna pins
+                 `turso =0.7.2` exactly, so adding `mummu` today resolves **two** turso versions.
+                 Both are pure Rust, so the "no C SQLite" rule is satisfied either way and
+                 `no_banned_database_crates_in_lockfile` (which bans `rusqlite`/`libsql`/`sqlx`)
+                 should now pass — but two embedded database engines in one binary is its own
+                 cost, and the standing rule "never a pre-release on an exact pin" blocks moving
+                 Nanna's own pin to `0.8.0-pre.x`. So:
+                 **But Mummu has to move first, and it has not.** Checked its real
+                 lockfile 2026-09-23, not its manifest: `/mnt/deepmem/Development/mummu`
+                 pins `burn 0.22.0-pre.3` (and `burn-cubecl =0.22.0-pre.3`), which
+                 resolves `cubecl-environment 0.11.0-pre.3` and therefore
+                 **`rusqlite 0.40.2` is still in Mummu's lock today**. So "cubecl is
+                 fixed" does **not** yet mean "adding mummu works" — the ordering is
+                 Mummu bumps burn `0.22.0-pre.3 → pre.4`, *then* Nanna can re-try. File
+                 the burn bump in Mummu's roadmap; do not spend a Nanna build on the
+                 integration before it lands, because the guard will fail for a reason
+                 that is not Nanna's.
+                 - [ ] **Once `turso 0.8.0` goes stable, move Nanna's pin to it and re-try adding
+                       `mummu`** — that is the single step that collapses the split and makes P12
+                       item 4 (Mummu's MiniLM embedder behind the memory `embed_fn`) buildable.
+                       The 0.8.0-pre watch above is now load-bearing for P12, not just for P13's
+                       indexing question.
+                 - [ ] **Measure before deciding, if 0.8.0 stays unstable:** add `mummu` at
+                       burn 0.22-pre.4 on a scratch branch and read the resolved lockfile. If the
+                       guard passes and the second turso is confined to cubecl's autotune cache,
+                       shipping the split is a defensible interim — say so with the lockfile in
+                       hand, not from this paragraph.
+                 - [x] ~~Narrow `dep_guard`'s ban to Nanna's own storage path.~~ **Moot** — there
+                       is no C SQLite left to permit.
+                 - [x] ~~Ask Mummu to make its GPU stack optional.~~ **Moot for this purpose** —
+                       cubecl no longer drags in rusqlite, so a CPU-only consumer needs no
+                       escape hatch from it. Still worth asking on its own merits (a CPU-only
+                       embedder should not compile a GPU stack), but it is no longer what blocks
+                       P12 item 4.)*
+
                  **So: watch #1608 before spending the owner's decision on the two options below.**
                  Re-check it at the top of each run — this is now the cheapest thing standing
                  between P12 and its first real consumer. The concrete check is one command once

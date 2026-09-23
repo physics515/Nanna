@@ -18,6 +18,9 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("014_memory_events", MIGRATION_014),
     ("015_model_stats_cache_ttl", MIGRATION_015),
     ("016_request_log_cache_ttl", MIGRATION_016),
+    ("017_members", MIGRATION_017),
+    ("018_task_deadline", MIGRATION_018),
+    ("019_task_thread", MIGRATION_019),
 ];
 
 const MIGRATION_001: &str = r"
@@ -563,6 +566,94 @@ const MIGRATION_016: &str = r"
 -- The same 1-hour cache-write share, per request, so a day's spend can be
 -- priced from the request log exactly as the lifetime totals are.
 ALTER TABLE model_request_log ADD COLUMN cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0;
+";
+
+const MIGRATION_017: &str = r#"
+-- P25 Stage 1: board members. The human, every agent and the Task Management
+-- Agent share ONE entity, so a card's assignee is a member id regardless of
+-- who is behind it and the board never has to branch on human-vs-agent to
+-- render a row.
+--
+-- `owner_kind` records who the member belongs to, not what it is: a workspace
+-- member is shared by everyone on that board, a human-owned agent travels with
+-- its owner. `profile` is the router's input (model tier, capability tags,
+-- tools, skills, cost) and is JSON because that shape is still being designed.
+-- The columns above it are the ones the board and the assignment path read.
+CREATE TABLE IF NOT EXISTS members (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    avatar TEXT,
+    kind TEXT NOT NULL,
+    owner_kind TEXT NOT NULL,
+    owner_id TEXT,
+    status TEXT NOT NULL DEFAULT 'idle',
+    profile TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_members_owner ON members(owner_kind, owner_id);
+CREATE INDEX IF NOT EXISTS idx_members_kind ON members(kind);
+
+-- `tasks.assignee` now holds a `members.id`. The column is not re-declared as
+-- a SQL foreign key: SQLite cannot add a constraint to an existing column, and
+-- `PRAGMA foreign_keys` is off here anyway, so the reference would be decorative.
+-- `TaskRepository` enforces it on write instead, which also covers the rows
+-- this migration inherits. The index is what the board's assignee filter and
+-- the per-member inbox read.
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
+
+-- The one human this install belongs to. Seeded rather than created on first
+-- use so that `assignee = 'human'` resolves from the moment the schema exists.
+INSERT OR IGNORE INTO members (id, name, kind, owner_kind, owner_id, status, profile)
+VALUES ('human', 'You', 'human', 'human', NULL, 'idle', '{}');
+
+-- One Task Management Agent per board, including the global one. It takes no
+-- work of its own. It reads a card and decides who does.
+INSERT OR IGNORE INTO members (id, name, kind, owner_kind, owner_id, status, profile)
+VALUES ('router:global', 'Task Router', 'agent', 'workspace', NULL, 'idle', '{"role":"router"}');
+
+INSERT OR IGNORE INTO members (id, name, kind, owner_kind, owner_id, status, profile)
+SELECT 'router:' || workspaces.id, 'Task Router', 'agent', 'workspace', workspaces.id, 'idle', '{"role":"router"}'
+FROM workspaces;
+"#;
+
+const MIGRATION_018: &str = r"
+-- P25 decision 10: a date and a deadline are different things, and conflating
+-- them is why a card that cannot start yet looks identical to one that is
+-- late. `due_at` keeps its column but changes meaning -- it is now the DEFER
+-- date, which keeps a card out of the inbox until it arrives. `deadline_at` is
+-- the bound: the card must be complete by then, and `overdue` is measured
+-- against it alone.
+--
+-- Existing rows are left as they are. A `due_at` written under the old meaning
+-- reads as a defer date, which is the conservative reading: it hides the card
+-- until its date rather than declaring it late.
+ALTER TABLE tasks ADD COLUMN deadline_at TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline_at);
+";
+
+const MIGRATION_019: &str = r"
+-- P25 decision 2: a conversation IS the card's thread. `task_notes` was an
+-- agent scratchpad with a free-text `author` -- it becomes the forum, so a
+-- post needs to say who made it (a board member) and what kind of post it is.
+-- Distinguishing the four kinds is what lets the router read a thread without
+-- re-deriving intent from prose: a `question` blocks, a `verdict` decides, a
+-- `progress` line is noise to everyone but the board.
+--
+-- `author` is kept, unchanged, holding the pre-members actor string ('gui',
+-- 'harness', an agent name). It is legacy that Stage 4 removes once every
+-- writer names a member. `author_member_id` is the P25 field and is NULL on
+-- every inherited row, which reads correctly: those posts predate members.
+--
+-- Nothing here makes a note mutable. The thread is the permanent record, so
+-- there is no UPDATE path and this migration does not add one.
+ALTER TABLE task_notes ADD COLUMN author_member_id TEXT;
+
+ALTER TABLE task_notes ADD COLUMN kind TEXT NOT NULL DEFAULT 'comment';
+
+CREATE INDEX IF NOT EXISTS idx_task_notes_author ON task_notes(author_member_id);
 ";
 
 /// Lexer state while splitting a migration.

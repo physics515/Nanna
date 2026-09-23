@@ -70,11 +70,11 @@ impl ControlPlane {
 
             TaskAction::Create {
                 title, scope, session_id, parent_id, description, priority, labels, tools,
-                due_at, recurrence, depends_on, acceptance, project, assignee,
+                due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
             } => {
                 let request = CreateTask {
                     title, scope, session_id, parent_id, description, priority, labels, tools,
-                    due_at, recurrence, depends_on, acceptance, project, assignee,
+                    due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
                 };
                 self.task_create(&repo, request).await
             }
@@ -89,7 +89,19 @@ impl ControlPlane {
             },
 
             TaskAction::Note { id, content } => {
-                match repo.add_note(id, Some("gui"), &content).await {
+                // A note from the GUI is the human posting on the card's
+                // thread, so it names the human member (P25 decision 2). The
+                // legacy `author` string stays "gui" until Stage 4 drops it.
+                match repo
+                    .post(
+                        id,
+                        Some("gui"),
+                        Some(nanna_storage::HUMAN_MEMBER_ID),
+                        nanna_storage::TaskNoteKind::Comment,
+                        &content,
+                    )
+                    .await
+                {
                     Ok(note) => json!({"note": note}),
                     Err(e) => json!({"error": "task_note_failed", "message": e.to_string()}),
                 }
@@ -171,7 +183,7 @@ impl ControlPlane {
     async fn task_create(&self, repo: &TaskRepository, request: CreateTask) -> Value {
         let CreateTask {
             title, scope, session_id, parent_id, description, priority, labels, tools,
-            due_at, recurrence, depends_on, acceptance, project, assignee,
+            due_at, deadline_at, recurrence, depends_on, acceptance, project, assignee,
         } = request;
         // A subtask always lives in its parent's scope and inherits
         // its ladder position; a new root task appends after
@@ -230,6 +242,7 @@ impl ControlPlane {
             labels: labels.unwrap_or_default(),
             tool_scope: tools.unwrap_or_default(),
             due_at,
+            deadline_at,
             recurrence,
             depends_on: depends_on.unwrap_or_default(),
             acceptance,
@@ -299,6 +312,10 @@ impl ControlPlane {
             tool_scope: patch.get("tools").filter(|v| v.is_array()).map(&string_vec),
             due_at: patch
                 .get("due_at")
+                .and_then(Value::as_str)
+                .map(|s| Some(s.to_string())),
+            deadline_at: patch
+                .get("deadline_at")
                 .and_then(Value::as_str)
                 .map(|s| Some(s.to_string())),
             recurrence: patch
@@ -536,6 +553,7 @@ struct CreateTask {
     labels: Option<Vec<String>>,
     tools: Option<Vec<String>>,
     due_at: Option<String>,
+    deadline_at: Option<String>,
     recurrence: Option<String>,
     depends_on: Option<Vec<i64>>,
     /// Boxed to match `TaskAction::Create`, whose field it is moved from; see

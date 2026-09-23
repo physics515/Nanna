@@ -120,8 +120,12 @@ pub enum TaskAction {
         labels: Option<Vec<String>>,
         #[serde(default)]
         tools: Option<Vec<String>>,
+        /// Defer date: the card stays out of the inbox until it arrives.
         #[serde(default)]
         due_at: Option<String>,
+        /// Completion bound; `overdue` is measured against this (P25).
+        #[serde(default)]
+        deadline_at: Option<String>,
         #[serde(default)]
         recurrence: Option<String>,
         #[serde(default)]

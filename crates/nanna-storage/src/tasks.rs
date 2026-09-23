@@ -11,7 +11,9 @@
 //! multi-statement invariants hold because every method acquires the single
 //! connection lock for the duration of its writes.
 
-use crate::{NewTask, StorageError, Task, TaskActivityEntry, TaskNote, TaskPatch, task_filter};
+use crate::{
+    NewTask, StorageError, Task, TaskActivityEntry, TaskNote, TaskNoteKind, TaskPatch, task_filter,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -54,7 +56,7 @@ pub const TASKS_PER_SCOPE_MAX: usize = 10_000;
 
 const TASK_COLUMNS: &str = "id, parent_id, scope, scope_id, project, title, description, status, \
      priority, labels, tool_scope, due_at, recurrence, depends_on, acceptance, assignee, \
-     sort_order, created_at, updated_at, completed_at";
+     sort_order, created_at, updated_at, completed_at, deadline_at";
 
 /// Outcome of completing a task.
 #[derive(Debug, Clone)]
@@ -93,15 +95,7 @@ impl TaskRepository {
     /// [`StorageError::NotFound`] if the inserted row cannot be read back. A
     /// failure writing the `created` activity entry leaves the task created.
     pub async fn create(&self, mut new: NewTask) -> Result<Task, StorageError> {
-        validate_scope(&new.scope, new.scope_id.as_deref())?;
-        validate_title(&new.title)?;
-        validate_priority(new.priority)?;
-        if new.depends_on.len() > TASK_DEPS_MAX {
-            return Err(StorageError::Invalid(format!(
-                "too many dependencies: {} (max {TASK_DEPS_MAX})",
-                new.depends_on.len()
-            )));
-        }
+        validate_new_task_fields(&new)?;
         // Canonicalize BEFORE storing: the row must hold the object shape the
         // harness reads back, whatever dialect the caller handed us.
         if let Some(acceptance) = &new.acceptance {
@@ -158,11 +152,15 @@ impl TaskRepository {
             .map(std::string::ToString::to_string);
 
         let conn = self.conn.lock().await;
+        if let Err(err) = ensure_member_exists(&conn, new.assignee.as_deref(), "assignee").await {
+            drop(conn);
+            return Err(err);
+        }
         conn.execute(
             "INSERT INTO tasks (parent_id, scope, scope_id, project, title, description, status, \
              priority, labels, tool_scope, due_at, recurrence, depends_on, acceptance, assignee, \
-             sort_order) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             sort_order, deadline_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             turso::params![
                 new.parent_id,
                 new.scope.as_str(),
@@ -179,6 +177,7 @@ impl TaskRepository {
                 acceptance_json.as_deref(),
                 new.assignee.as_deref(),
                 new.sort_order,
+                new.deadline_at.as_deref(),
             ],
         )
         .await?;
@@ -371,12 +370,20 @@ impl TaskRepository {
         let needs_graph_check = patch.depends_on.is_some() || patch.parent_id.is_some();
         let parent_changed = patch.parent_id.is_some();
         let changed = apply_patch(&mut task, patch)?;
+        validate_dates(task.due_at.as_deref(), task.deadline_at.as_deref())?;
 
         {
             // Validate and write under ONE connection guard: the mutex is the
             // transaction, so a concurrent writer cannot slip a conflicting
             // graph change between the checks and the write.
             let conn = self.conn.lock().await;
+            if changed.contains(&"assignee")
+                && let Err(err) =
+                    ensure_member_exists(&conn, task.assignee.as_deref(), "assignee").await
+            {
+                drop(conn);
+                return Err(err);
+            }
             if needs_graph_check {
                 let scope_tasks =
                     load_scope_with(&conn, &task.scope, task.scope_id.as_deref()).await?;
@@ -559,6 +566,36 @@ impl TaskRepository {
         author: Option<&str>,
         content: &str,
     ) -> Result<TaskNote, StorageError> {
+        self.post(task_id, author, None, TaskNoteKind::Comment, content)
+            .await
+    }
+
+    /// Append a thread post (P25 decision 2): the same append-only write as
+    /// [`Self::add_note`], but naming the board member who posted and what the
+    /// post is doing.
+    ///
+    /// `author_member_id` is checked against `members` when present — the same
+    /// enforcement `tasks.assignee` gets, for the same reason. `author` stays
+    /// as the pre-members actor string so a post from the harness still says
+    /// where it came from.
+    ///
+    /// There is no counterpart that edits a post: the thread is the permanent
+    /// record, so append is the only write shape.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Invalid`] if the trimmed content is empty or
+    /// longer than [`TASK_NOTE_MAX_BYTES`] or if `author_member_id` is not a
+    /// board member, [`StorageError::NotFound`] if no task has `task_id` or
+    /// the new post cannot be read back, or [`StorageError::Database`] if a
+    /// read or write fails.
+    pub async fn post(
+        &self,
+        task_id: i64,
+        author: Option<&str>,
+        author_member_id: Option<&str>,
+        kind: TaskNoteKind,
+        content: &str,
+    ) -> Result<TaskNote, StorageError> {
         let trimmed = content.trim();
         if trimmed.is_empty() {
             return Err(StorageError::Invalid("note content is empty".to_string()));
@@ -573,29 +610,28 @@ impl TaskRepository {
         let _ = self.get_raw(task_id).await?;
 
         let conn = self.conn.lock().await;
+        if let Err(err) = ensure_member_exists(&conn, author_member_id, "note author").await {
+            drop(conn);
+            return Err(err);
+        }
+        let kind_token = kind.as_str();
         conn.execute(
-            "INSERT INTO task_notes (task_id, author, content) VALUES (?1, ?2, ?3)",
-            turso::params![task_id, author, trimmed],
+            "INSERT INTO task_notes (task_id, author, author_member_id, kind, content) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            turso::params![task_id, author, author_member_id, kind_token, trimmed],
         )
         .await?;
         let mut rows = conn
             .query(
-                "SELECT id, task_id, author, content, created_at FROM task_notes \
-                 ORDER BY id DESC LIMIT 1",
+                "SELECT id, task_id, author, content, created_at, author_member_id, kind \
+                 FROM task_notes ORDER BY id DESC LIMIT 1",
                 (),
             )
             .await?;
-        let note = if let Some(row) = rows.next().await? {
-            Ok(TaskNote {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                author: row.get(2)?,
-                content: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        } else {
-            Err(StorageError::NotFound("note just created".to_string()))
-        };
+        let note = rows.next().await?.map_or_else(
+            || Err(StorageError::NotFound("note just created".to_string())),
+            |row| decode_task_note(&row),
+        );
         // Held from the insert through the read-back: "newest row" is only
         // this note while no other writer can interleave, and the cursor must
         // be gone before the guard is.
@@ -613,20 +649,14 @@ impl TaskRepository {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, task_id, author, content, created_at FROM task_notes \
-                 WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
+                "SELECT id, task_id, author, content, created_at, author_member_id, kind \
+                 FROM task_notes WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
                 turso::params![task_id, limit],
             )
             .await?;
         let mut notes = Vec::new();
         while let Some(row) = rows.next().await? {
-            notes.push(TaskNote {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                author: row.get(2)?,
-                content: row.get(3)?,
-                created_at: row.get(4)?,
-            });
+            notes.push(decode_task_note(&row)?);
         }
         // Held until the cursor is gone: an open `Rows` on the shared
         // connection swallows later writes.
@@ -1119,7 +1149,8 @@ async fn write_task_with(conn: &Connection, task: &Task) -> Result<(), StorageEr
         "UPDATE tasks SET parent_id = ?1, project = ?2, title = ?3, description = ?4, \
          status = ?5, priority = ?6, labels = ?7, tool_scope = ?8, due_at = ?9, \
          recurrence = ?10, depends_on = ?11, acceptance = ?12, assignee = ?13, \
-         sort_order = ?14, completed_at = ?15, updated_at = datetime('now') WHERE id = ?16",
+         sort_order = ?14, completed_at = ?15, deadline_at = ?16, \
+         updated_at = datetime('now') WHERE id = ?17",
         turso::params![
             task.parent_id,
             task.project.as_deref(),
@@ -1136,6 +1167,7 @@ async fn write_task_with(conn: &Connection, task: &Task) -> Result<(), StorageEr
             task.assignee.as_deref(),
             task.sort_order,
             task.completed_at.as_deref(),
+            task.deadline_at.as_deref(),
             task.id,
         ],
     )
@@ -1232,6 +1264,10 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
         };
         changed.push("acceptance");
         task.acceptance = acceptance;
+    }
+    if let Some(deadline_at) = patch.deadline_at {
+        changed.push("deadline_at");
+        task.deadline_at = deadline_at;
     }
     if let Some(assignee) = patch.assignee {
         changed.push("assignee");
@@ -2305,6 +2341,100 @@ fn check_parent_cycle(by_id: &HashMap<i64, &Task>, start: i64) -> Result<(), Sto
     Ok(())
 }
 
+/// A card deferred past its own deadline can never be worked (P25 decision 10):
+/// it stays out of the inbox until `due_at`, by which time `deadline_at` has
+/// already passed. Same-day is fine — the comparison is on the date part, so an
+/// afternoon deadline on a morning's defer date is admitted.
+///
+/// Both values are ISO (`YYYY-MM-DD` or a full timestamp), which the store has
+/// required since P15, so the first ten characters order correctly as text.
+fn validate_dates(due_at: Option<&str>, deadline_at: Option<&str>) -> Result<(), StorageError> {
+    let (Some(defer), Some(deadline)) = (due_at, deadline_at) else {
+        return Ok(());
+    };
+    let defer_day: String = defer.chars().take(10).collect();
+    let deadline_day: String = deadline.chars().take(10).collect();
+    if deadline_day < defer_day {
+        return Err(StorageError::Invalid(format!(
+            "deadline {deadline} is before the defer date {defer}: the card would never be \
+             workable"
+        )));
+    }
+    Ok(())
+}
+
+/// `tasks.assignee` holds a `members.id` (P25 Stage 1). SQLite cannot add a
+/// foreign key to an existing column and `PRAGMA foreign_keys` is off on this
+/// connection, so the reference is enforced here — on write, under the same
+/// guard as the write, which is stronger than the declarative constraint would
+/// have been anyway.
+///
+/// `None` is unassigned and always admitted: that is the state a card sits in
+/// between creation and the router placing it.
+/// Every field-level check a new task must pass, in one place: they are
+/// independent of the store, so running them before the scope is loaded keeps
+/// a malformed request from costing a read.
+fn validate_new_task_fields(new: &NewTask) -> Result<(), StorageError> {
+    validate_scope(&new.scope, new.scope_id.as_deref())?;
+    validate_title(&new.title)?;
+    validate_priority(new.priority)?;
+    validate_dates(new.due_at.as_deref(), new.deadline_at.as_deref())?;
+    if new.depends_on.len() > TASK_DEPS_MAX {
+        return Err(StorageError::Invalid(format!(
+            "too many dependencies: {} (max {TASK_DEPS_MAX})",
+            new.depends_on.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The shared half of the reference check above: `None` is admitted, anything
+/// else must name a row in `members`. `role` names the field in the error so a
+/// bad assignee and a bad note author do not read identically.
+async fn ensure_member_exists(
+    conn: &Connection,
+    member_id: Option<&str>,
+    role: &str,
+) -> Result<(), StorageError> {
+    let Some(member_id) = member_id else {
+        return Ok(());
+    };
+    let owned = member_id.to_string();
+    let mut rows = conn
+        .query("SELECT 1 FROM members WHERE id = ?1", turso::params![owned])
+        .await?;
+    let found = rows.next().await?.is_some();
+    // Drop the open cursor before the caller's write: an unfinished Rows on
+    // the shared turso connection silently swallows later writes.
+    drop(rows);
+    if found {
+        return Ok(());
+    }
+    Err(StorageError::Invalid(format!(
+        "{role} '{member_id}' is not a board member; create the member first"
+    )))
+}
+
+/// Decode one `task_notes` row in `TASK_NOTE_COLUMNS` order.
+fn decode_task_note(row: &turso::Row) -> Result<TaskNote, StorageError> {
+    let id: i64 = row.get(0)?;
+    let kind_token: String = row.get(6)?;
+    // An unknown kind is a post from a newer schema. Flattening it to a
+    // comment would silently demote a question or a verdict.
+    let kind = TaskNoteKind::parse(&kind_token).ok_or_else(|| {
+        StorageError::Invalid(format!("note #{id} has unknown kind '{kind_token}'"))
+    })?;
+    Ok(TaskNote {
+        id,
+        task_id: row.get(1)?,
+        author: row.get(2)?,
+        content: row.get(3)?,
+        created_at: row.get(4)?,
+        author_member_id: row.get(5)?,
+        kind,
+    })
+}
+
 fn decode_task_row(row: &turso::Row) -> Result<Task, StorageError> {
     let labels_str: String = row.get(9)?;
     let tool_scope_str: String = row.get(10)?;
@@ -2331,6 +2461,7 @@ fn decode_task_row(row: &turso::Row) -> Result<Task, StorageError> {
         created_at: row.get(17)?,
         updated_at: row.get(18)?,
         completed_at: row.get(19)?,
+        deadline_at: row.get(20)?,
         blocked: false,
     })
 }

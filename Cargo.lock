@@ -36,9 +36,9 @@ dependencies = [
 
 [[package]]
 name = "aegis"
-version = "0.9.16"
+version = "0.9.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4542662923e93dc727bc364f885f6cf24adb4dc60d6fcce0e8d397d214179e14"
+checksum = "889e16399083fb85723e46ab10c0d34345012bd5a3b3f412e131a909f6fb5be4"
 dependencies = [
  "cc",
  "softaes",
@@ -2008,7 +2008,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.6",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3625,9 +3625,9 @@ dependencies = [
 
 [[package]]
 name = "glib"
-version = "0.22.9"
+version = "0.22.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18b9b8d350db41f690ec1b87109f202782748bbd8ab2f2ede17cb40d29e2838c"
+checksum = "e4cf9e5bd8713f1990a92c422998826e0fb34824277b46bc59757373483c6694"
 dependencies = [
  "bitflags 2.13.2",
  "futures-channel",
@@ -5010,9 +5010,9 @@ dependencies = [
 
 [[package]]
 name = "libredox"
-version = "0.1.24"
+version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6480ccc157a1389bb2e4891b24751b0f798ba640d22386f23143fbcc89da195a"
+checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
 dependencies = [
  "libc",
 ]
@@ -5546,7 +5546,7 @@ dependencies = [
 
 [[package]]
 name = "nanna"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5575,7 +5575,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-agent"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5604,7 +5604,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-bench"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "criterion",
  "nanna-simd",
@@ -5617,7 +5617,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-browser"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "async-trait",
  "chromiumoxide",
@@ -5633,7 +5633,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-channels"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -5654,7 +5654,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-client"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -5671,7 +5671,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-config"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -5691,7 +5691,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-core"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5715,7 +5715,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-daemon"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5762,7 +5762,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gpu"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -5778,7 +5778,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gui"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -5815,7 +5815,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-llm"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "async-stream",
  "directories",
@@ -5834,7 +5834,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-mcp"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5851,7 +5851,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-memory"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "async-trait",
  "half",
@@ -5868,11 +5868,11 @@ dependencies = [
 
 [[package]]
 name = "nanna-numeric"
-version = "0.3.28"
+version = "0.3.29"
 
 [[package]]
 name = "nanna-proc"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "libc",
  "tempfile",
@@ -5883,7 +5883,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-scripting"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "boa_engine",
  "chrono",
@@ -5909,7 +5909,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-server"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "anyhow",
  "axum",
@@ -5940,7 +5940,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-simd"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "half",
  "wide",
@@ -5948,7 +5948,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-storage"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "chrono",
  "nanna-numeric",
@@ -5963,7 +5963,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-timeline"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "nanna-storage",
  "serde",
@@ -5974,7 +5974,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-tools"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -6007,7 +6007,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-workspace"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "serde",
  "serde_json",
@@ -7374,7 +7374,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -10500,7 +10500,7 @@ dependencies = [
  "base64 0.23.1",
  "block2",
  "cairo-rs",
- "glib 0.22.9",
+ "glib 0.22.10",
  "gtk",
  "javascriptcore-rs",
  "objc2",
