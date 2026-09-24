@@ -1948,7 +1948,13 @@ impl MemoryService {
     /// chunk-write failures are logged, not returned.
     pub async fn update_content(&self, id: &str, content: &str) -> Result<(), MemoryError> {
         self.store.update_content(id, content).await?;
-        info!("Updated memory content: {}", id);
+        // The store just dropped this entry's vector, because it described the
+        // text that stopped existing. That leaves the row in exactly the state
+        // a vector-less write leaves it — queued — so it has to be announced
+        // the same way, or the drain never learns there is work and the memory
+        // stays unsearchable until some unrelated write happens to wake it.
+        self.note_vector_queued();
+        info!("Updated memory content: {} (queued for re-embedding)", id);
         Ok(())
     }
 

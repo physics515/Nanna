@@ -8026,9 +8026,27 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       per-session half. Delete rather than fix; sub-agents are sub-tasks, tools are `tool.ts`.
 
 **Stage 1 — store, memory, storage:**
-- [ ] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and
+- [x] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and
       call `note_vector_queued` (the durable half of the 2026-08 fix; `nanna-memory/src/lib.rs:1268`,
       `service.rs:1949,1059`).
+      *(2026-09-24)* **Both halves were genuinely missing and they fail differently.**
+      (1) *Durable:* `MemoryRepository::update_content` wrote only `content`, so the row kept the
+      vector describing the text that had just stopped existing. The 2026-08 fix cleared the RAM
+      copy and the buckets — and a restart reloaded the stale vector straight back off disk. The
+      statement now sets `embedding = NULL, embedding_model = NULL` in the same UPDATE. There is
+      deliberately **no variant that keeps the old vector**: changing the text invalidates the
+      embedding by definition, and a row findable by words it no longer contains looks completely
+      healthy while being wrong.
+      (2) *Queue:* `MemoryService::update_content` never called `note_vector_queued`, so the row
+      entered the ordinary queued-for-backfill state without anything telling the drain there was
+      work — the memory stayed unsearchable until some unrelated write happened to wake it.
+      `NULL` is not a special case invented for this: `convert_rows` already counts it as awaiting
+      embedding, so the drain re-embeds the new text and the row is *unsearchable* rather than
+      *wrongly searchable* in the meantime — the safe direction. The save path's conflict branch
+      (`memory_persistence.rs:200`) clears then re-writes the embedding it just computed, so a crash
+      between the two leaves the row queued, which is also the safe direction.
+      4 tests in `memory_content_invalidates_vector.rs`; **verified to fail against the old
+      statement** (2 of the 4 flip red when the clear is reverted) rather than passing vacuously.
 - [ ] `rank_and_assemble`: keep global memories that matched only by chunk under a scoped recall;
       reject NaN scores before the gate and sort with a total order (`service.rs:1634-1662`).
 - [ ] `MemoryAction::Clear{scope:None}` must be durable or refuse; `save_entry`'s conflict
