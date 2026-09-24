@@ -10,6 +10,7 @@ mod migrations;
 mod models;
 mod recovery;
 mod repositories;
+mod task_events;
 pub mod task_filter;
 mod tasks;
 
@@ -17,6 +18,7 @@ pub use members::*;
 pub use models::*;
 pub use recovery::*;
 pub use repositories::*;
+pub use task_events::*;
 pub use tasks::*;
 
 use std::sync::Arc;
@@ -59,6 +61,14 @@ impl Default for StorageConfig {
 /// Main storage interface
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
+    /// Where task lifecycle events go, once someone is listening.
+    ///
+    /// Write-once rather than a constructor argument: the daemon's event bus
+    /// does not exist yet when storage is opened, and `Storage` is shared as
+    /// an `Arc` immediately afterwards, so there is no later `&mut self` to
+    /// set it through. A `OnceLock` also makes "attached twice" a detectable
+    /// mistake instead of a silently dropped first sink.
+    task_events: std::sync::OnceLock<Arc<dyn TaskEventSink>>,
 }
 
 impl Storage {
@@ -73,6 +83,7 @@ impl Storage {
         let conn = db.connect()?;
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
+            task_events: std::sync::OnceLock::new(),
         };
 
         storage.migrate().await?;
@@ -92,6 +103,7 @@ impl Storage {
         let conn = db.connect()?;
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
+            task_events: std::sync::OnceLock::new(),
         };
         storage.migrate().await?;
         // Released once migrations have run; from here on the connection's
@@ -199,9 +211,21 @@ impl Storage {
         MemberRepository::new(self.conn.clone())
     }
 
+    /// Attach the sink task lifecycle events are published to.
+    ///
+    /// Returns `false` if a sink was already attached, in which case the new
+    /// one is dropped and the existing one keeps receiving. Callers that care
+    /// should treat `false` as a wiring bug, not as a condition to retry.
+    pub fn set_task_events(&self, sink: Arc<dyn TaskEventSink>) -> bool {
+        self.task_events.set(sink).is_ok()
+    }
+
     #[must_use]
     pub fn tasks(&self) -> TaskRepository {
+        // A fresh repository per call, so the sink is handed over each time
+        // rather than held by whoever happened to build the first one.
         TaskRepository::new(self.conn.clone())
+            .with_events(self.task_events.get().cloned())
     }
 
     // =========================================================================

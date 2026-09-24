@@ -979,7 +979,7 @@ dependencies = [
  "tap",
  "temporal_rs",
  "thin-vec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "timezone_provider",
  "xsum",
@@ -1296,7 +1296,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1454,7 +1454,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",
@@ -2205,7 +2205,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2245,7 +2245,7 @@ dependencies = [
  "swc_sourcemap",
  "swc_visit",
  "text_lines",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode-width 0.2.2",
  "url",
 ]
@@ -2283,7 +2283,7 @@ dependencies = [
  "sourcemap",
  "static_assertions",
  "sys_traits",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "url",
  "uuid",
@@ -2341,7 +2341,7 @@ dependencies = [
  "strum_macros 0.27.2",
  "syn 2.0.119",
  "syn-match",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2353,7 +2353,7 @@ dependencies = [
  "deno_error",
  "percent-encoding",
  "sys_traits",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "url",
 ]
 
@@ -2792,13 +2792,12 @@ checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
 name = "encoding_rs"
-version = "0.8.41"
+version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5ef0006ac9ab233c38522f5ae99cae3625151de8f706cacee1cba4b8e2832a"
+checksum = "8e985e0451871ad22fb8d2b6b076e2028a502a0d3950998c2c5c0a4f9b5d9679"
 dependencies = [
  "cfg-if",
  "core_detect",
- "multiversion",
  "multiversion_no_op",
  "rustversion",
  "scopeguard",
@@ -3749,7 +3748,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "log",
  "presser",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "windows 0.62.2",
 ]
 
@@ -4679,7 +4678,7 @@ dependencies = [
  "jni-sys 0.4.1",
  "log",
  "simd_cesu8",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "walkdir",
  "windows-link 0.2.1",
 ]
@@ -5123,7 +5122,7 @@ dependencies = [
  "rayon",
  "sha2 0.11.0",
  "stringprep",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "weezl",
 ]
 
@@ -5469,29 +5468,8 @@ dependencies = [
  "once_cell",
  "png 0.18.1",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "multiversion"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4ca4bea16ffc3f443cf7d866912118196bfef4c6a1556ca00f9f9b00bb43f7c"
-dependencies = [
- "multiversion-macros",
-]
-
-[[package]]
-name = "multiversion-macros"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d416831a7317ef4b08bee00b69cbbb9c8763da7959a7026244d6266869f9c83"
-dependencies = [
- "proc-macro2",
- "quote",
- "rustversion",
- "syn 3.0.6",
 ]
 
 [[package]]
@@ -5528,7 +5506,7 @@ dependencies = [
  "once_cell",
  "rustc-hash 1.1.0",
  "spirv",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode-ident",
 ]
 
@@ -5541,12 +5519,12 @@ dependencies = [
  "hashbrown 0.17.1",
  "indexmap 2.14.2",
  "rustc-hash 1.1.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "nanna"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5575,7 +5553,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-agent"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5595,7 +5573,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5604,7 +5582,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-bench"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "criterion",
  "nanna-simd",
@@ -5617,7 +5595,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-browser"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "async-trait",
  "chromiumoxide",
@@ -5626,14 +5604,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "nanna-channels"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -5645,7 +5623,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -5654,7 +5632,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-client"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -5662,7 +5640,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -5671,7 +5649,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-config"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -5683,7 +5661,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "zeroize",
@@ -5691,7 +5669,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-core"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5706,7 +5684,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5715,7 +5693,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-daemon"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5748,7 +5726,7 @@ dependencies = [
  "socket2",
  "subtle",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
  "tower-http 0.7.1",
@@ -5762,7 +5740,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gpu"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -5770,7 +5748,7 @@ dependencies = [
  "half",
  "nanna-numeric",
  "nanna-simd",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "wgpu",
@@ -5778,7 +5756,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-gui"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -5815,7 +5793,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-llm"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "async-stream",
  "directories",
@@ -5825,7 +5803,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tiktoken-rs",
  "tokio",
  "tracing",
@@ -5834,7 +5812,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-mcp"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5843,7 +5821,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uuid",
@@ -5851,7 +5829,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-memory"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "async-trait",
  "half",
@@ -5860,7 +5838,7 @@ dependencies = [
  "nanna-simd",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uuid",
@@ -5868,11 +5846,11 @@ dependencies = [
 
 [[package]]
 name = "nanna-numeric"
-version = "0.3.29"
+version = "0.3.30"
 
 [[package]]
 name = "nanna-proc"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "libc",
  "tempfile",
@@ -5883,7 +5861,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-scripting"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "boa_engine",
  "chrono",
@@ -5900,7 +5878,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",
@@ -5909,7 +5887,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-server"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "anyhow",
  "axum",
@@ -5930,7 +5908,7 @@ dependencies = [
  "serde_urlencoded",
  "sha2 0.11.0",
  "subtle",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tower",
  "tower-http 0.7.1",
@@ -5940,7 +5918,7 @@ dependencies = [
 
 [[package]]
 name = "nanna-simd"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "half",
  "wide",
@@ -5948,13 +5926,13 @@ dependencies = [
 
 [[package]]
 name = "nanna-storage"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "chrono",
  "nanna-numeric",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "turso",
@@ -5963,18 +5941,18 @@ dependencies = [
 
 [[package]]
 name = "nanna-timeline"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "nanna-storage",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "uuid",
 ]
 
 [[package]]
 name = "nanna-tools"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -5998,7 +5976,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uuid",
@@ -6007,12 +5985,12 @@ dependencies = [
 
 [[package]]
 name = "nanna-workspace"
-version = "0.3.29"
+version = "0.3.30"
 dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
@@ -6561,7 +6539,7 @@ dependencies = [
  "rten",
  "rten-imageproc",
  "rten-tensor",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "wasm-bindgen",
 ]
 
@@ -6716,7 +6694,7 @@ dependencies = [
  "objc2-osa-kit",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -7069,7 +7047,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
  "tower",
@@ -7653,7 +7631,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60dc65c0ff1a7ae1294b0c67b9f14baf70b644404010370171787bfac1038fc0"
 dependencies = [
  "libredox",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -8124,7 +8102,7 @@ dependencies = [
  "rustpython-ruff_python_ast",
  "rustpython-ruff_text_size",
  "rustpython-wtf8",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode_names2 2.0.0",
 ]
 
@@ -8168,7 +8146,7 @@ dependencies = [
  "rustpython-ruff_python_parser",
  "rustpython-ruff_source_file",
  "rustpython-ruff_text_size",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -8265,7 +8243,7 @@ dependencies = [
  "rustpython-ruff_python_trivia",
  "rustpython-ruff_source_file",
  "rustpython-ruff_text_size",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -8468,7 +8446,7 @@ dependencies = [
  "static_assertions",
  "strum 0.28.0",
  "strum_macros 0.28.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "timsort",
  "uname",
  "unic-ucd-bidi",
@@ -8863,7 +8841,7 @@ dependencies = [
  "num-bigint 0.4.8",
  "serde",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -9938,9 +9916,9 @@ dependencies = [
 
 [[package]]
 name = "sys_traits"
-version = "0.1.28"
+version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88826d6169418c98e8bc52a43f79d50907dfa3e87ba5161930d42c6f980b35ee"
+checksum = "c7a35f11f9773f11930a7d1e6276766f1577400ee2530b7f0cf3844c2dcbf12b"
 dependencies = [
  "sys_traits_macros",
 ]
@@ -10055,7 +10033,7 @@ dependencies = [
  "tantivy-stacker",
  "tantivy-tokenizer-api",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "typetag",
  "uuid",
@@ -10278,7 +10256,7 @@ dependencies = [
  "tauri-runtime",
  "tauri-runtime-wry",
  "tauri-utils",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tray-icon",
  "url",
@@ -10327,7 +10305,7 @@ dependencies = [
  "sha2 0.10.9",
  "syn 2.0.119",
  "tauri-utils",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "url",
  "uuid",
@@ -10378,7 +10356,7 @@ dependencies = [
  "tauri",
  "tauri-plugin",
  "tauri-plugin-fs",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "url",
 ]
 
@@ -10401,7 +10379,7 @@ dependencies = [
  "tauri",
  "tauri-plugin",
  "tauri-utils",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "toml 1.1.6+spec-1.1.0",
  "url",
 ]
@@ -10420,7 +10398,7 @@ dependencies = [
  "serde_repr",
  "tauri",
  "tauri-plugin",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "url",
 ]
@@ -10452,7 +10430,7 @@ dependencies = [
  "shared_child",
  "tauri",
  "tauri-plugin",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
@@ -10481,7 +10459,7 @@ dependencies = [
  "tauri",
  "tauri-plugin",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "tokio",
  "url",
@@ -10512,7 +10490,7 @@ dependencies = [
  "tauri",
  "tauri-plugin",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uuid",
@@ -10540,7 +10518,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tauri-utils",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "url",
  "webkit2gtk",
  "webview2-com",
@@ -10603,7 +10581,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "swift-rs",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "toml 1.1.6+spec-1.1.0",
  "url",
  "urlpattern",
@@ -10628,7 +10606,7 @@ version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed071c670382e85fc2f48ae706492d8c338f4f89bf72520d32f8abfe880aade"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "windows 0.61.3",
  "windows-version",
 ]
@@ -10739,11 +10717,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.20",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -10759,9 +10737,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -11153,7 +11131,7 @@ checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
 dependencies = [
  "crossbeam-channel",
  "symlink",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "tracing-subscriber",
 ]
@@ -11226,7 +11204,7 @@ dependencies = [
  "once_cell",
  "png 0.18.1",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]
 
@@ -11259,7 +11237,7 @@ dependencies = [
  "log",
  "rand 0.9.5",
  "sha1 0.10.7",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "utf-8",
 ]
 
@@ -11277,7 +11255,7 @@ dependencies = [
  "native-tls",
  "rand 0.10.3",
  "sha1 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -11287,7 +11265,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9491d7a80312c5abe66a4409e4dce02065503a235453c94b9e4133877e39ffc"
 dependencies = [
  "mimalloc",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
  "turso_core",
@@ -11354,7 +11332,7 @@ dependencies = [
  "strum_macros 0.26.4",
  "tantivy",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
  "turso_ext",
@@ -11399,7 +11377,7 @@ dependencies = [
  "miette",
  "strum 0.26.3",
  "strum_macros 0.26.4",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "turso_macros",
 ]
 
@@ -11447,7 +11425,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "turso_core",
  "turso_parser",
@@ -12108,7 +12086,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a10e6b67c951a84de7029487e0e0a496860dae49f6699edd279d5ff35b8fbf54"
 dependencies = [
  "deno_error",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -12238,7 +12216,7 @@ version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "381336cfffd772377d291702245447a5251a2ffa5bad679c99e61bc48bacbf9c"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "windows 0.61.3",
  "windows-core 0.61.2",
 ]
@@ -12304,7 +12282,7 @@ dependencies = [
  "raw-window-handle",
  "rustc-hash 1.1.0",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-emscripten",
  "wgpu-core-deps-windows-linux-android",
@@ -12385,7 +12363,7 @@ dependencies = [
  "renderdoc-sys",
  "smallvec",
  "static_assertions",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "wasm-bindgen",
  "wayland-sys",
  "web-sys",
@@ -13082,7 +13060,7 @@ dependencies = [
  "sha2 0.10.9",
  "soup3",
  "tao-macros",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "url",
  "webkit2gtk",
  "webkit2gtk-sys",
@@ -13257,18 +13235,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.57"
+version = "0.8.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
+checksum = "c17e8fafad82b542ff3717217ecdc736231b59e387768c9630123b4ce4d2db44"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.57"
+version = "0.8.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
+checksum = "595f56e044df4f46a0c9a626f65c3d99eb8488f7e8a8baa12dd76326d9710bf2"
 dependencies = [
  "proc-macro2",
  "quote",

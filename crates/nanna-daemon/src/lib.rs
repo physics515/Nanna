@@ -54,6 +54,7 @@ pub mod server;
 pub mod service;
 pub mod session;
 pub mod shutdown;
+pub mod task_event_bridge;
 pub mod tasks;
 pub mod tool_authoring;
 pub mod vision_service;

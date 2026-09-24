@@ -1,6 +1,6 @@
 {
   "name": "nanna-gui",
-  "version": "0.3.29",
+  "version": "0.3.30",
   "type": "module",
   "private": true,
   "scripts": {
@@ -24,7 +24,7 @@
   },
   "dependencies": {
     "@guolao/vue-monaco-editor": "^1.6.0",
-    "@lucide/vue": "^1.47.0",
+    "@lucide/vue": "^1.48.0",
     "@monaco-editor/loader": "^1.7.0",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.3",

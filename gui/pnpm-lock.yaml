@@ -12,8 +12,8 @@ importers:
         specifier: ^1.6.0
         version: 1.6.0(monaco-editor@0.56.0)(vue@3.5.43(typescript@5.9.3))
       '@lucide/vue':
-        specifier: ^1.47.0
-        version: 1.47.0(vue@3.5.43(typescript@5.9.3))
+        specifier: ^1.48.0
+        version: 1.48.0(vue@3.5.43(typescript@5.9.3))
       '@monaco-editor/loader':
         specifier: ^1.7.0
         version: 1.7.0
@@ -547,8 +547,8 @@ packages:
   '@kwsites/promise-deferred@1.1.1':
     resolution: {integrity: sha512-GaHYm+c0O9MjZRu0ongGBRbinu8gVAMd2UZjji6jVmqKtZluZnptXGWhz1E8j8D2HJ3f/yMxKAUC0b+57wncIw==}
 
-  '@lucide/vue@1.47.0':
-    resolution: {integrity: sha512-S0/UX9zra4Z8xmqrA1MH5GiSKA8daAPFwkmORt/u+gUHAkYZoeOcr+DH3scZeyE9bdLWScGK+MJoDYi8rIU5Jg==}
+  '@lucide/vue@1.48.0':
+    resolution: {integrity: sha512-3/Nwx/RsqQ4ZrrSML1GNsSWCSDyLnBgoF/eEr1q9G6iZymn3+WKtzIj7Dbc/Nxrt9WOPuGrJ58S+CBiamK+36w==}
     peerDependencies:
       vue: '>=3.0.1'
 
@@ -4688,7 +4688,7 @@ snapshots:
 
   '@kwsites/promise-deferred@1.1.1': {}
 
-  '@lucide/vue@1.47.0(vue@3.5.43(typescript@5.9.3))':
+  '@lucide/vue@1.48.0(vue@3.5.43(typescript@5.9.3))':
     dependencies:
       vue: 3.5.43(typescript@5.9.3)
 

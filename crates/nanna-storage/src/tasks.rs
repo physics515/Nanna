@@ -12,7 +12,8 @@
 //! connection lock for the duration of its writes.
 
 use crate::{
-    NewTask, StorageError, Task, TaskActivityEntry, TaskNote, TaskNoteKind, TaskPatch, task_filter,
+    NewTask, StorageError, Task, TaskActivityEntry, TaskEvent, TaskEventKind, TaskEventSink,
+    TaskNote, TaskNoteKind, TaskPatch, task_filter,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -56,7 +57,8 @@ pub const TASKS_PER_SCOPE_MAX: usize = 10_000;
 
 const TASK_COLUMNS: &str = "id, parent_id, scope, scope_id, project, title, description, status, \
      priority, labels, tool_scope, due_at, recurrence, depends_on, acceptance, assignee, \
-     sort_order, created_at, updated_at, completed_at, deadline_at";
+     sort_order, created_at, updated_at, completed_at, deadline_at, due_announced_at, \
+     overdue_announced_at";
 
 /// Outcome of completing a task.
 #[derive(Debug, Clone)]
@@ -71,12 +73,94 @@ pub struct CompleteOutcome {
 /// Task repository over the shared Turso connection.
 pub struct TaskRepository {
     conn: Arc<Mutex<Connection>>,
+    /// Where lifecycle events go; `None` when nobody is listening, which is
+    /// every test and every caller that predates the daemon's event bus.
+    events: Option<Arc<dyn TaskEventSink>>,
 }
 
 impl TaskRepository {
     #[must_use]
     pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+        Self { conn, events: None }
+    }
+
+    /// Attach the lifecycle event sink (see [`crate::Storage::set_task_events`]).
+    #[must_use]
+    pub fn with_events(mut self, events: Option<Arc<dyn TaskEventSink>>) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Emit `Blocked`/`Unblocked` for every task whose derived `blocked` flag
+    /// differs between two snapshots of the same scope.
+    ///
+    /// `blocked` is derived on read and never stored, so a transition is a
+    /// *difference between two computations*, not a column that changed. Taking
+    /// the snapshots around the whole mutation — rather than reasoning about
+    /// which dependents a particular write should have touched — is what makes
+    /// the cascades free: `complete` auto-closes ancestors and `update` cancels
+    /// a subtree, and both are already reflected in the "after" snapshot.
+    ///
+    /// Only tasks present in **both** snapshots transition: a task that was
+    /// deleted did not become unblocked, it stopped existing.
+    fn emit_block_transitions(&self, before: &[Task], after: &[Task], actor: Option<&str>) {
+        if self.events.is_none() {
+            return;
+        }
+        let was_blocked = blocked_ids(before);
+        let now_blocked = blocked_ids(after);
+        let existed: HashSet<i64> = before.iter().map(|t| t.id).collect();
+        for task in after {
+            if !existed.contains(&task.id) {
+                continue;
+            }
+            let before_blocked = was_blocked.contains(&task.id);
+            let after_blocked = now_blocked.contains(&task.id);
+            if before_blocked == after_blocked {
+                continue;
+            }
+            let kind = if after_blocked {
+                TaskEventKind::Blocked
+            } else {
+                TaskEventKind::Unblocked
+            };
+            self.emit(
+                kind,
+                task,
+                actor,
+                serde_json::json!({ "depends_on": task.depends_on }),
+            );
+        }
+    }
+
+    /// Publish one lifecycle event, if anyone is listening.
+    ///
+    /// # Invariant
+    ///
+    /// **Never called while the connection guard is held.** The sink is
+    /// foreign code, and running it under the mutex that serializes every
+    /// write in this process would let one consumer stall the whole store.
+    /// Every call site sits after its writes have completed and the guard has
+    /// been dropped — which also means an event is published only for a
+    /// mutation that actually reached the database.
+    fn emit(
+        &self,
+        kind: TaskEventKind,
+        task: &Task,
+        actor: Option<&str>,
+        detail: serde_json::Value,
+    ) {
+        let Some(sink) = self.events.as_ref() else {
+            return;
+        };
+        sink.publish(TaskEvent {
+            kind,
+            task_id: task.id,
+            scope: task.scope.clone(),
+            scope_id: task.scope_id.clone(),
+            actor: actor.map(str::to_string),
+            detail,
+        });
     }
 
     /// Create a task. Validates scope, title, priority, parent, and
@@ -114,7 +198,7 @@ impl TaskRepository {
             let parent = by_id.get(&parent_id).ok_or_else(|| {
                 StorageError::Invalid(format!("parent task #{parent_id} not found in scope"))
             })?;
-            if parent.status == "done" || parent.status == "cancelled" {
+            if is_closed_status(&parent.status) {
                 return Err(StorageError::Invalid(format!(
                     "cannot add a child to {} task #{parent_id}",
                     parent.status
@@ -199,6 +283,7 @@ impl TaskRepository {
 
         self.log_activity(task.id, new.assignee.as_deref(), "created", None)
             .await?;
+        self.emit(TaskEventKind::Created, &task, new.assignee.as_deref(), created_detail(&task));
         Ok(task)
     }
 
@@ -238,11 +323,11 @@ impl TaskRepository {
             task.blocked = task.depends_on.iter().any(|dep| {
                 statuses
                     .get(dep)
-                    .is_some_and(|s| s != "done" && s != "cancelled")
+                    .is_some_and(|s| !is_closed_status(s))
             });
         }
         if !include_closed {
-            tasks.retain(|t| t.status != "done" && t.status != "cancelled");
+            tasks.retain(|t| !is_closed_status(&t.status));
         }
         tasks.sort_by_key(|t| (t.sort_order, t.id));
         Ok(tasks)
@@ -371,6 +456,20 @@ impl TaskRepository {
         let parent_changed = patch.parent_id.is_some();
         let changed = apply_patch(&mut task, patch)?;
         validate_dates(task.due_at.as_deref(), task.deadline_at.as_deref())?;
+        // Snapshot before the write when this update can change what blocks
+        // what: a status transition opens or closes a dependency, and a
+        // `depends_on` change moves the edges themselves. `task` is already
+        // patched in memory, but the rows still hold the pre-update state.
+        let blocking_before = if self.events.is_some()
+            && (changed.contains(&"status") || changed.contains(&"depends_on"))
+        {
+            Some(
+                self.load_scope(&task.scope, task.scope_id.as_deref())
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         {
             // Validate and write under ONE connection guard: the mutex is the
@@ -425,6 +524,32 @@ impl TaskRepository {
         if changed.contains(&"status") && task.status == "cancelled" {
             self.cascade_cancel(&task, actor).await?;
         }
+        // Emitted from `changed`, so each event describes a real transition:
+        // `apply_patch` compares both of these fields before recording them.
+        if changed.contains(&"status") {
+            self.emit(
+                TaskEventKind::StatusChanged,
+                &task,
+                actor,
+                serde_json::json!({ "status": task.status }),
+            );
+        }
+        if changed.contains(&"assignee") {
+            self.emit(
+                TaskEventKind::Assigned,
+                &task,
+                actor,
+                serde_json::json!({ "assignee": task.assignee }),
+            );
+        }
+        // After the cascade, so a subtree cancelled above is already reflected
+        // and its dependents' releases are part of this one diff.
+        if let Some(before) = blocking_before {
+            let after = self
+                .load_scope(&task.scope, task.scope_id.as_deref())
+                .await?;
+            self.emit_block_transitions(&before, &after, actor);
+        }
         self.get(id).await
     }
 
@@ -467,7 +592,7 @@ impl TaskRepository {
             let open_children: Vec<i64> = scope_tasks
                 .iter()
                 .filter(|t| {
-                    t.parent_id == Some(id) && t.status != "done" && t.status != "cancelled"
+                    t.parent_id == Some(id) && !is_closed_status(&t.status)
                 })
                 .map(|t| t.id)
                 .collect();
@@ -484,7 +609,7 @@ impl TaskRepository {
         let by_id: HashMap<i64, &Task> = scope_tasks.iter().map(|t| (t.id, t)).collect();
         let mut closed: HashSet<i64> = scope_tasks
             .iter()
-            .filter(|t| t.status == "done" || t.status == "cancelled")
+            .filter(|t| is_closed_status(&t.status))
             .map(|t| t.id)
             .collect();
         closed.insert(id);
@@ -522,6 +647,35 @@ impl TaskRepository {
 
         let task = self.get_raw(id).await?;
         debug_assert!(task.status == "done", "complete() must leave status=done");
+        self.emit(
+            TaskEventKind::Verdict,
+            &task,
+            actor,
+            serde_json::json!({ "auto": false, "auto_completed": auto_completed }),
+        );
+        // Ancestors closed by this completion get their own verdict. They are
+        // the reason these events are emitted from the repository at all: no
+        // caller ever named them, so a consumer listening one layer up would
+        // watch a parent silently become done.
+        for parent_id in &auto_completed {
+            let Some(parent) = by_id.get(parent_id) else {
+                continue;
+            };
+            self.emit(
+                TaskEventKind::Verdict,
+                parent,
+                actor,
+                serde_json::json!({ "auto": true, "trigger": id }),
+            );
+        }
+        // Closing a task releases whatever depended on it. The reload also
+        // picks up the ancestors auto-closed above, so one diff covers both.
+        if self.events.is_some() {
+            let after = self
+                .load_scope(&task.scope, task.scope_id.as_deref())
+                .await?;
+            self.emit_block_transitions(&scope_tasks, &after, actor);
+        }
         Ok(CompleteOutcome {
             task,
             auto_completed,
@@ -537,19 +691,43 @@ impl TaskRepository {
     /// entry leaves the task reopened.
     pub async fn reopen(&self, id: i64, actor: Option<&str>) -> Result<Task, StorageError> {
         let task = self.get_raw(id).await?;
-        if task.status != "done" && task.status != "cancelled" {
+        if !is_closed_status(&task.status) {
             return Ok(task);
         }
+        // Reopening runs the transition the other way: a dependency that was
+        // closed is open again, so its dependents become blocked.
+        let blocking_before = if self.events.is_some() {
+            Some(
+                self.load_scope(&task.scope, task.scope_id.as_deref())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE tasks SET status = 'pending', completed_at = NULL, \
+             due_announced_at = NULL, overdue_announced_at = NULL, \
              updated_at = datetime('now') WHERE id = ?1",
             turso::params![id],
         )
         .await?;
         drop(conn);
         self.log_activity(id, actor, "reopened", None).await?;
-        self.get_raw(id).await
+        let reopened = self.get_raw(id).await?;
+        self.emit(
+            TaskEventKind::StatusChanged,
+            &reopened,
+            actor,
+            serde_json::json!({ "status": reopened.status, "reopened": true }),
+        );
+        if let Some(before) = blocking_before {
+            let after = self
+                .load_scope(&task.scope, task.scope_id.as_deref())
+                .await?;
+            self.emit_block_transitions(&before, &after, actor);
+        }
+        Ok(reopened)
     }
 
     /// Append a working note (the durable scratchpad sub-agents leave
@@ -606,8 +784,11 @@ impl TaskRepository {
                 trimmed.len()
             )));
         }
-        // Ensure the task exists before writing (FKs are unenforced).
-        let _ = self.get_raw(task_id).await?;
+        // Ensure the task exists before writing (FKs are unenforced). The row
+        // is kept rather than discarded: the lifecycle event below names the
+        // card's scope, and re-reading it after the write would be a second
+        // round-trip for data already in hand.
+        let task = self.get_raw(task_id).await?;
 
         let conn = self.conn.lock().await;
         if let Err(err) = ensure_member_exists(&conn, author_member_id, "note author").await {
@@ -637,6 +818,21 @@ impl TaskRepository {
         // be gone before the guard is.
         drop(rows);
         drop(conn);
+        // Only a post that was actually written is announced — the thread is
+        // the permanent record, so an event for a failed append would describe
+        // a post nobody can ever read.
+        if let Ok(ref note) = note {
+            self.emit(
+                TaskEventKind::Posted,
+                &task,
+                author,
+                serde_json::json!({
+                    "note_id": note.id,
+                    "kind": kind_token,
+                    "author_member_id": author_member_id,
+                }),
+            );
+        }
         note
     }
 
@@ -796,7 +992,9 @@ impl TaskRepository {
         }
         drop(conn);
 
-        // Strip dangling dependency references.
+        // Strip dangling dependency references. This is itself an unblocking
+        // mechanism — a dependent whose only dependency was deleted is free —
+        // so the diff below is taken after the stripping, not before it.
         let doomed_set: HashSet<i64> = doomed.iter().copied().collect();
         for t in &scope_tasks {
             if doomed_set.contains(&t.id) {
@@ -807,6 +1005,13 @@ impl TaskRepository {
                 kept.depends_on.retain(|d| !doomed_set.contains(d));
                 self.write_task(&kept).await?;
             }
+        }
+
+        if self.events.is_some() {
+            let after = self
+                .load_scope(&task.scope, task.scope_id.as_deref())
+                .await?;
+            self.emit_block_transitions(&scope_tasks, &after, actor);
         }
 
         let count = doomed.len() as u64;
@@ -835,7 +1040,7 @@ impl TaskRepository {
         // Delete children before parents so subtree deletes never double-count.
         let mut targets: Vec<&Task> = tasks
             .iter()
-            .filter(|t| !closed_only || t.status == "done" || t.status == "cancelled")
+            .filter(|t| !closed_only || is_closed_status(&t.status))
             .collect();
         targets.sort_by_key(|t| std::cmp::Reverse(parent_depth_lenient(&tasks, t.id)));
         for target in targets {
@@ -848,7 +1053,7 @@ impl TaskRepository {
                     .any(|member_id| {
                         by_id
                             .get(&member_id)
-                            .is_some_and(|t| t.status != "done" && t.status != "cancelled")
+                            .is_some_and(|t| !is_closed_status(&t.status))
                     });
                 if has_open_descendant {
                     continue;
@@ -946,6 +1151,126 @@ impl TaskRepository {
         Ok(imported)
     }
 
+    /// Announce the time-driven lifecycle events: cards whose defer date has
+    /// arrived (`due`) and open cards whose deadline has passed (`overdue`).
+    ///
+    /// Returns `(due, overdue)` counts. `now` is passed in rather than read
+    /// here so the caller owns the clock and a test can cross a boundary
+    /// without sleeping.
+    ///
+    /// Comparison is at **day** granularity, matching `validate_dates` and the
+    /// filter language: these fields hold ISO strings that may be a bare day
+    /// (`2026-07-20`) or a full timestamp, and a raw string compare would make
+    /// a day-only deadline overdue from midnight of the day it is due.
+    ///
+    /// **Each card is announced once per crossing, not once per sweep.** The
+    /// marker columns are what make that true, and they are re-armed when the
+    /// date moves or the card is reopened — see migration `020`. Without them a
+    /// sweep running every five minutes would re-announce the same overdue card
+    /// forever, which is a notification bug rather than an event stream.
+    ///
+    /// Closed cards are skipped: a card that is done is not late, and P25
+    /// decision 10 measures `overdue` against `deadline_at` alone — `due_at` is
+    /// the defer date and says only when the card may start.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the scan or a marker write fails.
+    /// A failure partway leaves the cards already marked announced, which is
+    /// the safe direction: the alternative is announcing them twice.
+    pub async fn announce_due(
+        &self,
+        now: &str,
+    ) -> Result<(usize, usize), StorageError> {
+        let today = day_of(now);
+        let pending = self.list_time_announcable(&today).await?;
+        let mut due_count = 0usize;
+        let mut overdue_count = 0usize;
+        for task in pending {
+            let due_crossed = task.due_announced_at.is_none()
+                && task.due_at.as_deref().is_some_and(|at| day_of(at) <= today);
+            let overdue_crossed = task.overdue_announced_at.is_none()
+                && task
+                    .deadline_at
+                    .as_deref()
+                    .is_some_and(|at| day_of(at) < today);
+            if due_crossed {
+                self.mark_announced(task.id, "due_announced_at", now).await?;
+                self.emit(
+                    TaskEventKind::Due,
+                    &task,
+                    None,
+                    serde_json::json!({ "due_at": task.due_at }),
+                );
+                due_count += 1;
+            }
+            if overdue_crossed {
+                self.mark_announced(task.id, "overdue_announced_at", now)
+                    .await?;
+                self.emit(
+                    TaskEventKind::Overdue,
+                    &task,
+                    None,
+                    serde_json::json!({ "deadline_at": task.deadline_at }),
+                );
+                overdue_count += 1;
+            }
+        }
+        Ok((due_count, overdue_count))
+    }
+
+    /// Open cards with an un-announced date or deadline that `now` has reached.
+    ///
+    /// The filtering is done in SQL so a board with thousands of settled cards
+    /// does not decode all of them every five minutes.
+    async fn list_time_announcable(&self, today: &str) -> Result<Vec<Task>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE status NOT IN ('done', 'cancelled') AND ( \
+                       (due_announced_at IS NULL AND due_at IS NOT NULL \
+                        AND substr(due_at, 1, 10) <= ?1) \
+                       OR (overdue_announced_at IS NULL AND deadline_at IS NOT NULL \
+                           AND substr(deadline_at, 1, 10) < ?1))"
+                ),
+                turso::params![today],
+            )
+            .await?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next().await? {
+            tasks.push(decode_task_row(&row)?);
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(tasks)
+    }
+
+    /// Stamp one announcement marker. The column name is a caller-supplied
+    /// literal, never user input — the two call sites above are its only
+    /// callers and both pass a constant.
+    async fn mark_announced(
+        &self,
+        id: i64,
+        column: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        debug_assert!(
+            column == "due_announced_at" || column == "overdue_announced_at",
+            "marker column must be one of the two announcement markers"
+        );
+        let conn = self.conn.lock().await;
+        conn.execute(
+            &format!("UPDATE tasks SET {column} = ?1 WHERE id = ?2"),
+            turso::params![now, id],
+        )
+        .await?;
+        drop(conn);
+        Ok(())
+    }
+
     /// All completed tasks that carry a recurrence expression, across every
     /// scope. The daemon's recurrence sweep (one recurrence engine — the P8
     /// scheduler) computes the next occurrence and reopens due ones.
@@ -988,7 +1313,7 @@ impl TaskRepository {
         let tasks = self.load_scope(&normalize_scope(scope), scope_id).await?;
         let closed = tasks
             .iter()
-            .filter(|t| t.status == "done" || t.status == "cancelled")
+            .filter(|t| is_closed_status(&t.status))
             .count() as u64;
         let open = tasks.len() as u64 - closed;
         Ok((open, closed))
@@ -1039,7 +1364,7 @@ impl TaskRepository {
                         // Its subtree moves with it — do not descend.
                         continue;
                     }
-                    if t.status != "done" && t.status != "cancelled" {
+                    if !is_closed_status(&t.status) {
                         let mut child = t.clone();
                         child.status = "cancelled".to_string();
                         self.write_task(&child).await?;
@@ -1150,7 +1475,8 @@ async fn write_task_with(conn: &Connection, task: &Task) -> Result<(), StorageEr
          status = ?5, priority = ?6, labels = ?7, tool_scope = ?8, due_at = ?9, \
          recurrence = ?10, depends_on = ?11, acceptance = ?12, assignee = ?13, \
          sort_order = ?14, completed_at = ?15, deadline_at = ?16, \
-         updated_at = datetime('now') WHERE id = ?17",
+         due_announced_at = ?17, overdue_announced_at = ?18, \
+         updated_at = datetime('now') WHERE id = ?19",
         turso::params![
             task.parent_id,
             task.project.as_deref(),
@@ -1168,6 +1494,8 @@ async fn write_task_with(conn: &Connection, task: &Task) -> Result<(), StorageEr
             task.sort_order,
             task.completed_at.as_deref(),
             task.deadline_at.as_deref(),
+            task.due_announced_at.as_deref(),
+            task.overdue_announced_at.as_deref(),
             task.id,
         ],
     )
@@ -1216,6 +1544,17 @@ fn apply_status_patch(
     Ok(())
 }
 
+/// What a `Created` event carries: enough for the router to place a new card
+/// without re-reading it, and nothing more — the event says what happened, and
+/// a full row on every mutation would make the bus a replication channel.
+fn created_detail(task: &Task) -> serde_json::Value {
+    serde_json::json!({
+        "title": task.title,
+        "assignee": task.assignee,
+        "parent_id": task.parent_id,
+    })
+}
+
 /// Apply every field of `patch` to `task` in memory, validating each, and
 /// return the names of the fields that changed. Nothing is written here.
 fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, StorageError> {
@@ -1249,6 +1588,12 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
     }
     if let Some(due_at) = patch.due_at {
         changed.push("due_at");
+        // Moving the date re-arms its announcement: a card pushed to next week
+        // must be able to fall due again, and a marker left set would mean it
+        // silently never does.
+        if task.due_at != due_at {
+            task.due_announced_at = None;
+        }
         task.due_at = due_at;
     }
     if let Some(recurrence) = patch.recurrence {
@@ -1267,10 +1612,21 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
     }
     if let Some(deadline_at) = patch.deadline_at {
         changed.push("deadline_at");
+        // Same re-arm as `due_at`: extending a deadline must let the card go
+        // overdue against the new one.
+        if task.deadline_at != deadline_at {
+            task.overdue_announced_at = None;
+        }
         task.deadline_at = deadline_at;
     }
     if let Some(assignee) = patch.assignee {
-        changed.push("assignee");
+        // Compared, not assumed. Every other field here may over-report a
+        // change harmlessly into the activity log, but `assignee` now drives
+        // an `assigned` lifecycle event that wakes the router: re-writing the
+        // same member must not look like a hand-off.
+        if task.assignee != assignee {
+            changed.push("assignee");
+        }
         task.assignee = assignee;
     }
     if let Some(project) = patch.project {
@@ -1336,7 +1692,7 @@ fn check_graph_update(
                 "parent task #{parent_id} not found in scope"
             )));
         };
-        if parent_changed && (parent.status == "done" || parent.status == "cancelled") {
+        if parent_changed && is_closed_status(&parent.status) {
             return Err(StorageError::Invalid(format!(
                 "cannot move a task under {} task #{parent_id}",
                 parent.status
@@ -2166,11 +2522,48 @@ pub fn is_explicit_yes(reply: &str) -> bool {
     YES.contains(first) && !words.iter().any(|w| NEGATIONS.contains(w))
 }
 
+/// Which tasks in a scope snapshot are blocked.
+///
+/// Mirrors [`is_blocked`] over a whole snapshot: a dependency blocks only if it
+/// is both **present** in the scope and **open**, so a dangling reference does
+/// not block (deleting a dependency releases its dependents, which is what
+/// `delete`'s dep-stripping relies on).
+fn blocked_ids(tasks: &[Task]) -> HashSet<i64> {
+    let open: HashSet<i64> = tasks
+        .iter()
+        .filter(|t| !is_closed_status(&t.status))
+        .map(|t| t.id)
+        .collect();
+    tasks
+        .iter()
+        .filter(|t| t.depends_on.iter().any(|dep| open.contains(dep)))
+        .map(|t| t.id)
+        .collect()
+}
+
+/// The day part of an ISO date or timestamp, which is the granularity the task
+/// store compares dates at (see `validate_dates` and the filter language). A
+/// bare `2026-07-20` and a full `2026-07-20T14:03:00Z` both yield `2026-07-20`.
+fn day_of(at: &str) -> String {
+    at.chars().take(10).collect()
+}
+
+/// Whether a status means the task is closed.
+///
+/// The single definition of "closed" in the store. It was written out by hand
+/// in twelve places, which matters more than it looks: `blocked` is *derived*
+/// from this predicate on every read, so a copy that drifts does not produce a
+/// visibly wrong field — it produces a task that is blocked to one reader and
+/// actionable to another. Adding a third closed status is now one edit.
+fn is_closed_status(status: &str) -> bool {
+    matches!(status, "done" | "cancelled")
+}
+
 fn is_blocked(task: &Task, by_id: &HashMap<i64, &Task>) -> bool {
     task.depends_on.iter().any(|dep| {
         by_id
             .get(dep)
-            .is_some_and(|t| t.status != "done" && t.status != "cancelled")
+            .is_some_and(|t| !is_closed_status(&t.status))
     })
 }
 
@@ -2462,6 +2855,8 @@ fn decode_task_row(row: &turso::Row) -> Result<Task, StorageError> {
         updated_at: row.get(18)?,
         completed_at: row.get(19)?,
         deadline_at: row.get(20)?,
+        due_announced_at: row.get(21)?,
+        overdue_announced_at: row.get(22)?,
         blocked: false,
     })
 }

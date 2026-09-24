@@ -1790,7 +1790,27 @@ impl MemoryRepository {
         Ok(out)
     }
 
-    /// Update content text for a memory entry.
+    /// Update content text for a memory entry, **invalidating its vector**.
+    ///
+    /// Changing the text necessarily invalidates the embedding: a vector
+    /// describes the words that produced it, so a row whose content moved on
+    /// while its vector did not is findable by text it no longer contains, and
+    /// silently — nothing about the row looks wrong. That is the same class as
+    /// the 2026-08 stale-binding incident, and it is why there is no variant of
+    /// this call that keeps the old vector.
+    ///
+    /// `embedding = NULL` is the ordinary queued-for-backfill state the loader
+    /// already understands (`convert_rows` counts these as awaiting embedding),
+    /// so the drain re-embeds the new text and the row is unsearchable rather
+    /// than wrongly searchable in the meantime.
+    ///
+    /// The in-RAM half of this was fixed in 2026-08 (`VectorStore::update_content`
+    /// clears `entry.embedding` and the buckets); this is the durable half,
+    /// without which a restart reloaded the stale vector from disk and undid it.
+    ///
+    /// A caller that has a NEW vector for the new text writes it immediately
+    /// afterwards with [`Self::update_embedding`]; a crash between the two
+    /// leaves the row queued, which is the safe direction.
     ///
     /// Returns `true` when a row was updated.
     ///
@@ -1800,7 +1820,8 @@ impl MemoryRepository {
         let conn = self.conn.lock().await;
         let result = conn
             .execute(
-                "UPDATE memories SET content = ?1, updated_at = datetime('now') WHERE memory_id = ?2",
+                "UPDATE memories SET content = ?1, embedding = NULL, embedding_model = NULL, \
+                 updated_at = datetime('now') WHERE memory_id = ?2",
                 turso::params![content, memory_id],
             )
             .await?;
