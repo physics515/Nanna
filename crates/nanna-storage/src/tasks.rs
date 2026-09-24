@@ -57,7 +57,8 @@ pub const TASKS_PER_SCOPE_MAX: usize = 10_000;
 
 const TASK_COLUMNS: &str = "id, parent_id, scope, scope_id, project, title, description, status, \
      priority, labels, tool_scope, due_at, recurrence, depends_on, acceptance, assignee, \
-     sort_order, created_at, updated_at, completed_at, deadline_at";
+     sort_order, created_at, updated_at, completed_at, deadline_at, due_announced_at, \
+     overdue_announced_at";
 
 /// Outcome of completing a task.
 #[derive(Debug, Clone)]
@@ -706,6 +707,7 @@ impl TaskRepository {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE tasks SET status = 'pending', completed_at = NULL, \
+             due_announced_at = NULL, overdue_announced_at = NULL, \
              updated_at = datetime('now') WHERE id = ?1",
             turso::params![id],
         )
@@ -1149,6 +1151,126 @@ impl TaskRepository {
         Ok(imported)
     }
 
+    /// Announce the time-driven lifecycle events: cards whose defer date has
+    /// arrived (`due`) and open cards whose deadline has passed (`overdue`).
+    ///
+    /// Returns `(due, overdue)` counts. `now` is passed in rather than read
+    /// here so the caller owns the clock and a test can cross a boundary
+    /// without sleeping.
+    ///
+    /// Comparison is at **day** granularity, matching `validate_dates` and the
+    /// filter language: these fields hold ISO strings that may be a bare day
+    /// (`2026-07-20`) or a full timestamp, and a raw string compare would make
+    /// a day-only deadline overdue from midnight of the day it is due.
+    ///
+    /// **Each card is announced once per crossing, not once per sweep.** The
+    /// marker columns are what make that true, and they are re-armed when the
+    /// date moves or the card is reopened — see migration `020`. Without them a
+    /// sweep running every five minutes would re-announce the same overdue card
+    /// forever, which is a notification bug rather than an event stream.
+    ///
+    /// Closed cards are skipped: a card that is done is not late, and P25
+    /// decision 10 measures `overdue` against `deadline_at` alone — `due_at` is
+    /// the defer date and says only when the card may start.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the scan or a marker write fails.
+    /// A failure partway leaves the cards already marked announced, which is
+    /// the safe direction: the alternative is announcing them twice.
+    pub async fn announce_due(
+        &self,
+        now: &str,
+    ) -> Result<(usize, usize), StorageError> {
+        let today = day_of(now);
+        let pending = self.list_time_announcable(&today).await?;
+        let mut due_count = 0usize;
+        let mut overdue_count = 0usize;
+        for task in pending {
+            let due_crossed = task.due_announced_at.is_none()
+                && task.due_at.as_deref().is_some_and(|at| day_of(at) <= today);
+            let overdue_crossed = task.overdue_announced_at.is_none()
+                && task
+                    .deadline_at
+                    .as_deref()
+                    .is_some_and(|at| day_of(at) < today);
+            if due_crossed {
+                self.mark_announced(task.id, "due_announced_at", now).await?;
+                self.emit(
+                    TaskEventKind::Due,
+                    &task,
+                    None,
+                    serde_json::json!({ "due_at": task.due_at }),
+                );
+                due_count += 1;
+            }
+            if overdue_crossed {
+                self.mark_announced(task.id, "overdue_announced_at", now)
+                    .await?;
+                self.emit(
+                    TaskEventKind::Overdue,
+                    &task,
+                    None,
+                    serde_json::json!({ "deadline_at": task.deadline_at }),
+                );
+                overdue_count += 1;
+            }
+        }
+        Ok((due_count, overdue_count))
+    }
+
+    /// Open cards with an un-announced date or deadline that `now` has reached.
+    ///
+    /// The filtering is done in SQL so a board with thousands of settled cards
+    /// does not decode all of them every five minutes.
+    async fn list_time_announcable(&self, today: &str) -> Result<Vec<Task>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE status NOT IN ('done', 'cancelled') AND ( \
+                       (due_announced_at IS NULL AND due_at IS NOT NULL \
+                        AND substr(due_at, 1, 10) <= ?1) \
+                       OR (overdue_announced_at IS NULL AND deadline_at IS NOT NULL \
+                           AND substr(deadline_at, 1, 10) < ?1))"
+                ),
+                turso::params![today],
+            )
+            .await?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next().await? {
+            tasks.push(decode_task_row(&row)?);
+        }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(tasks)
+    }
+
+    /// Stamp one announcement marker. The column name is a caller-supplied
+    /// literal, never user input — the two call sites above are its only
+    /// callers and both pass a constant.
+    async fn mark_announced(
+        &self,
+        id: i64,
+        column: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        debug_assert!(
+            column == "due_announced_at" || column == "overdue_announced_at",
+            "marker column must be one of the two announcement markers"
+        );
+        let conn = self.conn.lock().await;
+        conn.execute(
+            &format!("UPDATE tasks SET {column} = ?1 WHERE id = ?2"),
+            turso::params![now, id],
+        )
+        .await?;
+        drop(conn);
+        Ok(())
+    }
+
     /// All completed tasks that carry a recurrence expression, across every
     /// scope. The daemon's recurrence sweep (one recurrence engine — the P8
     /// scheduler) computes the next occurrence and reopens due ones.
@@ -1353,7 +1475,8 @@ async fn write_task_with(conn: &Connection, task: &Task) -> Result<(), StorageEr
          status = ?5, priority = ?6, labels = ?7, tool_scope = ?8, due_at = ?9, \
          recurrence = ?10, depends_on = ?11, acceptance = ?12, assignee = ?13, \
          sort_order = ?14, completed_at = ?15, deadline_at = ?16, \
-         updated_at = datetime('now') WHERE id = ?17",
+         due_announced_at = ?17, overdue_announced_at = ?18, \
+         updated_at = datetime('now') WHERE id = ?19",
         turso::params![
             task.parent_id,
             task.project.as_deref(),
@@ -1371,6 +1494,8 @@ async fn write_task_with(conn: &Connection, task: &Task) -> Result<(), StorageEr
             task.sort_order,
             task.completed_at.as_deref(),
             task.deadline_at.as_deref(),
+            task.due_announced_at.as_deref(),
+            task.overdue_announced_at.as_deref(),
             task.id,
         ],
     )
@@ -1463,6 +1588,12 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
     }
     if let Some(due_at) = patch.due_at {
         changed.push("due_at");
+        // Moving the date re-arms its announcement: a card pushed to next week
+        // must be able to fall due again, and a marker left set would mean it
+        // silently never does.
+        if task.due_at != due_at {
+            task.due_announced_at = None;
+        }
         task.due_at = due_at;
     }
     if let Some(recurrence) = patch.recurrence {
@@ -1481,6 +1612,11 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
     }
     if let Some(deadline_at) = patch.deadline_at {
         changed.push("deadline_at");
+        // Same re-arm as `due_at`: extending a deadline must let the card go
+        // overdue against the new one.
+        if task.deadline_at != deadline_at {
+            task.overdue_announced_at = None;
+        }
         task.deadline_at = deadline_at;
     }
     if let Some(assignee) = patch.assignee {
@@ -2405,6 +2541,13 @@ fn blocked_ids(tasks: &[Task]) -> HashSet<i64> {
         .collect()
 }
 
+/// The day part of an ISO date or timestamp, which is the granularity the task
+/// store compares dates at (see `validate_dates` and the filter language). A
+/// bare `2026-07-20` and a full `2026-07-20T14:03:00Z` both yield `2026-07-20`.
+fn day_of(at: &str) -> String {
+    at.chars().take(10).collect()
+}
+
 /// Whether a status means the task is closed.
 ///
 /// The single definition of "closed" in the store. It was written out by hand
@@ -2712,6 +2855,8 @@ fn decode_task_row(row: &turso::Row) -> Result<Task, StorageError> {
         updated_at: row.get(18)?,
         completed_at: row.get(19)?,
         deadline_at: row.get(20)?,
+        due_announced_at: row.get(21)?,
+        overdue_announced_at: row.get(22)?,
         blocked: false,
     })
 }

@@ -209,6 +209,14 @@ pub struct Task {
     /// Derived at read time: true while any dependency is not done.
     #[serde(default)]
     pub blocked: bool,
+    /// When the sweep announced that [`Self::due_at`] arrived, so it announces
+    /// once rather than every pass. Store-internal: no caller sets it, and
+    /// changing `due_at` clears it.
+    pub due_announced_at: Option<String>,
+    /// When the sweep announced that [`Self::deadline_at`] passed. Same
+    /// contract as [`Self::due_announced_at`]; changing `deadline_at` clears
+    /// it, and reopening the card clears both.
+    pub overdue_announced_at: Option<String>,
 }
 
 /// New task input

@@ -7739,12 +7739,12 @@ as its turn (`TurnAdmission`, scope default `session`).
       the session's `workspace_id`, else `global`, and stamps label `promoted`. Delete
       `TurnAdmission` (`crates/nanna-daemon/src/tasks.rs:1210`) and its call sites in
       `chat_harness.rs`.
-- [~] Task lifecycle events on the broadcast bus: `created, assigned, status_changed, blocked,
+- [x] Task lifecycle events on the broadcast bus: `created, assigned, status_changed, blocked,
       unblocked, posted, due, overdue, verdict`. Run events stay. Consumers must not block the bus
       (see the event-bus rule in memory).
-      *(2026-09-24 — **seven of the nine are landed**: the five with direct emit points, then the
-      derived `blocked`/`unblocked` pair. Only the time-driven `due`/`overdue` sweep pair is still
-      open, filed as its own item below.)* `Event::TaskEvent { kind, task_id, scope,
+      *(2026-09-24 — **all nine landed**: five from direct writes, the derived `blocked`/`unblocked`
+      pair, and the time-driven `due`/`overdue` pair from the sweep. Each arrived with its emit
+      point; none was declared ahead of the machinery that sends it.)* `Event::TaskEvent { kind, task_id, scope,
       scope_id, actor, detail }` sits beside the `TaskRun*` family, classified into `session_id()`'s
       `None` group (a card outlives every session, P25 decision 9). `kind` is the typed
       `nanna_storage::TaskEventKind`, **re-exported rather than mirrored** — the daemon puts the
@@ -7765,8 +7765,9 @@ as its turn (`TurnAdmission`, scope default `session`).
       **`emit` is never called under the connection guard** — the sink is foreign code and that
       mutex serializes every write in the process — so an event is only ever published for a
       mutation that actually reached the database.
-      **Only kinds that are emitted are declared.** `due`/`overdue` are still absent: shipping
-      variants nothing ever sends would leave a consumer matching on them forever.
+      **Every declared kind has a real emit point.** Nothing here was declared ahead of the
+      machinery that sends it — a kind a consumer can match on but never receive is a dead field
+      wearing a feature's clothes.
       **A real bug fell out:** `apply_patch` recorded an `assignee` change whenever the field was
       present, with **no old/new comparison**, so re-writing the same member looked like a hand-off.
       Harmless while it only fed the activity log; not harmless once it wakes the router. Now
@@ -7829,7 +7830,35 @@ as its turn (`TurnAdmission`, scope default `session`).
       them. Note the derivation is currently duplicated — `is_blocked()` plus an inlined copy of the
       same predicate in `list()` — and a transition computed against one while readers use the other
       would be a split brain; unify them first.
-- [ ] **The sweep pair: `due` / `overdue`.** Time-driven, so they need a sweep rather than an emit
+- [x] **The sweep pair: `due` / `overdue`.**
+      *(2026-09-24)* `TaskRepository::announce_due(now)` returns `(due, overdue)` and rides the
+      existing `task_recurrence_sweep` rather than adding a second scheduled task. **The order is
+      load-bearing**: recurrence reopening runs first and clears the announcement markers, so a card
+      that came back around this pass falls due on the same pass instead of waiting another five
+      minutes. The scheduled task **keeps its name** — renaming it would not rename the row an
+      existing daemon already has, so `has_task_named` would register a *second* sweep beside the
+      first.
+      **The once-per-crossing question is answered with state, not hope.** Migration `020` adds
+      `due_announced_at` / `overdue_announced_at`. Without them a sweep re-deriving "this card is
+      overdue" every pass re-announces it every five minutes forever — a notification bug, not an
+      event stream. They are deliberately **not** in `NewTask`/`TaskPatch`: they are the store's
+      memory of what it has already said, and a caller who could write one could suppress a
+      notification. Re-arming is explicit because it is the half that is easy to get wrong — moving
+      `due_at` clears its marker, moving `deadline_at` clears its, and `reopen` clears **both**, so
+      a recurring card can fall due again.
+      **A real bug caught in review of my own first version:** it compared dates as raw strings, but
+      the store compares at **day** granularity everywhere else (`validate_dates` takes the first 10
+      chars). A raw compare makes a day-only deadline of `2026-07-20` overdue against
+      `2026-07-20T00:01:00Z` — late one minute into the day it is due. Now day-granular in both the
+      SQL filter and the Rust predicate (`day_of`), pinned by
+      `a_day_only_deadline_and_a_full_timestamp_behave_the_same`.
+      **And the migration-splitter test earned its keep:** the first draft put a `;` inside a `--`
+      comment, which the lexer ignores but the old naive `split(';')` mis-splits.
+      `every_shipped_migration_splits_exactly_as_it_did_before` failed on exactly that, which is the
+      class it was written for (migration 014's near miss). Comment reworded rather than the
+      invariant relaxed — migrations stay safe under either splitter.
+      8 new tests; the load-bearing one is `a_repeated_sweep_announces_nothing_twice`.
+- [ ] ~~**The sweep pair: `due` / `overdue`.**~~ *(original scouting)* Time-driven, so they need a sweep rather than an emit
       point. The natural home is beside `sweep_recurrences`
       (`crates/nanna-daemon/src/tasks.rs`, registered every 300s in `start_scheduler`), which has no
       event bus today — but `ScheduledTaskDeps` already holds `events`, and the sibling reminder arm

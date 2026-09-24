@@ -2989,9 +2989,31 @@ async fn run_recurrence_sweep(
     if reopened > 0 {
         info!("Recurrence sweep reopened {reopened} tasks");
     }
+    // The time-driven task events ride this sweep rather than a second one:
+    // both are periodic task maintenance on the same cadence, and the ORDER is
+    // load-bearing — reopening a recurring card clears its announcement
+    // markers, so a card that came back around this pass can fall due on the
+    // same pass instead of waiting five minutes for the next.
+    //
+    // The scheduled task keeps the name `task_recurrence_sweep`. Renaming it
+    // would not rename the row an existing daemon already has, so
+    // `has_task_named` would register a SECOND sweep beside the first.
+    let now = chrono::Utc::now().to_rfc3339();
+    let (due, overdue) = match storage.tasks().announce_due(&now).await {
+        Ok(counts) => counts,
+        Err(e) => {
+            warn!("task time sweep failed: {e}");
+            (0, 0)
+        }
+    };
+    if due > 0 || overdue > 0 {
+        info!("Task time sweep announced {due} due and {overdue} overdue");
+    }
     (
         true,
-        Some(format!("Reopened {reopened} recurring tasks")),
+        Some(format!(
+            "Reopened {reopened} recurring tasks; announced {due} due, {overdue} overdue"
+        )),
         None,
     )
 }

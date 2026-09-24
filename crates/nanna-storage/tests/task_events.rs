@@ -557,3 +557,192 @@ async fn a_mutation_that_changes_no_blocking_announces_no_transition() {
     assert_eq!(recorder.of_kind(TaskEventKind::Blocked).len(), 0);
     assert_eq!(recorder.of_kind(TaskEventKind::Unblocked).len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Time-driven: `due` / `overdue`
+//
+// These have no write to hang off — a sweep notices them — so the property
+// that matters is that a sweep running every five minutes announces a card
+// ONCE per crossing rather than once per pass.
+// ---------------------------------------------------------------------------
+
+fn dated(title: &str, due_at: Option<&str>, deadline_at: Option<&str>) -> NewTask {
+    NewTask {
+        due_at: due_at.map(str::to_string),
+        deadline_at: deadline_at.map(str::to_string),
+        ..card(title)
+    }
+}
+
+#[tokio::test]
+async fn a_defer_date_that_has_arrived_is_announced_due() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let task = repo
+        .create(dated("starts today", Some("2026-07-20"), None))
+        .await
+        .expect("created");
+    recorder.clear();
+
+    let (due, overdue) = repo.announce_due("2026-07-20").await.expect("swept");
+    assert_eq!((due, overdue), (1, 0));
+    let events = recorder.of_kind(TaskEventKind::Due);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].task_id, task.id);
+}
+
+#[tokio::test]
+async fn a_future_defer_date_is_not_announced() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    repo.create(dated("starts next week", Some("2026-07-27"), None))
+        .await
+        .expect("created");
+    recorder.clear();
+
+    let (due, overdue) = repo.announce_due("2026-07-20").await.expect("swept");
+    assert_eq!((due, overdue), (0, 0));
+    assert_eq!(recorder.kinds(), Vec::<TaskEventKind>::new());
+}
+
+/// The property the marker columns exist for.
+#[tokio::test]
+async fn a_repeated_sweep_announces_nothing_twice() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    repo.create(dated("late", Some("2026-07-01"), Some("2026-07-10")))
+        .await
+        .expect("created");
+    recorder.clear();
+
+    let first = repo.announce_due("2026-07-20").await.expect("first sweep");
+    assert_eq!(first, (1, 1), "due and overdue on the first crossing");
+    recorder.clear();
+
+    for _ in 0..3 {
+        let again = repo.announce_due("2026-07-20").await.expect("later sweep");
+        assert_eq!(again, (0, 0));
+    }
+    assert_eq!(
+        recorder.kinds(),
+        Vec::<TaskEventKind>::new(),
+        "a 5-minute sweep must not re-announce the same card forever"
+    );
+}
+
+#[tokio::test]
+async fn a_deadline_is_not_overdue_on_the_day_it_falls() {
+    // Dates are compared at day granularity throughout the store, so a card due
+    // "2026-07-20" has all of that day; it is late on the 21st.
+    let (storage, _recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    repo.create(dated("due today", None, Some("2026-07-20")))
+        .await
+        .expect("created");
+
+    let (_, overdue) = repo.announce_due("2026-07-20").await.expect("swept");
+    assert_eq!(overdue, 0, "still has the day");
+
+    let (_, overdue) = repo.announce_due("2026-07-21").await.expect("swept");
+    assert_eq!(overdue, 1, "late the next day");
+}
+
+#[tokio::test]
+async fn a_day_only_deadline_and_a_full_timestamp_behave_the_same() {
+    // A raw string compare would make `2026-07-20` overdue against
+    // `2026-07-20T00:01:00Z` — the exact bug day-granularity avoids.
+    let (storage, _recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    repo.create(dated("timestamped", None, Some("2026-07-20T23:59:00Z")))
+        .await
+        .expect("created");
+
+    let (_, overdue) = repo
+        .announce_due("2026-07-20T00:01:00Z")
+        .await
+        .expect("swept");
+    assert_eq!(overdue, 0);
+}
+
+#[tokio::test]
+async fn a_closed_card_is_never_late() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let task = repo
+        .create(dated("finished early", None, Some("2026-07-10")))
+        .await
+        .expect("created");
+    repo.complete(task.id, Some("gui"), None)
+        .await
+        .expect("done");
+    recorder.clear();
+
+    let (due, overdue) = repo.announce_due("2026-07-20").await.expect("swept");
+    assert_eq!((due, overdue), (0, 0), "a card that is done is not late");
+}
+
+#[tokio::test]
+async fn moving_the_date_re_arms_the_announcement() {
+    let (storage, _recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let task = repo
+        .create(dated("slipping", Some("2026-07-01"), Some("2026-07-10")))
+        .await
+        .expect("created");
+    assert_eq!(
+        repo.announce_due("2026-07-20").await.expect("swept"),
+        (1, 1)
+    );
+
+    // Pushed out: both must be able to fire again against the new dates.
+    repo.update(
+        task.id,
+        TaskPatch {
+            due_at: Some(Some("2026-08-01".to_string())),
+            deadline_at: Some(Some("2026-08-10".to_string())),
+            ..TaskPatch::default()
+        },
+        Some("gui"),
+    )
+    .await
+    .expect("dates moved");
+    assert_eq!(
+        repo.announce_due("2026-07-20").await.expect("swept"),
+        (0, 0),
+        "not yet — the new dates are in the future"
+    );
+    assert_eq!(
+        repo.announce_due("2026-08-11").await.expect("swept"),
+        (1, 1),
+        "and they announce again once reached"
+    );
+}
+
+#[tokio::test]
+async fn reopening_re_arms_both_announcements() {
+    // A recurring card comes back around and must be able to fall due again;
+    // a marker left set would mean it silently never does.
+    let (storage, _recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let task = repo
+        .create(dated("weekly", Some("2026-07-01"), Some("2026-07-10")))
+        .await
+        .expect("created");
+    assert_eq!(
+        repo.announce_due("2026-07-20").await.expect("swept"),
+        (1, 1)
+    );
+
+    repo.complete(task.id, Some("harness"), None)
+        .await
+        .expect("done");
+    repo.reopen(task.id, Some("recurrence"))
+        .await
+        .expect("reopened");
+
+    assert_eq!(
+        repo.announce_due("2026-07-20").await.expect("swept"),
+        (1, 1),
+        "the reopened card announces again"
+    );
+}

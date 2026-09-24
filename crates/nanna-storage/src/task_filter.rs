@@ -491,6 +491,8 @@ mod tests {
             updated_at: String::new(),
             completed_at: None,
             blocked: false,
+            due_announced_at: None,
+            overdue_announced_at: None,
         }
     }
 

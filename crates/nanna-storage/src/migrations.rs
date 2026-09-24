@@ -21,6 +21,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("017_members", MIGRATION_017),
     ("018_task_deadline", MIGRATION_018),
     ("019_task_thread", MIGRATION_019),
+    ("020_task_time_announcements", MIGRATION_020),
 ];
 
 const MIGRATION_001: &str = r"
@@ -654,6 +655,28 @@ ALTER TABLE task_notes ADD COLUMN author_member_id TEXT;
 ALTER TABLE task_notes ADD COLUMN kind TEXT NOT NULL DEFAULT 'comment';
 
 CREATE INDEX IF NOT EXISTS idx_task_notes_author ON task_notes(author_member_id);
+";
+
+const MIGRATION_020: &str = r"
+-- P25 Stage 1: `due` and `overdue` are TIME-driven lifecycle events, so unlike
+-- every other kind they have no write to hang off -- a sweep notices them.
+-- A sweep that re-derives 'this card is overdue' every pass would re-announce
+-- the same card every 5 minutes forever, which is a notification bug rather
+-- than an event stream. These two columns are the crossing marker: set when the
+-- sweep announces, so the announcement happens once.
+--
+-- They are deliberately NOT part of `NewTask` or `TaskPatch`. Nobody outside
+-- the store sets them -- they are the store's memory of what it has already
+-- said, and letting a caller write one would let a caller suppress a
+-- notification.
+--
+-- Re-arming is the half that is easy to get wrong, so it is explicit: moving
+-- `due_at` clears `due_announced_at`, moving `deadline_at` clears
+-- `overdue_announced_at`, and reopening a card clears BOTH -- a recurring card
+-- comes back around and must be able to fall due again.
+ALTER TABLE tasks ADD COLUMN due_announced_at TEXT;
+
+ALTER TABLE tasks ADD COLUMN overdue_announced_at TEXT;
 ";
 
 /// Lexer state while splitting a migration.

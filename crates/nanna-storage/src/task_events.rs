@@ -25,12 +25,11 @@ use serde_json::Value;
 
 /// What happened to a task in the store.
 ///
-/// **Only kinds that are actually emitted exist here.** P25 lists nine; the
-/// two missing ones — `due` and `overdue` — are time-driven and need a sweep
-/// that does not exist yet. Declaring them now would ship variants that nothing
-/// ever sends, which is a dead field wearing a feature's clothes: a consumer
-/// would match on them and wait forever. They arrive with their emit points,
-/// not before.
+/// All nine of P25's kinds now exist, and every one has a real emit point —
+/// five from direct writes, two derived from dependency transitions, and two
+/// from the time sweep. Nothing here is declared ahead of the machinery that
+/// sends it: a kind a consumer can match on but never receive is a dead field
+/// wearing a feature's clothes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskEventKind {
@@ -48,6 +47,12 @@ pub enum TaskEventKind {
     Unblocked,
     /// A thread post was appended.
     Posted,
+    /// The card's defer date arrived, so it enters the inbox (P25 decision 11).
+    /// Announced once per crossing, not once per sweep.
+    Due,
+    /// The card's deadline passed while it was still open. Measured against
+    /// `deadline_at` alone — `due_at` defers, it does not bind.
+    Overdue,
     /// A card was completed — the recorded verdict.
     Verdict,
 }
@@ -64,6 +69,8 @@ impl TaskEventKind {
             Self::Blocked => "blocked",
             Self::Unblocked => "unblocked",
             Self::Posted => "posted",
+            Self::Due => "due",
+            Self::Overdue => "overdue",
             Self::Verdict => "verdict",
         }
     }
@@ -109,13 +116,15 @@ mod tests {
     use super::*;
 
     /// Every kind, so a new variant has to be added here too.
-    const ALL: [TaskEventKind; 7] = [
+    const ALL: [TaskEventKind; 9] = [
         TaskEventKind::Created,
         TaskEventKind::Assigned,
         TaskEventKind::StatusChanged,
         TaskEventKind::Blocked,
         TaskEventKind::Unblocked,
         TaskEventKind::Posted,
+        TaskEventKind::Due,
+        TaskEventKind::Overdue,
         TaskEventKind::Verdict,
     ];
 
@@ -139,6 +148,8 @@ mod tests {
         assert_eq!(TaskEventKind::Blocked.as_str(), "blocked");
         assert_eq!(TaskEventKind::Unblocked.as_str(), "unblocked");
         assert_eq!(TaskEventKind::Posted.as_str(), "posted");
+        assert_eq!(TaskEventKind::Due.as_str(), "due");
+        assert_eq!(TaskEventKind::Overdue.as_str(), "overdue");
         assert_eq!(TaskEventKind::Verdict.as_str(), "verdict");
     }
 
