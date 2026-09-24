@@ -7739,9 +7739,47 @@ as its turn (`TurnAdmission`, scope default `session`).
       the session's `workspace_id`, else `global`, and stamps label `promoted`. Delete
       `TurnAdmission` (`crates/nanna-daemon/src/tasks.rs:1210`) and its call sites in
       `chat_harness.rs`.
-- [ ] Task lifecycle events on the broadcast bus: `created, assigned, status_changed, blocked,
+- [~] Task lifecycle events on the broadcast bus: `created, assigned, status_changed, blocked,
       unblocked, posted, due, overdue, verdict`. Run events stay. Consumers must not block the bus
       (see the event-bus rule in memory).
+      *(2026-09-24 — **the five with emit points are landed**; the derived pair and the sweep pair
+      are still open, filed as their own items below.)* `Event::TaskEvent { kind, task_id, scope,
+      scope_id, actor, detail }` sits beside the `TaskRun*` family, classified into `session_id()`'s
+      `None` group (a card outlives every session, P25 decision 9). `kind` is the typed
+      `nanna_storage::TaskEventKind`, **re-exported rather than mirrored** — the daemon puts the
+      storage enum straight on the wire, so there is no second copy to drift, and a test asserts
+      serde's `snake_case` name equals `as_str()` for every variant.
+      **They are emitted from `TaskRepository`, not from a caller, and that is the whole design.**
+      The write-path survey found *five* independent ingress families (the `tasks.*` tool services,
+      the control plane's IPC handlers, the harness's `TaskSource`, the seeding/recurrence sweeps,
+      the GUI) and **two of them have no event bus at all**. Worse, two mutations have no caller to
+      instrument: `cascade_cancel` closes a whole subtree and ancestor auto-completion closes
+      parents, both touching rows nobody named. Emitting one layer up would have announced a child
+      completing while its parent silently went done — which is exactly what
+      `an_ancestor_closed_by_a_cascade_gets_its_own_verdict` pins. `nanna-storage` does not know the
+      wire protocol, so it emits its own `TaskEvent` through a `TaskEventSink` trait and
+      `task_event_bridge.rs` adapts it; the sink is a write-once cell on `Storage` (the bus does not
+      exist yet when storage is opened, and `Storage` is shared as an `Arc` immediately after, so
+      there is no later `&mut self`), and attaching twice is refused rather than silently replacing.
+      **`emit` is never called under the connection guard** — the sink is foreign code and that
+      mutex serializes every write in the process — so an event is only ever published for a
+      mutation that actually reached the database.
+      **Only the five kinds that are emitted are declared.** Declaring `blocked`/`unblocked`/`due`/
+      `overdue` before their machinery exists would ship four variants nothing ever sends, and a
+      consumer matching on them would wait forever.
+      **A real bug fell out:** `apply_patch` recorded an `assignee` change whenever the field was
+      present, with **no old/new comparison**, so re-writing the same member looked like a hand-off.
+      Harmless while it only fed the activity log; not harmless once it wakes the router. Now
+      compared, with both directions pinned by tests. One consequence worth stating: a no-op
+      re-assign no longer runs `ensure_member_exists`, so patching a stale assignee to *itself* no
+      longer errors — the row is unchanged either way, so the store is no worse.
+      **Removed a duplicate:** `task_create` was emitting this store mutation as
+      `TaskRunProgress{kind:"created"}` — the harness *run* family — from the IPC path only. The
+      repository now emits it for every writer, so the IPC copy is gone. Nothing in the GUI consumed
+      it (its `DaemonEvent` mirror has a `#[serde(other)] Unknown` catch-all, so the new variant
+      degrades safely there until Stage 4 builds the board).
+      10 integration tests in `crates/nanna-storage/tests/task_events.rs`; 793 tests across
+      nanna-storage + nanna-daemon green, clippy 0 warnings.
       *(2026-09-23 — scouted, deliberately not started, so the next run can go straight at it.)*
       Add ONE variant beside the `TaskRun*` family in `crates/nanna-daemon/src/protocol.rs:1065`
       (`TaskRunStarted`/`Progress`/`Completed` are about a **run**; these are store mutations).
@@ -7758,6 +7796,24 @@ as its turn (`TurnAdmission`, scope default `session`).
       home is beside `task_recurrence_sweep`. Emitting five and calling the item done would leave
       four kinds declared and never sent, which is the failure mode the dead-fields rule is about.
       Land the five with their emit points, then the derived pair, then the sweep pair.
+- [ ] **The derived pair: `blocked` / `unblocked`.** `blocked` is computed on read and never
+      stored, so these are transitions nothing currently detects — nothing walks *reverse*
+      dependencies. A dependent can only flip to unblocked when a dependency reaches `done` or
+      `cancelled`, so the triggers are exactly three: `TaskRepository::complete` (the natural home —
+      it already loads the whole scope for the open-children check and already builds the `closed`
+      set, so the reverse scan is free), `update` when status→`cancelled`, and `cascade_cancel`.
+      `delete` is a fourth: it strips `depends_on` entries from sibling rows, which can unblock
+      them. Note the derivation is currently duplicated — `is_blocked()` plus an inlined copy of the
+      same predicate in `list()` — and a transition computed against one while readers use the other
+      would be a split brain; unify them first.
+- [ ] **The sweep pair: `due` / `overdue`.** Time-driven, so they need a sweep rather than an emit
+      point. The natural home is beside `sweep_recurrences`
+      (`crates/nanna-daemon/src/tasks.rs`, registered every 300s in `start_scheduler`), which has no
+      event bus today — but `ScheduledTaskDeps` already holds `events`, and the sibling reminder arm
+      already uses it, so threading it in is small. `overdue` is measured against `deadline_at`
+      (P25 decision 10), not `due_at`, which is the defer date. Decide once whether these fire once
+      per crossing or on every sweep; a 5-minute re-announcement of the same overdue card is a
+      notification bug waiting to happen.
 - [x] Thread = `task_notes` with `author_member_id` and `kind ∈ {comment, progress, question,
       verdict}` + attachments; never rewritten.
       *(2026-09-23)* Migration `019_task_thread`. `TaskRepository::post` is the new write shape —
@@ -8175,6 +8231,25 @@ keep the phases readable; promote individual items into a phase when they become
       - `claude setup-token` mints a **one-year** token and only PRINTS it (confirmed in the official
         docs this run), so the practical workaround — and what the doctor's remedy says — is to
         re-mint rather than to rely on refresh.
+
+### The workspace is not rustfmt-formatted, and nothing checks (found 2026-09-24)
+
+- [ ] **`cargo fmt --check` reports 3407 hunks across 212 files on a clean `origin/master`**, and
+      **no workflow in `.github/workflows/` runs `cargo fmt` at all** — so this is a standing,
+      unenforced condition rather than drift someone introduced. It is worth deciding on
+      explicitly, because the nightly routine's "every commit must have green `cargo fmt`" reads as
+      a lie against a tree in this state, and a run that took it literally would mass-reformat 212
+      files it never touched. That is exactly the change the *never crate-wide `cargo fmt`* rule
+      exists to prevent (a partial apply of rustfmt's edits has deleted code here before).
+      Two defensible options, and the choice is the work:
+      (a) **Accept it**: state in the routine that `cargo fmt` applies to the hunks a run *writes*,
+      not the tree, and keep new files rustfmt-clean (which is what the 2026-09-24 run did — its
+      three new files are formatted, its edits to existing files are hand-matched to local style).
+      (b) **Fix it once, deliberately**: a single mechanical commit that reformats everything, with
+      no other change in it, landed when no long-lived branch is open, then add a `cargo fmt
+      --check` job so it cannot recur. This is the only way the gate ever becomes real, but it
+      makes `git blame` noisier for 212 files and must not be bundled with any behavioural change.
+      Do **not** let a nightly drift into (b) incidentally.
 
 ### Linux host blockers (found 2026-09-09)
 
@@ -8665,6 +8740,24 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      Vulkan is the backend `wgpu` already picks, so a CubeCL-Vulkan Mummu would land on a path Nanna
      has bench numbers for. File the actual port in Mummu.
      Source: [tracel-ai/burn](https://github.com/tracel-ai/burn).
+   - *(2026-09-24 re-check)* `turso` moved to **`0.8.0-pre.12`**, and the `=0.7.2` pin holds —
+     never a pre-release on an exact pin. The changelog check is the cheap part and it still
+     answers: `CHANGELOG.md` on `main` **stops at 0.7.0 (2026-07-13)**, so there is still no
+     evidence 0.8 brings the dense ANN index P13's indexed clustering is waiting on.
+     **A caution for whoever searches this next:** web results for "turso vector index" mostly
+     describe **libSQL / Turso Cloud**, which *does* ship DiskANN (`libsql_vector_idx`,
+     `vector_top_k`). That is a different product from the `turso` **Rust rewrite** this workspace
+     pins, and conflating them would "disprove" a roadmap claim that is actually about the rewrite.
+     **And a number that argues against ever wanting it here:** upstream issue
+     [tursodatabase/turso#3778](https://github.com/tursodatabase/turso/issues/3778) (now *closed*)
+     reports libSQL's DiskANN building a **5 GB index for 30k vectors over 117 MB of data** — a
+     ~43× blowup — and argues for SIMD-accelerated brute force instead, which is what Nanna already
+     runs in RAM. So "wait for dense ANN" is waiting for something nobody has announced, *and* the
+     shipped instance of that algorithm is a poor fit for a local-first single-GPU box. Treat
+     indexed clustering as our own problem to solve, not a dependency to wait on.
+   - *(2026-09-24 re-check)* **`rustpython`: still nothing after 0.5.0 (2026-03-31)** — just under
+     six months, queried from `/api/v1/crates/rustpython-vm/versions` (7 versions, 0.5.0 newest).
+     Both holds it forces — `malachite-bigint =0.9.2` and the `libc <= 0.2.186` ceiling — stay.
    - *(2026-09-20 re-check)* `turso` is **still** `0.8.0-pre.11` — now **nine days** unchanged
      (published 2026-09-11), still no stable 0.8.0, still no changelog past 0.7.0. The exact
      `=0.7.2` pin holds; never a pre-release on an exact pin.

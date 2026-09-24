@@ -3287,7 +3287,17 @@ impl DaemonServer {
                     );
                     self.memory_recovery = Some(Arc::new(report));
                 }
-                self.set_storage(Arc::new(storage));
+                let storage = Arc::new(storage);
+                // Task lifecycle events reach the bus from the storage layer,
+                // which is the only place that sees every writer — including
+                // the cascades (subtree cancel, ancestor auto-complete) that
+                // no caller ever names.
+                if !storage.set_task_events(Arc::new(
+                    crate::task_event_bridge::TaskEventBridge::new(self.ipc.event_sender()),
+                )) {
+                    warn!("task event sink was already attached; keeping the existing one");
+                }
+                self.set_storage(storage);
             }
             Err(e) => {
                 // Storage is where MEMORY lives, not just model stats. Without

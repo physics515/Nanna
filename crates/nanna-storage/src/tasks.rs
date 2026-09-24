@@ -12,7 +12,8 @@
 //! connection lock for the duration of its writes.
 
 use crate::{
-    NewTask, StorageError, Task, TaskActivityEntry, TaskNote, TaskNoteKind, TaskPatch, task_filter,
+    NewTask, StorageError, Task, TaskActivityEntry, TaskEvent, TaskEventKind, TaskEventSink,
+    TaskNote, TaskNoteKind, TaskPatch, task_filter,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -71,12 +72,52 @@ pub struct CompleteOutcome {
 /// Task repository over the shared Turso connection.
 pub struct TaskRepository {
     conn: Arc<Mutex<Connection>>,
+    /// Where lifecycle events go; `None` when nobody is listening, which is
+    /// every test and every caller that predates the daemon's event bus.
+    events: Option<Arc<dyn TaskEventSink>>,
 }
 
 impl TaskRepository {
     #[must_use]
     pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+        Self { conn, events: None }
+    }
+
+    /// Attach the lifecycle event sink (see [`crate::Storage::set_task_events`]).
+    #[must_use]
+    pub fn with_events(mut self, events: Option<Arc<dyn TaskEventSink>>) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Publish one lifecycle event, if anyone is listening.
+    ///
+    /// # Invariant
+    ///
+    /// **Never called while the connection guard is held.** The sink is
+    /// foreign code, and running it under the mutex that serializes every
+    /// write in this process would let one consumer stall the whole store.
+    /// Every call site sits after its writes have completed and the guard has
+    /// been dropped — which also means an event is published only for a
+    /// mutation that actually reached the database.
+    fn emit(
+        &self,
+        kind: TaskEventKind,
+        task: &Task,
+        actor: Option<&str>,
+        detail: serde_json::Value,
+    ) {
+        let Some(sink) = self.events.as_ref() else {
+            return;
+        };
+        sink.publish(TaskEvent {
+            kind,
+            task_id: task.id,
+            scope: task.scope.clone(),
+            scope_id: task.scope_id.clone(),
+            actor: actor.map(str::to_string),
+            detail,
+        });
     }
 
     /// Create a task. Validates scope, title, priority, parent, and
@@ -199,6 +240,7 @@ impl TaskRepository {
 
         self.log_activity(task.id, new.assignee.as_deref(), "created", None)
             .await?;
+        self.emit(TaskEventKind::Created, &task, new.assignee.as_deref(), created_detail(&task));
         Ok(task)
     }
 
@@ -425,6 +467,24 @@ impl TaskRepository {
         if changed.contains(&"status") && task.status == "cancelled" {
             self.cascade_cancel(&task, actor).await?;
         }
+        // Emitted from `changed`, so each event describes a real transition:
+        // `apply_patch` compares both of these fields before recording them.
+        if changed.contains(&"status") {
+            self.emit(
+                TaskEventKind::StatusChanged,
+                &task,
+                actor,
+                serde_json::json!({ "status": task.status }),
+            );
+        }
+        if changed.contains(&"assignee") {
+            self.emit(
+                TaskEventKind::Assigned,
+                &task,
+                actor,
+                serde_json::json!({ "assignee": task.assignee }),
+            );
+        }
         self.get(id).await
     }
 
@@ -522,6 +582,27 @@ impl TaskRepository {
 
         let task = self.get_raw(id).await?;
         debug_assert!(task.status == "done", "complete() must leave status=done");
+        self.emit(
+            TaskEventKind::Verdict,
+            &task,
+            actor,
+            serde_json::json!({ "auto": false, "auto_completed": auto_completed }),
+        );
+        // Ancestors closed by this completion get their own verdict. They are
+        // the reason these events are emitted from the repository at all: no
+        // caller ever named them, so a consumer listening one layer up would
+        // watch a parent silently become done.
+        for parent_id in &auto_completed {
+            let Some(parent) = by_id.get(parent_id) else {
+                continue;
+            };
+            self.emit(
+                TaskEventKind::Verdict,
+                parent,
+                actor,
+                serde_json::json!({ "auto": true, "trigger": id }),
+            );
+        }
         Ok(CompleteOutcome {
             task,
             auto_completed,
@@ -606,8 +687,11 @@ impl TaskRepository {
                 trimmed.len()
             )));
         }
-        // Ensure the task exists before writing (FKs are unenforced).
-        let _ = self.get_raw(task_id).await?;
+        // Ensure the task exists before writing (FKs are unenforced). The row
+        // is kept rather than discarded: the lifecycle event below names the
+        // card's scope, and re-reading it after the write would be a second
+        // round-trip for data already in hand.
+        let task = self.get_raw(task_id).await?;
 
         let conn = self.conn.lock().await;
         if let Err(err) = ensure_member_exists(&conn, author_member_id, "note author").await {
@@ -637,6 +721,21 @@ impl TaskRepository {
         // be gone before the guard is.
         drop(rows);
         drop(conn);
+        // Only a post that was actually written is announced — the thread is
+        // the permanent record, so an event for a failed append would describe
+        // a post nobody can ever read.
+        if let Ok(ref note) = note {
+            self.emit(
+                TaskEventKind::Posted,
+                &task,
+                author,
+                serde_json::json!({
+                    "note_id": note.id,
+                    "kind": kind_token,
+                    "author_member_id": author_member_id,
+                }),
+            );
+        }
         note
     }
 
@@ -1216,6 +1315,17 @@ fn apply_status_patch(
     Ok(())
 }
 
+/// What a `Created` event carries: enough for the router to place a new card
+/// without re-reading it, and nothing more — the event says what happened, and
+/// a full row on every mutation would make the bus a replication channel.
+fn created_detail(task: &Task) -> serde_json::Value {
+    serde_json::json!({
+        "title": task.title,
+        "assignee": task.assignee,
+        "parent_id": task.parent_id,
+    })
+}
+
 /// Apply every field of `patch` to `task` in memory, validating each, and
 /// return the names of the fields that changed. Nothing is written here.
 fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, StorageError> {
@@ -1270,7 +1380,13 @@ fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, S
         task.deadline_at = deadline_at;
     }
     if let Some(assignee) = patch.assignee {
-        changed.push("assignee");
+        // Compared, not assumed. Every other field here may over-report a
+        // change harmlessly into the activity log, but `assignee` now drives
+        // an `assigned` lifecycle event that wakes the router: re-writing the
+        // same member must not look like a hand-off.
+        if task.assignee != assignee {
+            changed.push("assignee");
+        }
         task.assignee = assignee;
     }
     if let Some(project) = patch.project {

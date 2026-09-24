@@ -1082,6 +1082,27 @@ pub enum Event {
         /// Serialized `LongHorizonReport`
         report: serde_json::Value,
     },
+
+    /// A task store mutation (P25 board lifecycle).
+    ///
+    /// Distinct from the `TaskRun*` family above, which describes a harness
+    /// *run*: this describes what happened to a *card*, and it is emitted by
+    /// the storage layer, which is the only place that sees every writer.
+    ///
+    /// `kind` is the typed [`nanna_storage::TaskEventKind`] rather than a
+    /// free `String` like `TaskRunProgress`: the router matches on it, so a
+    /// typo should not compile. Only the kinds that are actually emitted
+    /// exist — see that enum for why the other four P25 kinds are absent.
+    TaskEvent {
+        kind: nanna_storage::TaskEventKind,
+        task_id: i64,
+        scope: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
+        detail: serde_json::Value,
+    },
 }
 
 impl Event {
@@ -1129,7 +1150,10 @@ impl Event {
             | Self::Disconnected { .. }
             | Self::TaskRunStarted { .. }
             | Self::TaskRunProgress { .. }
-            | Self::TaskRunCompleted { .. } => None,
+            | Self::TaskRunCompleted { .. }
+            // A card outlives every session (P25 decision 9), so a task event
+            // belongs to no session even when a session caused it.
+            | Self::TaskEvent { .. } => None,
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Task control actions (P15 store + P14 long-horizon runs).
 
-use super::{json, Arc, ControlPlane, Event, PathBuf, TaskAction, Value};
+use super::{json, Arc, ControlPlane, PathBuf, TaskAction, Value};
 use crate::tasks::{AgentStepRunner, TursoTaskSource};
 use nanna_agent::harness::LongHorizonConfig;
 use nanna_storage::{NewTask, TaskPatch, TaskRepository};
@@ -249,17 +249,14 @@ impl ControlPlane {
             assignee,
             sort_order,
         };
+        // No `created` event is emitted here. `TaskRepository::create` emits
+        // `Event::TaskEvent{ kind: Created }` for every writer, not just this
+        // one; announcing it again from the IPC path would double-report a
+        // card created through the GUI and report nothing for a card created
+        // by a tool. (It also used to ride on `TaskRunProgress`, which is the
+        // harness *run* family — a store mutation wearing run clothes.)
         match repo.create(new).await {
-            Ok(task) => {
-                self.emit(Event::TaskRunProgress {
-                    scope: task.scope.clone(),
-                    scope_id: task.scope_id.clone(),
-                    task_id: Some(task.id),
-                    kind: "created".to_string(),
-                    detail: json!({"title": task.title}),
-                });
-                json!({"task": task})
-            }
+            Ok(task) => json!({"task": task}),
             Err(e) => json!({"error": "task_create_failed", "message": e.to_string()}),
         }
     }
