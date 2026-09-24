@@ -7742,8 +7742,9 @@ as its turn (`TurnAdmission`, scope default `session`).
 - [~] Task lifecycle events on the broadcast bus: `created, assigned, status_changed, blocked,
       unblocked, posted, due, overdue, verdict`. Run events stay. Consumers must not block the bus
       (see the event-bus rule in memory).
-      *(2026-09-24 — **the five with emit points are landed**; the derived pair and the sweep pair
-      are still open, filed as their own items below.)* `Event::TaskEvent { kind, task_id, scope,
+      *(2026-09-24 — **seven of the nine are landed**: the five with direct emit points, then the
+      derived `blocked`/`unblocked` pair. Only the time-driven `due`/`overdue` sweep pair is still
+      open, filed as its own item below.)* `Event::TaskEvent { kind, task_id, scope,
       scope_id, actor, detail }` sits beside the `TaskRun*` family, classified into `session_id()`'s
       `None` group (a card outlives every session, P25 decision 9). `kind` is the typed
       `nanna_storage::TaskEventKind`, **re-exported rather than mirrored** — the daemon puts the
@@ -7764,9 +7765,8 @@ as its turn (`TurnAdmission`, scope default `session`).
       **`emit` is never called under the connection guard** — the sink is foreign code and that
       mutex serializes every write in the process — so an event is only ever published for a
       mutation that actually reached the database.
-      **Only the five kinds that are emitted are declared.** Declaring `blocked`/`unblocked`/`due`/
-      `overdue` before their machinery exists would ship four variants nothing ever sends, and a
-      consumer matching on them would wait forever.
+      **Only kinds that are emitted are declared.** `due`/`overdue` are still absent: shipping
+      variants nothing ever sends would leave a consumer matching on them forever.
       **A real bug fell out:** `apply_patch` recorded an `assignee` change whenever the field was
       present, with **no old/new comparison**, so re-writing the same member looked like a hand-off.
       Harmless while it only fed the activity log; not harmless once it wakes the router. Now
@@ -7796,7 +7796,30 @@ as its turn (`TurnAdmission`, scope default `session`).
       home is beside `task_recurrence_sweep`. Emitting five and calling the item done would leave
       four kinds declared and never sent, which is the failure mode the dead-fields rule is about.
       Land the five with their emit points, then the derived pair, then the sweep pair.
-- [ ] **The derived pair: `blocked` / `unblocked`.** `blocked` is computed on read and never
+- [x] **The derived pair: `blocked` / `unblocked`.**
+      *(2026-09-24)* Emitted by **diffing two snapshots of the scope around the whole mutation**
+      rather than reasoning about which dependents a given write should have touched. That choice is
+      what makes the cascades free: `complete` auto-closes ancestors and `update` cancels a subtree,
+      and both are already in the "after" snapshot, so one diff covers them. Only tasks present in
+      **both** snapshots transition — a deleted card did not become unblocked, it stopped existing.
+      Wired to all four mutations that can move the flag: `complete`, `update` (status→`cancelled`
+      **and** `depends_on` edits), `reopen` (which runs it the other way — reopening a dependency
+      blocks its dependents again), and `delete` (whose dep-stripping is itself an unblocking
+      mechanism, so the diff is taken after it).
+      **The prerequisite was real and bigger than the item implied.** `status == "done" ||
+      status == "cancelled"` was written out by hand in **twelve** places in `tasks.rs`, including
+      the two independent derivations of `blocked` the item names. Because `blocked` is derived on
+      every read, a drifted copy would not produce a visibly wrong field — it would produce a task
+      that is blocked to one reader and actionable to another. All twelve now route through
+      `is_closed_status`, and `blocked_ids` is the snapshot-wide mirror of `is_blocked` (a dangling
+      dependency does not block, which is what `delete`'s stripping relies on).
+      Cost, stated plainly: each of the four mutations now does one extra bounded `load_scope`
+      when a sink is attached (and `update` only when `status`/`depends_on` actually changed).
+      Eight new tests — the load-bearing one is
+      `a_dependent_with_two_dependencies_unblocks_only_on_the_last_one`: partial progress is not a
+      transition, and a consumer woken at the halfway point would start work that is still blocked.
+- [ ] ~~**The derived pair: `blocked` / `unblocked`.**~~ *(original scouting, kept for the triggers
+      it identified)* `blocked` is computed on read and never
       stored, so these are transitions nothing currently detects — nothing walks *reverse*
       dependencies. A dependent can only flip to unblocked when a dependency reaches `done` or
       `cancelled`, so the triggers are exactly three: `TaskRepository::complete` (the natural home —

@@ -90,6 +90,48 @@ impl TaskRepository {
         self
     }
 
+    /// Emit `Blocked`/`Unblocked` for every task whose derived `blocked` flag
+    /// differs between two snapshots of the same scope.
+    ///
+    /// `blocked` is derived on read and never stored, so a transition is a
+    /// *difference between two computations*, not a column that changed. Taking
+    /// the snapshots around the whole mutation — rather than reasoning about
+    /// which dependents a particular write should have touched — is what makes
+    /// the cascades free: `complete` auto-closes ancestors and `update` cancels
+    /// a subtree, and both are already reflected in the "after" snapshot.
+    ///
+    /// Only tasks present in **both** snapshots transition: a task that was
+    /// deleted did not become unblocked, it stopped existing.
+    fn emit_block_transitions(&self, before: &[Task], after: &[Task], actor: Option<&str>) {
+        if self.events.is_none() {
+            return;
+        }
+        let was_blocked = blocked_ids(before);
+        let now_blocked = blocked_ids(after);
+        let existed: HashSet<i64> = before.iter().map(|t| t.id).collect();
+        for task in after {
+            if !existed.contains(&task.id) {
+                continue;
+            }
+            let before_blocked = was_blocked.contains(&task.id);
+            let after_blocked = now_blocked.contains(&task.id);
+            if before_blocked == after_blocked {
+                continue;
+            }
+            let kind = if after_blocked {
+                TaskEventKind::Blocked
+            } else {
+                TaskEventKind::Unblocked
+            };
+            self.emit(
+                kind,
+                task,
+                actor,
+                serde_json::json!({ "depends_on": task.depends_on }),
+            );
+        }
+    }
+
     /// Publish one lifecycle event, if anyone is listening.
     ///
     /// # Invariant
@@ -155,7 +197,7 @@ impl TaskRepository {
             let parent = by_id.get(&parent_id).ok_or_else(|| {
                 StorageError::Invalid(format!("parent task #{parent_id} not found in scope"))
             })?;
-            if parent.status == "done" || parent.status == "cancelled" {
+            if is_closed_status(&parent.status) {
                 return Err(StorageError::Invalid(format!(
                     "cannot add a child to {} task #{parent_id}",
                     parent.status
@@ -280,11 +322,11 @@ impl TaskRepository {
             task.blocked = task.depends_on.iter().any(|dep| {
                 statuses
                     .get(dep)
-                    .is_some_and(|s| s != "done" && s != "cancelled")
+                    .is_some_and(|s| !is_closed_status(s))
             });
         }
         if !include_closed {
-            tasks.retain(|t| t.status != "done" && t.status != "cancelled");
+            tasks.retain(|t| !is_closed_status(&t.status));
         }
         tasks.sort_by_key(|t| (t.sort_order, t.id));
         Ok(tasks)
@@ -413,6 +455,20 @@ impl TaskRepository {
         let parent_changed = patch.parent_id.is_some();
         let changed = apply_patch(&mut task, patch)?;
         validate_dates(task.due_at.as_deref(), task.deadline_at.as_deref())?;
+        // Snapshot before the write when this update can change what blocks
+        // what: a status transition opens or closes a dependency, and a
+        // `depends_on` change moves the edges themselves. `task` is already
+        // patched in memory, but the rows still hold the pre-update state.
+        let blocking_before = if self.events.is_some()
+            && (changed.contains(&"status") || changed.contains(&"depends_on"))
+        {
+            Some(
+                self.load_scope(&task.scope, task.scope_id.as_deref())
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         {
             // Validate and write under ONE connection guard: the mutex is the
@@ -485,6 +541,14 @@ impl TaskRepository {
                 serde_json::json!({ "assignee": task.assignee }),
             );
         }
+        // After the cascade, so a subtree cancelled above is already reflected
+        // and its dependents' releases are part of this one diff.
+        if let Some(before) = blocking_before {
+            let after = self
+                .load_scope(&task.scope, task.scope_id.as_deref())
+                .await?;
+            self.emit_block_transitions(&before, &after, actor);
+        }
         self.get(id).await
     }
 
@@ -527,7 +591,7 @@ impl TaskRepository {
             let open_children: Vec<i64> = scope_tasks
                 .iter()
                 .filter(|t| {
-                    t.parent_id == Some(id) && t.status != "done" && t.status != "cancelled"
+                    t.parent_id == Some(id) && !is_closed_status(&t.status)
                 })
                 .map(|t| t.id)
                 .collect();
@@ -544,7 +608,7 @@ impl TaskRepository {
         let by_id: HashMap<i64, &Task> = scope_tasks.iter().map(|t| (t.id, t)).collect();
         let mut closed: HashSet<i64> = scope_tasks
             .iter()
-            .filter(|t| t.status == "done" || t.status == "cancelled")
+            .filter(|t| is_closed_status(&t.status))
             .map(|t| t.id)
             .collect();
         closed.insert(id);
@@ -603,6 +667,14 @@ impl TaskRepository {
                 serde_json::json!({ "auto": true, "trigger": id }),
             );
         }
+        // Closing a task releases whatever depended on it. The reload also
+        // picks up the ancestors auto-closed above, so one diff covers both.
+        if self.events.is_some() {
+            let after = self
+                .load_scope(&task.scope, task.scope_id.as_deref())
+                .await?;
+            self.emit_block_transitions(&scope_tasks, &after, actor);
+        }
         Ok(CompleteOutcome {
             task,
             auto_completed,
@@ -618,9 +690,19 @@ impl TaskRepository {
     /// entry leaves the task reopened.
     pub async fn reopen(&self, id: i64, actor: Option<&str>) -> Result<Task, StorageError> {
         let task = self.get_raw(id).await?;
-        if task.status != "done" && task.status != "cancelled" {
+        if !is_closed_status(&task.status) {
             return Ok(task);
         }
+        // Reopening runs the transition the other way: a dependency that was
+        // closed is open again, so its dependents become blocked.
+        let blocking_before = if self.events.is_some() {
+            Some(
+                self.load_scope(&task.scope, task.scope_id.as_deref())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE tasks SET status = 'pending', completed_at = NULL, \
@@ -630,7 +712,20 @@ impl TaskRepository {
         .await?;
         drop(conn);
         self.log_activity(id, actor, "reopened", None).await?;
-        self.get_raw(id).await
+        let reopened = self.get_raw(id).await?;
+        self.emit(
+            TaskEventKind::StatusChanged,
+            &reopened,
+            actor,
+            serde_json::json!({ "status": reopened.status, "reopened": true }),
+        );
+        if let Some(before) = blocking_before {
+            let after = self
+                .load_scope(&task.scope, task.scope_id.as_deref())
+                .await?;
+            self.emit_block_transitions(&before, &after, actor);
+        }
+        Ok(reopened)
     }
 
     /// Append a working note (the durable scratchpad sub-agents leave
@@ -895,7 +990,9 @@ impl TaskRepository {
         }
         drop(conn);
 
-        // Strip dangling dependency references.
+        // Strip dangling dependency references. This is itself an unblocking
+        // mechanism — a dependent whose only dependency was deleted is free —
+        // so the diff below is taken after the stripping, not before it.
         let doomed_set: HashSet<i64> = doomed.iter().copied().collect();
         for t in &scope_tasks {
             if doomed_set.contains(&t.id) {
@@ -906,6 +1003,13 @@ impl TaskRepository {
                 kept.depends_on.retain(|d| !doomed_set.contains(d));
                 self.write_task(&kept).await?;
             }
+        }
+
+        if self.events.is_some() {
+            let after = self
+                .load_scope(&task.scope, task.scope_id.as_deref())
+                .await?;
+            self.emit_block_transitions(&scope_tasks, &after, actor);
         }
 
         let count = doomed.len() as u64;
@@ -934,7 +1038,7 @@ impl TaskRepository {
         // Delete children before parents so subtree deletes never double-count.
         let mut targets: Vec<&Task> = tasks
             .iter()
-            .filter(|t| !closed_only || t.status == "done" || t.status == "cancelled")
+            .filter(|t| !closed_only || is_closed_status(&t.status))
             .collect();
         targets.sort_by_key(|t| std::cmp::Reverse(parent_depth_lenient(&tasks, t.id)));
         for target in targets {
@@ -947,7 +1051,7 @@ impl TaskRepository {
                     .any(|member_id| {
                         by_id
                             .get(&member_id)
-                            .is_some_and(|t| t.status != "done" && t.status != "cancelled")
+                            .is_some_and(|t| !is_closed_status(&t.status))
                     });
                 if has_open_descendant {
                     continue;
@@ -1087,7 +1191,7 @@ impl TaskRepository {
         let tasks = self.load_scope(&normalize_scope(scope), scope_id).await?;
         let closed = tasks
             .iter()
-            .filter(|t| t.status == "done" || t.status == "cancelled")
+            .filter(|t| is_closed_status(&t.status))
             .count() as u64;
         let open = tasks.len() as u64 - closed;
         Ok((open, closed))
@@ -1138,7 +1242,7 @@ impl TaskRepository {
                         // Its subtree moves with it — do not descend.
                         continue;
                     }
-                    if t.status != "done" && t.status != "cancelled" {
+                    if !is_closed_status(&t.status) {
                         let mut child = t.clone();
                         child.status = "cancelled".to_string();
                         self.write_task(&child).await?;
@@ -1452,7 +1556,7 @@ fn check_graph_update(
                 "parent task #{parent_id} not found in scope"
             )));
         };
-        if parent_changed && (parent.status == "done" || parent.status == "cancelled") {
+        if parent_changed && is_closed_status(&parent.status) {
             return Err(StorageError::Invalid(format!(
                 "cannot move a task under {} task #{parent_id}",
                 parent.status
@@ -2282,11 +2386,41 @@ pub fn is_explicit_yes(reply: &str) -> bool {
     YES.contains(first) && !words.iter().any(|w| NEGATIONS.contains(w))
 }
 
+/// Which tasks in a scope snapshot are blocked.
+///
+/// Mirrors [`is_blocked`] over a whole snapshot: a dependency blocks only if it
+/// is both **present** in the scope and **open**, so a dangling reference does
+/// not block (deleting a dependency releases its dependents, which is what
+/// `delete`'s dep-stripping relies on).
+fn blocked_ids(tasks: &[Task]) -> HashSet<i64> {
+    let open: HashSet<i64> = tasks
+        .iter()
+        .filter(|t| !is_closed_status(&t.status))
+        .map(|t| t.id)
+        .collect();
+    tasks
+        .iter()
+        .filter(|t| t.depends_on.iter().any(|dep| open.contains(dep)))
+        .map(|t| t.id)
+        .collect()
+}
+
+/// Whether a status means the task is closed.
+///
+/// The single definition of "closed" in the store. It was written out by hand
+/// in twelve places, which matters more than it looks: `blocked` is *derived*
+/// from this predicate on every read, so a copy that drifts does not produce a
+/// visibly wrong field — it produces a task that is blocked to one reader and
+/// actionable to another. Adding a third closed status is now one edit.
+fn is_closed_status(status: &str) -> bool {
+    matches!(status, "done" | "cancelled")
+}
+
 fn is_blocked(task: &Task, by_id: &HashMap<i64, &Task>) -> bool {
     task.depends_on.iter().any(|dep| {
         by_id
             .get(dep)
-            .is_some_and(|t| t.status != "done" && t.status != "cancelled")
+            .is_some_and(|t| !is_closed_status(&t.status))
     })
 }
 

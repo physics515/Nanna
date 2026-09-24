@@ -26,12 +26,11 @@ use serde_json::Value;
 /// What happened to a task in the store.
 ///
 /// **Only kinds that are actually emitted exist here.** P25 lists nine; the
-/// four missing ones need machinery that does not exist yet — `blocked` and
-/// `unblocked` are *derived* transitions (nothing walks reverse dependencies
-/// today) and `due`/`overdue` are time-driven (they need a sweep). Declaring
-/// them now would ship four variants that nothing ever sends, which is a dead
-/// field wearing a feature's clothes: a consumer would match on them and wait
-/// forever. They arrive with their emit points, not before.
+/// two missing ones — `due` and `overdue` — are time-driven and need a sweep
+/// that does not exist yet. Declaring them now would ship variants that nothing
+/// ever sends, which is a dead field wearing a feature's clothes: a consumer
+/// would match on them and wait forever. They arrive with their emit points,
+/// not before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskEventKind {
@@ -41,6 +40,12 @@ pub enum TaskEventKind {
     Assigned,
     /// The status moved between two different values.
     StatusChanged,
+    /// The card's derived `blocked` flag became true — a dependency it names
+    /// is open again, or it gained one that already was.
+    Blocked,
+    /// The card's derived `blocked` flag became false — every dependency it
+    /// names is now closed, gone, or no longer named.
+    Unblocked,
     /// A thread post was appended.
     Posted,
     /// A card was completed — the recorded verdict.
@@ -56,6 +61,8 @@ impl TaskEventKind {
             Self::Created => "created",
             Self::Assigned => "assigned",
             Self::StatusChanged => "status_changed",
+            Self::Blocked => "blocked",
+            Self::Unblocked => "unblocked",
             Self::Posted => "posted",
             Self::Verdict => "verdict",
         }
@@ -102,10 +109,12 @@ mod tests {
     use super::*;
 
     /// Every kind, so a new variant has to be added here too.
-    const ALL: [TaskEventKind; 5] = [
+    const ALL: [TaskEventKind; 7] = [
         TaskEventKind::Created,
         TaskEventKind::Assigned,
         TaskEventKind::StatusChanged,
+        TaskEventKind::Blocked,
+        TaskEventKind::Unblocked,
         TaskEventKind::Posted,
         TaskEventKind::Verdict,
     ];
@@ -127,6 +136,8 @@ mod tests {
         assert_eq!(TaskEventKind::Created.as_str(), "created");
         assert_eq!(TaskEventKind::Assigned.as_str(), "assigned");
         assert_eq!(TaskEventKind::StatusChanged.as_str(), "status_changed");
+        assert_eq!(TaskEventKind::Blocked.as_str(), "blocked");
+        assert_eq!(TaskEventKind::Unblocked.as_str(), "unblocked");
         assert_eq!(TaskEventKind::Posted.as_str(), "posted");
         assert_eq!(TaskEventKind::Verdict.as_str(), "verdict");
     }

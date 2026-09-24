@@ -330,3 +330,230 @@ async fn a_second_sink_is_refused_rather_than_silently_replacing_the_first() {
     assert_eq!(recorder.kinds(), vec![TaskEventKind::Created]);
     assert_eq!(second.kinds(), Vec::<TaskEventKind>::new());
 }
+
+// ---------------------------------------------------------------------------
+// Derived transitions: `blocked` / `unblocked`
+//
+// `blocked` is computed on read and never stored, so these events are a
+// difference between two derivations rather than a column that changed. The
+// tests below are written around the four mutations that can move it.
+// ---------------------------------------------------------------------------
+
+/// `b` depends on `a`, so `b` starts blocked.
+async fn blocked_pair(storage: &Storage) -> (i64, i64) {
+    let repo = storage.tasks();
+    let a = repo
+        .create(card("the dependency"))
+        .await
+        .expect("a created");
+    let b = repo
+        .create(NewTask {
+            depends_on: vec![a.id],
+            ..card("the dependent")
+        })
+        .await
+        .expect("b created");
+    let fetched = repo.get(b.id).await.expect("read back");
+    assert!(fetched.blocked, "b starts blocked");
+    (a.id, b.id)
+}
+
+#[tokio::test]
+async fn completing_a_dependency_unblocks_its_dependent() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let (a, b) = blocked_pair(&storage).await;
+    recorder.clear();
+
+    storage
+        .tasks()
+        .complete(a, Some("harness"), None)
+        .await
+        .expect("dependency completed");
+
+    let unblocked = recorder.of_kind(TaskEventKind::Unblocked);
+    assert_eq!(unblocked.len(), 1, "exactly the one dependent");
+    assert_eq!(unblocked[0].task_id, b);
+    assert!(
+        !storage.tasks().get(b).await.expect("read back").blocked,
+        "and the derived flag agrees with the event"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_dependency_also_unblocks() {
+    // `is_blocked` treats cancelled as closed, so a cancel releases dependents
+    // exactly as a completion does — and a consumer that only watched
+    // completions would miss it.
+    let (storage, recorder) = storage_with_recorder().await;
+    let (a, b) = blocked_pair(&storage).await;
+    recorder.clear();
+
+    storage
+        .tasks()
+        .update(
+            a,
+            TaskPatch {
+                status: Some("cancelled".to_string()),
+                ..TaskPatch::default()
+            },
+            Some("gui"),
+        )
+        .await
+        .expect("dependency cancelled");
+
+    let unblocked = recorder.of_kind(TaskEventKind::Unblocked);
+    assert_eq!(unblocked.len(), 1);
+    assert_eq!(unblocked[0].task_id, b);
+}
+
+#[tokio::test]
+async fn reopening_a_dependency_blocks_its_dependent_again() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let (a, b) = blocked_pair(&storage).await;
+    let repo = storage.tasks();
+    repo.complete(a, Some("harness"), None)
+        .await
+        .expect("completed");
+    recorder.clear();
+
+    repo.reopen(a, Some("recurrence")).await.expect("reopened");
+
+    let blocked = recorder.of_kind(TaskEventKind::Blocked);
+    assert_eq!(blocked.len(), 1, "the transition runs both ways");
+    assert_eq!(blocked[0].task_id, b);
+    assert!(repo.get(b).await.expect("read back").blocked);
+}
+
+#[tokio::test]
+async fn deleting_a_dependency_unblocks_and_does_not_announce_the_deleted_card() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let (a, b) = blocked_pair(&storage).await;
+    recorder.clear();
+
+    storage
+        .tasks()
+        .delete(a, Some("gui"))
+        .await
+        .expect("deleted");
+
+    let unblocked = recorder.of_kind(TaskEventKind::Unblocked);
+    assert_eq!(unblocked.len(), 1, "only the survivor transitions");
+    assert_eq!(
+        unblocked[0].task_id, b,
+        "a deleted card did not become unblocked, it stopped existing"
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_dependency_edge_unblocks_without_closing_anything() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let (_a, b) = blocked_pair(&storage).await;
+    recorder.clear();
+
+    storage
+        .tasks()
+        .update(
+            b,
+            TaskPatch {
+                depends_on: Some(Vec::new()),
+                ..TaskPatch::default()
+            },
+            Some("router"),
+        )
+        .await
+        .expect("edge removed");
+
+    let unblocked = recorder.of_kind(TaskEventKind::Unblocked);
+    assert_eq!(unblocked.len(), 1);
+    assert_eq!(unblocked[0].task_id, b);
+}
+
+#[tokio::test]
+async fn gaining_an_open_dependency_blocks() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let a = repo
+        .create(card("the dependency"))
+        .await
+        .expect("a created");
+    let b = repo.create(card("the dependent")).await.expect("b created");
+    recorder.clear();
+
+    repo.update(
+        b.id,
+        TaskPatch {
+            depends_on: Some(vec![a.id]),
+            ..TaskPatch::default()
+        },
+        Some("router"),
+    )
+    .await
+    .expect("edge added");
+
+    let blocked = recorder.of_kind(TaskEventKind::Blocked);
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].task_id, b.id);
+}
+
+#[tokio::test]
+async fn a_dependent_with_two_dependencies_unblocks_only_on_the_last_one() {
+    // The whole point of deriving the flag rather than storing it: partial
+    // progress is not a transition, and a consumer woken at the halfway point
+    // would start work that is still blocked.
+    let (storage, recorder) = storage_with_recorder().await;
+    let repo = storage.tasks();
+    let a = repo.create(card("first")).await.expect("a");
+    let b = repo.create(card("second")).await.expect("b");
+    let c = repo
+        .create(NewTask {
+            depends_on: vec![a.id, b.id],
+            ..card("the dependent")
+        })
+        .await
+        .expect("c");
+    recorder.clear();
+
+    repo.complete(a.id, Some("harness"), None)
+        .await
+        .expect("first done");
+    assert_eq!(
+        recorder.of_kind(TaskEventKind::Unblocked).len(),
+        0,
+        "one of two is not an unblock"
+    );
+
+    repo.complete(b.id, Some("harness"), None)
+        .await
+        .expect("second done");
+    let unblocked = recorder.of_kind(TaskEventKind::Unblocked);
+    assert_eq!(unblocked.len(), 1, "the last one releases it");
+    assert_eq!(unblocked[0].task_id, c.id);
+}
+
+#[tokio::test]
+async fn a_mutation_that_changes_no_blocking_announces_no_transition() {
+    let (storage, recorder) = storage_with_recorder().await;
+    let (_a, _b) = blocked_pair(&storage).await;
+    let task = storage
+        .tasks()
+        .create(card("unrelated"))
+        .await
+        .expect("created");
+    recorder.clear();
+
+    storage
+        .tasks()
+        .update(
+            task.id,
+            TaskPatch {
+                title: Some("renamed".to_string()),
+                ..TaskPatch::default()
+            },
+            Some("gui"),
+        )
+        .await
+        .expect("renamed");
+
+    assert_eq!(recorder.of_kind(TaskEventKind::Blocked).len(), 0);
+    assert_eq!(recorder.of_kind(TaskEventKind::Unblocked).len(), 0);
+}
