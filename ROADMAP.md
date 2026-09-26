@@ -7910,7 +7910,19 @@ as its turn (`TurnAdmission`, scope default `session`).
       "Dreaming operates only on these copies" holds by construction: nothing in dreaming reads
       `task_notes`. 2 tests, one end-to-end (card → post → complete = three linked copies, none for
       a session card on the same store).
-- [~] *(2026-09-26 — step (1) landed; steps (2)–(4) open.)* **Step (1): the board feeds
+- [~] *(2026-09-26 — steps (1) and (2) landed; (3)–(4) open.)* **Step (2):
+      `nanna_timeline::compress_episode(events, budget)`** — pure, deterministic, no model, no
+      clock. Keeps both endpoints, every `outcome` (a transition), and every local salience peak ≥
+      `PEAK_FLOOR` (0.5 — an ordinary comment's salience, so a peak among progress lines is noise);
+      decimates the rest evenly into the remaining budget; each dropped run leaves a
+      `[… N events elided …]` marker so the fold's truncation stays visible, and the markers sum to
+      exactly what was dropped. When transitions and peaks alone overflow the budget, the triage
+      is endpoints, then transitions before peaks, then salience, then age — a total order, so a
+      re-run dream folds identically. Lineage is the kept events' sources, card first, bounded by
+      `MAX_EVENT_SOURCE_IDS`. 5 tests over a fixed-seed `SplitMix64` corpus. No caller yet on
+      purpose: step (3)'s dream phase is its consumer, and it is useful on its own as the unit
+      that phase will be built and benchmarked against.
+      **Step (1): the board feeds
       `memory_events`.** The write-through worker now also appends one `nanna_timeline` episode per
       thread post (`message`) and per status change or verdict (`outcome`), with `source_ids` =
       `task:<id>` (+ `task_note:<id>`), workspace-scoped, through `Timeline::append` so the
