@@ -8340,8 +8340,16 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `[Skipped: …]` result (`pair_unrun_calls`, malformed-call results included) — left unpaired,
       the conversation's **next** request is one Anthropic rejects outright. 2 tests; the
       classifier's is red on the old catch-all.
-- [ ] `dispatch_tool_calls` runs a turn's calls concurrently but presents them sequentially:
+- [x] `dispatch_tool_calls` runs a turn's calls concurrently but presents them sequentially:
       either serialise writes-before-execs or say so in the results (`loop_runner.rs:7442`).
+      *(2026-09-26)* Serialised, not annotated: a turn's batch runs in parallel **only when every
+      call is on `READ_ONLY_TOOLS`** (the file/search/web readers, recall, status, image
+      description, plus the Claude Code aliases models send); otherwise `run_tool_batch` awaits
+      each call in the order the model wrote it. `[write_file, exec "cargo test"]` could test the
+      *old* file, and the model, reading the results in order, chased a bug that was only a race.
+      An allowlist on purpose: an unknown tool — a new skill, any MCP tool — counts as mutating.
+      Cancellation still races the whole batch. The test pins both halves: a slow write finishes
+      before the test starts in a mutating batch; reads still overlap.
 - [ ] Model routing strips the provider prefix but always calls the primary provider
       (`loop_runner.rs:5361`); the per-member `ModelChain` replaces this path.
 - [~] *(2026-09-26 — the first finding, the high-severity one, is done; the rest of this line is

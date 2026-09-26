@@ -3777,7 +3777,67 @@ async fn race_stream_cancel<F: std::future::Future>(
     }
 }
 
-/// A provider error mid-stream as the `Err` it is; every other event passes.
+/// Tools that only read: a batch made only of these may run in parallel.
+///
+/// An allowlist, so an unknown tool — a new skill, an MCP tool — counts as
+/// one that may change something, and the batch it is in runs in order.
+/// Canonical names plus the Claude Code aliases models send.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "read_pdf",
+    "list_dir",
+    "find_files",
+    "search_file",
+    "code_search",
+    "code_outline",
+    "project_structure",
+    "file_history",
+    "web_search",
+    "web_search_batch",
+    "web_fetch",
+    "recall",
+    "recall_messages",
+    "status",
+    "discover_tools",
+    "list_reminders",
+    "list_user_tools",
+    "describe_image",
+    "analyze_image",
+    "ocr",
+    "echo",
+    "Read",
+    "Glob",
+    "Grep",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// Whether `name` is a tool that cannot change anything.
+fn is_read_only_tool(name: &str) -> bool {
+    READ_ONLY_TOOLS.contains(&name)
+}
+
+/// Run one turn's tool calls: all at once when `parallel`, else one after
+/// another in the order given.
+///
+/// A turn's calls used to run concurrently while their results were presented
+/// in order, as if sequential: `write_file` then `exec cargo test` in one turn
+/// could test the OLD file, and the model — reading "wrote it, then the test
+/// failed" — would chase a bug that was only a race. Parallelism is kept for
+/// batches that only read, where order cannot change an answer.
+async fn run_tool_batch<F: std::future::Future>(futures: Vec<F>, parallel: bool) -> Vec<F::Output> {
+    if parallel {
+        return futures::future::join_all(futures).await;
+    }
+    let mut outputs = Vec::with_capacity(futures.len());
+    for future in futures {
+        outputs.push(future.await);
+    }
+    outputs
+}
+
+/// A provider error mid-stream as the `Err` it is; every other event passes./// A provider error mid-stream as the `Err` it is; every other event passes.
 ///
 /// Both error events used to fall into the stream loop's `_ => {}`: an
 /// overload, a 429 or a dropped connection ended the loop as though the model
@@ -7535,10 +7595,14 @@ impl Agent {
         tool_calls_with_meta: &[(String, String, Value, ToolCall)],
         breaker_notices: &[Option<String>],
     ) -> ControlFlow<Vec<ContentBlock>, Vec<(ToolResponse, u64)>> {
-        // Phase 2: Execute all tools in parallel
+        // Phase 2: execute the batch — in parallel only when every call is
+        // read-only; otherwise one at a time, in the order the model wrote.
+        let parallel = tool_calls_with_meta
+            .iter()
+            .all(|(_, name, _, _)| is_read_only_tool(name));
         info!(
-            "🚀 Executing {} tools in parallel",
-            tool_calls_with_meta.len()
+            count = tool_calls_with_meta.len(),
+            parallel, "🚀 Executing tool batch"
         );
         let tool_futures: Vec<_> = tool_calls_with_meta
             .iter()
@@ -7605,7 +7669,7 @@ impl Agent {
         let results = if let Some(token) = options.cancel.as_ref() {
             tokio::select! {
                 biased;
-                joined = futures::future::join_all(tool_futures) => joined,
+                joined = run_tool_batch(tool_futures, parallel) => joined,
                 () = token.cancelled() => {
                     const INTERRUPTED: &str =
                         "[Interrupted: the user cancelled the run while this tool was \
@@ -7632,7 +7696,7 @@ impl Agent {
                 }
             }
         } else {
-            futures::future::join_all(tool_futures).await
+            run_tool_batch(tool_futures, parallel).await
         };
         ControlFlow::Continue(results)
     }
@@ -10458,6 +10522,47 @@ mod tests {
                 .is_none(),
             "a round that is not stopping pairs nothing"
         );
+    }
+
+    /// A batch with a call that can change something runs in the model's
+    /// order: a slow first call finishes before the second starts. A batch that
+    /// only reads keeps its parallelism.
+    #[tokio::test]
+    async fn a_mutating_batch_runs_in_order_and_a_read_only_one_in_parallel() {
+        async fn batch(parallel: bool) -> Vec<&'static str> {
+            let finished = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let make = |label: &'static str, delay_ms: u64| {
+                let finished = Arc::clone(&finished);
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    finished.lock().expect("lock").push(label);
+                }
+            };
+            let futures = vec![
+                Box::pin(make("write", 40))
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+                Box::pin(make("test", 0)),
+            ];
+            run_tool_batch(futures, parallel).await;
+            finished.lock().expect("lock").clone()
+        }
+        assert_eq!(
+            batch(false).await,
+            ["write", "test"],
+            "the test sees the write"
+        );
+        assert_eq!(batch(true).await, ["test", "write"], "reads still overlap");
+
+        assert!(is_read_only_tool("read_file") && is_read_only_tool("Grep"));
+        for mutating in [
+            "exec",
+            "write_file",
+            "edit_file",
+            "python",
+            "mcp__github__create_issue",
+        ] {
+            assert!(!is_read_only_tool(mutating), "{mutating}");
+        }
     }
 
     /// Only an INPUT overflow halves the conversation. The old catch-all
