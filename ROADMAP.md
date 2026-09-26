@@ -8439,10 +8439,18 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (`cdp.rs:140,489`, `playwright.rs:254`).
 
 **Stage 4 — the board client and what it must not port:**
-- [ ] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
+- [~] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
       (`scheduler.rs:28`, `settings.rs:454,519,550` and siblings); no `unsafe set_var` from
       commands; `import_config` must reload secrets; `search_memory` must slice on char
       boundaries (or be replaced by the daemon's `memory.search`).
+      *(2026-09-26 — the `search_memory` half, the **high** one.)* Two ways to abort the GUI (the
+      release profile is `panic = "abort"`): byte slicing ±50 from a match lands inside a
+      multi-byte character (an em dash nearby is enough), and the match offset was found in the
+      *lowercased* copy and applied to the original — but lowercasing can change a character's
+      byte length (`İ` 2 → 3 bytes). `match_snippet` maps every byte of the lowered copy back to
+      its original character and expands the context by characters. 1 test (em dashes, `İ`).
+      **Still open:** the lock discipline, `unsafe set_var`, and `import_config` reloading
+      secrets.
 - [x] CLI: `nanna sessions/chat/run` ignore `[general] data_dir` (`cli.rs:390`, `setup.rs:241`);
       `register_discover_tools` `.expect` on a user-editable file (`setup.rs:319`). The CLI's chat
       commands go with the chat; `run` becomes "create a card and watch it".
