@@ -8273,8 +8273,16 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `the_live_request_survives_every_cut_path` only ever passed because it pins by hand; the
       new `the_runs_request_is_pinned_where_it_is_pushed` goes through the real entry path, so
       together they cover pin-then-cut end to end.
-- [ ] `deduplicate_messages` must never replace the newest tool result, and chunk hashes must
+- [x] `deduplicate_messages` must never replace the newest tool result, and chunk hashes must
       clear when their summary is dropped (`context.rs:779-866`, `2272`).
+      *(2026-09-26)* The newest message (the round's tool results) and the pinned live request are
+      now sent whole, always; older copies still fold. A fresh re-read of a file whose first read
+      had been summarised came back as "already included in previous context summary" — from a
+      *lossy* summary — so the model lost the very text it had just asked for and asked again.
+      The hashes are the other half: the two paths that make the summary lose text (preamble
+      elision and re-condensation) now `forget_summarized_hashes`, since a hash that says "the
+      summary covers this" after that part of the summary is gone points a placeholder at
+      nothing. Deduplicating less is the safe direction. 1 new test, 1 extended.
 - [ ] `verified_outcomes` needs a reduction path (fold read-only successes, cap by budget) and
       must be pruned when an item is reopened as regressed (`loop_runner.rs:7188`, `harness.rs:3574`).
 - [ ] `is_context_length_error` must not match provider 400s about `max_tokens`; the token-budget
