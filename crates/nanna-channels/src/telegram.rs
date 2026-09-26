@@ -691,8 +691,8 @@ impl Channel for TelegramChannel {
 
         let reply_to: Option<i64> = message
             .reply_to
-            .as_ref()
-            .and_then(|r| r.parse().ok());
+            .as_deref()
+            .and_then(|r| crate::native_reply_id(r).parse().ok());
 
         let result = match message.content {
             MessageContent::Text { text } => {

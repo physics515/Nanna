@@ -8123,7 +8123,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       channel, and stays synchronous so ordering under the lock holds. 1 test (1 100 enqueues,
       no reader). (`MessageQueue` has no caller today — it is on the rotting-exports list.)
       **Stale:** byte chunking — `split_for_length` already counts Unicode scalars.
-      **Still open:** composite `reply_to` ids, legacy Markdown, dead signald/Slack upload paths.
+      *(later)* **Composite `reply_to` ids:** the daemon replies with `reply_to` = the incoming
+      id, which is composite (`chat:message`, `channel:message`, `channel:ts`); Telegram failed to
+      parse it and silently sent unthreaded, Discord sent it as a message reference (not a
+      snowflake) and Slack as a `thread_ts`. `native_reply_id` (last segment) now feeds all three.
+      1 test. **Still open:** legacy Markdown, dead signald/Slack upload paths.
 - [ ] `nanna-server` webhooks (`slack.rs`, `discord.rs`, `telegram.rs`, `signal.rs`): full turn
       before ack, own replay check, webhook-reply Markdown, Signal bypassing `process_message`,
       unbounded `AppState.agents`. What stays of `nanna-server` is decided when remote board access
