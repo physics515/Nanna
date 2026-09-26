@@ -91,7 +91,7 @@ for (const { key, asset, bundleDir } of PLATFORMS) {
   }
   platforms[key] = {
     signature,
-    url: `https://github.com/physics515/Nanna/releases/download/${tag}/${asset}`,
+    url: `https://github.com/basic-automation/Nanna/releases/download/${tag}/${asset}`,
   };
 }
 
