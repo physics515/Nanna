@@ -8102,6 +8102,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       long-poll listener alike — put the token into logs, the circuit breaker's failure detail
       and the channel status. All four sites now format `e.without_url()`. 1 test (red without
       it: a refused connection's error carried the token).
+      *(later)* **Discord delivered no human message at all.** `convert_message` read
+      `author.bot` with `?`, and Discord omits `bot` for a human — so the `?` returned `None` for
+      every human message and only bots (then skipped) got as far as the check. A missing field
+      is now "not a bot" (1 test, red without the fix). **And it kept no heartbeat:** it beat
+      only when the gateway asked (op 1), which Discord rarely does, so the connection was dropped
+      as dead about every 41 s. Hello now arms an interval (`heartbeat_period`, floored at 1 s — a
+      zero period panics `tokio::time::interval`), `beat` sends on each tick, and a tick whose
+      previous beat got no op 11 ACK leaves the zombie connection and resumes (Discord's rule).
+      1 paused-clock test. Not driven against a live gateway (no bot token on this host).
 - [ ] `nanna-server` webhooks (`slack.rs`, `discord.rs`, `telegram.rs`, `signal.rs`): full turn
       before ack, own replay check, webhook-reply Markdown, Signal bypassing `process_message`,
       unbounded `AppState.agents`. What stays of `nanna-server` is decided when remote board access
