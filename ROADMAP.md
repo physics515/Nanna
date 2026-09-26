@@ -8094,9 +8094,14 @@ Each line is one finding from the 2026-09-22 review, kept only if the code path 
 P25. Grouped by the stage that owns the path; "delete" lines are here so nobody fixes them.
 
 **Delete with the chat, sessions and channels (Stage 4 cut-over) — do not fix:**
-- [ ] `nanna-channels` in full: Discord `author.bot` short-circuit, missing gateway heartbeat,
+- [~] `nanna-channels` in full: Discord `author.bot` short-circuit, missing gateway heartbeat,
       Telegram token in error Display, composite `reply_to` ids, byte chunking, legacy Markdown,
       Signal/WhatsApp 120 s SSE cut, dead signald/Slack upload paths, queue write-lock send.
+      *(2026-09-26 — the Telegram token.)* The Bot API URL embeds the token (`/bot<token>/…`) and
+      reqwest's error Display prints the URL, so every connection or decode failure — sender and
+      long-poll listener alike — put the token into logs, the circuit breaker's failure detail
+      and the channel status. All four sites now format `e.without_url()`. 1 test (red without
+      it: a refused connection's error carried the token).
 - [ ] `nanna-server` webhooks (`slack.rs`, `discord.rs`, `telegram.rs`, `signal.rs`): full turn
       before ack, own replay check, webhook-reply Markdown, Signal bypassing `process_message`,
       unbounded `AppState.agents`. What stays of `nanna-server` is decided when remote board access
