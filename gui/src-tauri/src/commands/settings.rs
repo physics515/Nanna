@@ -451,8 +451,11 @@ pub async fn set_extraction_model(
     if let Err(e) = state_guard.config.save() {
         warn!("Failed to save extraction model to config: {}", e);
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     if model.is_empty() {
         info!("Extraction model set to: (use chat model)");
@@ -516,8 +519,11 @@ pub async fn set_provider_api_key(
         error!("Failed to save config: {}", e);
         // Non-fatal - key is hydrated in-process for this session
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("API key set for provider: {} (secure store)", provider);
     Ok(())
@@ -547,8 +553,11 @@ async fn persist_oauth_login(
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {e}");
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
     Ok(())
 }
 
@@ -732,9 +741,7 @@ pub async fn save_anthropic_oauth_token(
 /// cannot be deleted; nothing else changes then. A failed `config.toml` save
 /// afterwards is only logged.
 #[tauri::command]
-pub async fn logout_anthropic_oauth(
-    state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<(), String> {
+pub async fn logout_anthropic_oauth(state: State<'_, Arc<RwLock<AppState>>>) -> Result<(), String> {
     // Remove the durable credential first — if this fails the user would be
     // silently logged back in at next launch, so surface it instead.
     nanna_config::SecureStore::new()
@@ -750,8 +757,11 @@ pub async fn logout_anthropic_oauth(
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config after logout: {}", e);
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Anthropic OAuth logout successful");
     Ok(())
@@ -924,8 +934,11 @@ pub async fn refresh_oauth_token(
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     let hours = refreshed.seconds_until_expiry().map_or(0, |s| s / 3600);
     info!("OAuth token refreshed, expires in {}h", hours);
@@ -983,8 +996,11 @@ pub async fn set_provider(
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Provider changed to: {}", provider);
     Ok(())
@@ -1170,8 +1186,11 @@ pub async fn set_ollama_api_key(
             return Err(err_msg);
         }
     }
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
     Ok(if saved { "Ollama token saved" } else { "Ollama token removed" }.to_string())
 }
 
@@ -2350,8 +2369,11 @@ pub async fn set_summarization_model_priority(
     // Tell the daemon now, as the other settings saves do. It would find the
     // change by itself — its file watcher polls every ~2 s — but a turn that
     // starts inside that window would summarize on the old list.
-    let _ = state_guard.backend.config_reload().await;
+    // Never hold AppState across a daemon round trip: every other
+    // command waits on this lock for as long as the reload takes.
+    let backend = Arc::clone(&state_guard.backend);
     drop(state_guard);
+    let _ = backend.config_reload().await;
 
     info!("Summarization model priority set: {:?}", priority);
     Ok(())

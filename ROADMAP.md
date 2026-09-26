@@ -8449,8 +8449,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       *lowercased* copy and applied to the original — but lowercasing can change a character's
       byte length (`İ` 2 → 3 bytes). `match_snippet` maps every byte of the lowered copy back to
       its original character and expands the context by characters. 1 test (em dashes, `İ`).
-      **Still open:** the lock discipline, `unsafe set_var`, and `import_config` reloading
-      secrets.
+      *(later the same day)* **Lock discipline, the reload half:** eleven commands held the
+      `AppState` write guard across `config.reload` — a daemon round trip bounded only by the
+      request timeout, during which every other command waited. The three scheduler setters now
+      share `update_scheduler_config(&state, |section| …)`, which scopes the lock to the change and
+      the save, and the eight `settings.rs` setters clone the backend `Arc`, drop the guard, and
+      then reload. Behaviour is otherwise identical (the save stays ordered under the lock).
+      **Still open:** the remaining round trips under a guard (`system_status` at
+      `settings.rs:874`, five `config_set` calls), `unsafe set_var`, and `import_config`
+      reloading secrets.
 - [x] CLI: `nanna sessions/chat/run` ignore `[general] data_dir` (`cli.rs:390`, `setup.rs:241`);
       `register_discover_tools` `.expect` on a user-editable file (`setup.rs:319`). The CLI's chat
       commands go with the chat; `run` becomes "create a card and watch it".
