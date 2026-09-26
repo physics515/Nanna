@@ -3149,6 +3149,11 @@ pub struct DaemonServer {
     /// store WAS repaired and does persist. Surfaced on status so the state is
     /// observable rather than inferred from a log line at boot.
     storage_error: Option<String>,
+    /// The board memory write-through queue's receiving end, created with the
+    /// task event sink when storage opens and taken by `init_services` once the
+    /// memory service exists (P25 Stage 1). Left `None` — and so dropped —
+    /// when memory is disabled, which the sink reads as "no copies owed".
+    board_copies: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<nanna_storage::TaskEvent>>>,
     /// Terminal reason file: a durable record of WHY this process stopped, so
     /// the next boot can tell a clean shutdown from a hard death whose only
     /// other evidence is a log that simply ends (2026-08-10 ministral leg).
@@ -3304,6 +3309,7 @@ impl DaemonServer {
             storage: None,
             memory_recovery: None,
             storage_error: None,
+            board_copies: std::sync::Mutex::new(None),
             exit_reason,
         }
     }
@@ -3366,9 +3372,18 @@ impl DaemonServer {
                 // which is the only place that sees every writer — including
                 // the cascades (subtree cancel, ancestor auto-complete) that
                 // no caller ever names.
-                if !storage.set_task_events(Arc::new(
-                    crate::task_event_bridge::TaskEventBridge::new(self.ipc.event_sender()),
+                let (copies_tx, copies_rx) = tokio::sync::mpsc::channel(
+                    crate::memory_write_through::WRITE_THROUGH_QUEUE_MAX,
+                );
+                if storage.set_task_events(Arc::new(
+                    crate::task_event_bridge::TaskEventBridge::new(self.ipc.event_sender())
+                        .with_memory_write_through(copies_tx),
                 )) {
+                    *self
+                        .board_copies
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(copies_rx);
+                } else {
                     warn!("task event sink was already attached; keeping the existing one");
                 }
                 self.set_storage(storage);
@@ -4814,6 +4829,7 @@ impl DaemonServer {
         let tools_dir = self.resolve_tools_directory();
 
         let memory = self.init_memory_service(chat_runs, degradations).await;
+        self.start_board_write_through(memory.as_ref());
 
         // ONE config for every long-lived collaborator below. The sub-agent
         // spawner and the script summarizer are constructed BEFORE the agent
@@ -5131,6 +5147,27 @@ impl DaemonServer {
             Some(resolved)
         } else {
             None
+        }
+    }
+
+    /// Start draining the board memory write-through queue (P25 Stage 1).
+    ///
+    /// Runs at most once: the receiver is taken. Without storage or memory the
+    /// receiver is dropped here, and the sink reads the closed queue as "no
+    /// copies owed" instead of filling it.
+    fn start_board_write_through(&self, memory: Option<&Arc<MemoryService>>) {
+        let queue = self
+            .board_copies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let (Some(queue), Some(storage), Some(memory)) = (queue, self.storage.as_ref(), memory) {
+            tokio::spawn(crate::memory_write_through::run(
+                queue,
+                Arc::clone(storage),
+                Arc::clone(memory),
+            ));
+            info!("Board memory write-through running: every card and post becomes a memory");
         }
     }
 

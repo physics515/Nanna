@@ -7888,8 +7888,28 @@ as its turn (`TurnAdmission`, scope default `session`).
       blob/path decision (in-row, on disk beside the workspace, or content-addressed) that Stage 1
       does not force, and a thread that is "the permanent record" makes where the bytes live a
       durability question, not a schema one. Filed below.
-- [ ] Memory write-through: on card create/close and on every post, write a workspace-scoped
+- [x] Memory write-through: on card create/close and on every post, write a workspace-scoped
       memory carrying `source_task_id` / `source_note_id`. Dreaming operates only on these copies.
+      *(2026-09-26)* `crates/nanna-daemon/src/memory_write_through.rs`. `Created`, `Verdict`,
+      `StatusChanged→cancelled` and `Posted` each write one copy through
+      `remember_deferred_vector` (durable before it returns, no embedding on the path — the
+      backfill drain vectors it), led by the card's title so a recalled post still says what it
+      was about, and carrying `source_task_id`, `source_note_id`, `board_event`, `post_kind`,
+      `labels` and — only for a real member — `author_member_id`. Workspace cards land in their
+      workspace; global cards stay global.
+      **Fed by the store's own sink, not a bus subscriber** — a lagging `broadcast` receiver drops
+      events, and here a dropped event is a memory that silently never exists. `TaskEventBridge`
+      also `try_send`s the memory-producing kinds to a bounded `mpsc` (`WRITE_THROUGH_QUEUE_MAX` =
+      one scope's worth, since the queue exists before the memory service does); one worker drains
+      it in order. A full queue is WARNed with a running count, never waited on (the sink runs on
+      the store's write path); a closed one — memory disabled — is silent, because nothing is owed.
+      New `TaskRepository::note(id)`, since events carry ids, not rows.
+      **Deliberately skipped: `session`-scoped tasks.** They are chat scaffolding (the harness
+      writes dozens per turn) and decision 9 deletes the scope; copying them would flood memory
+      with plan steps. They start producing copies when the scope promotion item above lands.
+      "Dreaming operates only on these copies" holds by construction: nothing in dreaming reads
+      `task_notes`. 2 tests, one end-to-end (card → post → complete = three linked copies, none for
+      a session card on the same store).
 - [ ] **DSP timeline compression — feed the North Star's moat.** *(owner 2026-09-23: "add that to
       the roadmap".)* `nanna-timeline` (`EventKind{Message,ToolCall,Recall,Outcome}`, `Episode`,
       `Timeline`) and migration 014's `memory_events` exist with **no consumer**; the dreaming item

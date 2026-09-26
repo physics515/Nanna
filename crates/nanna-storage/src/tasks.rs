@@ -870,6 +870,34 @@ impl TaskRepository {
         Ok(notes)
     }
 
+    /// One thread post by its id.
+    ///
+    /// Task events name a post by id rather than carrying it (the bus is not a
+    /// replication channel), so a consumer that needs the text reads it here.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no post has `note_id`, or
+    /// [`StorageError::Database`] if the query fails or the row does not decode.
+    pub async fn note(&self, note_id: i64) -> Result<TaskNote, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, task_id, author, content, created_at, author_member_id, kind \
+                 FROM task_notes WHERE id = ?1",
+                turso::params![note_id],
+            )
+            .await?;
+        let note = match rows.next().await? {
+            Some(row) => Some(decode_task_note(&row)?),
+            None => None,
+        };
+        drop(rows);
+        drop(conn);
+        let note = note.ok_or_else(|| StorageError::NotFound(format!("task note #{note_id}")))?;
+        debug_assert_eq!(note.id, note_id, "looked up by primary key");
+        Ok(note)
+    }
+
     /// Last `limit` activity entries for a task, oldest first.
     ///
     /// # Errors
