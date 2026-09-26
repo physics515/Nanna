@@ -8325,9 +8325,20 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       visited set; `SystemExit` must carry its status; manifest skills with `kill_on_drop`; the
       registry backstop must extend for undeclared timeouts too (`boa_impl.rs:43,779`,
       `python.rs:147,374`, `engine.rs:414,203`, `skills/executable.rs:150`).
-- [ ] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
+- [x] Tool authoring: `tools.update` refuses bundled names and runs `check_syntax`; GUI
       `update_skill` validates the name (`tool_authoring.rs:99,236`, `gui/.../tools.rs:458`). Both
       move with the `default-skills` → tools rename.
+      *(2026-09-26)* `validate_source` now runs `nanna_scripting::check_syntax` — the parse
+      `create_tool` already ran — so a syntax-breaking edit is refused and the working tool stays
+      on disk (it used to be written, re-registered, and fail only when called). `refuse_bundled`
+      guards **both** `tools.create` and `tools.update`: create matters too, because a debug build
+      loads bundled tools from the source tree, so the tools dir may not hold one and a same-named
+      user tool would shadow it. `is_bundled` is now the one catalogue check (the listing reuses
+      it). GUI: `update_skill` joined an unvalidated name, and `Path::join` with `../x` walks out
+      of the skills directory while an **absolute** name replaces it outright — any existing
+      `tool.ts` anywhere could be overwritten. `delete_skill`'s check is now the shared
+      `validate_existing_skill_name`, and `update_skill` also canonicalises the resolved directory
+      against the skills root (a symlinked skill dir). 3 tests.
 - [ ] Smaller: `strip_ansi_escapes` OSC/non-CSI; missing `workdir` misreported as missing command;
       `Nanna.readFile` size ceiling; `timeout_secs * 1000` overflow; `run_git` buffers before the
       cap; `dump_empty_step` unbounded log outside the data dir; strict `as_u64` where Boa hands
