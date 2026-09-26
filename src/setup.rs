@@ -329,15 +329,7 @@ pub async fn init_components(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     // Initialize storage first (needed for memory tools)
-    let storage_path = config
-        .memory
-        .storage_path
-        .clone()
-        .unwrap_or_else(|| {
-            Config::default_data_dir()
-                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
-                .join("nanna.db")
-        });
+    let storage_path = cli_storage_path(config);
 
     let storage_config = StorageConfig {
         path: storage_path.to_string_lossy().to_string(),
@@ -404,17 +396,41 @@ pub async fn init_components(
     Ok((llm, tools, storage))
 }
 
+/// The database the CLI opens: `[memory].storage_path`, else `nanna.db` in
+/// the data directory THIS configuration selects.
+///
+/// `Config::resolve_data_dir` honours `[general] data_dir`; the CLI used
+/// `Config::default_data_dir`, which does not — so with a custom data dir set,
+/// `nanna chat`, `run` and `sessions` opened a different database from the
+/// daemon's, and a user's sessions seemed to vanish.
+#[must_use]
+pub fn cli_storage_path(config: &Config) -> std::path::PathBuf {
+    config.memory.storage_path.clone().unwrap_or_else(|| {
+        config
+            .resolve_data_dir()
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+            .join("nanna.db")
+    })
+}
+
 /// Register the `discover_tools` JS/TS skill with the tool registry.
+///
+/// The skill's source lives in the user's tools directory, where it can be
+/// edited — so a source that no longer parses is logged and skipped, never a
+/// panic that takes the whole CLI down with it.
 async fn register_discover_tools(tools: &Arc<ToolRegistry>, config: &Config) {
     let tools_dir = nanna_tools::skills::defaults::resolve_tools_dir(
         config.tools.tools_dir.as_deref()
     );
     if let Some(ref dir) = tools_dir
         && let Some(source) = nanna_tools::skills::defaults::load_discover_tools_source(dir) {
-            let wrapper = nanna_tools::skills::ScriptedToolWrapper::from_source("discover_tools", &source)
-                .expect("discover_tools skill must parse")
-                .with_registry(Arc::downgrade(tools));
-            tools.register(wrapper).await;
+            match nanna_tools::skills::ScriptedToolWrapper::from_source("discover_tools", &source) {
+                Ok(wrapper) => tools.register(wrapper.with_registry(Arc::downgrade(tools))).await,
+                Err(e) => tracing::warn!(
+                    "discover_tools in {} does not parse ({e}); continuing without it",
+                    dir.display()
+                ),
+            }
         }
 }
 
@@ -464,6 +480,30 @@ mod tests {
         let error = chat_api_key(&config, "OPENROUTER_API_KEY", no_env)
             .expect_err("the Anthropic key is not OpenRouter's");
         assert!(error.to_string().contains("OPENROUTER_API_KEY"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod storage_path_tests {
+    use super::cli_storage_path;
+    use nanna_config::Config;
+
+    /// The CLI and the daemon must open the same database: with `[general]
+    /// data_dir` set, the CLI used the platform default instead.
+    #[test]
+    fn the_cli_opens_the_database_in_the_configured_data_dir() {
+        let mut config = Config::default();
+        config.general.data_dir = Some(std::path::PathBuf::from("/srv/nanna-data"));
+        assert_eq!(
+            cli_storage_path(&config),
+            std::path::Path::new("/srv/nanna-data/nanna.db")
+        );
+        config.memory.storage_path = Some(std::path::PathBuf::from("/elsewhere/x.db"));
+        assert_eq!(
+            cli_storage_path(&config),
+            std::path::Path::new("/elsewhere/x.db"),
+            "an explicit storage path still wins"
+        );
     }
 }
 

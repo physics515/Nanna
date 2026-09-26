@@ -8443,9 +8443,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (`scheduler.rs:28`, `settings.rs:454,519,550` and siblings); no `unsafe set_var` from
       commands; `import_config` must reload secrets; `search_memory` must slice on char
       boundaries (or be replaced by the daemon's `memory.search`).
-- [ ] CLI: `nanna sessions/chat/run` ignore `[general] data_dir` (`cli.rs:390`, `setup.rs:241`);
+- [x] CLI: `nanna sessions/chat/run` ignore `[general] data_dir` (`cli.rs:390`, `setup.rs:241`);
       `register_discover_tools` `.expect` on a user-editable file (`setup.rs:319`). The CLI's chat
       commands go with the chat; `run` becomes "create a card and watch it".
+      *(2026-09-26)* Both CLI storage paths now go through one `cli_storage_path`, which uses
+      `Config::resolve_data_dir` (the rule that honours `[general] data_dir`) instead of
+      `default_data_dir` — with a custom data dir set, the CLI had been opening a different
+      database from the daemon's. A `discover_tools` source that no longer parses is logged and
+      skipped instead of panicking the CLI. 1 test.
 - [x] `nanna-client`: `auto_reconnect`/`max_reconnect_attempts`/`Reconnecting` are declared and
       never read; a failed send leaves a `pending` entry (`connection.rs:28,327`). The board client
       needs reconnect for real.
