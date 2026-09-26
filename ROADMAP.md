@@ -513,7 +513,9 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             inside `pop()`), patched in ≥ 0.18.2** — reached only via `tantivy 0.26` under turso's
             exact `=0.7.2` pin, so it moves when turso does. Not reachable in shipped builds: it
             needs unwinding plus `catch_unwind`, and the release profile is `panic = "abort"`.
-      - [ ] **Monaco vendors DOMPurify 3.4.8** (`monaco-editor/esm/vs/base/browser/dompurify/`) —
+      - [x] *(2026-09-26 — `monaco-editor 0.57.0` vendors DOMPurify 3.4.15; `pnpm audit` reports
+            nothing at any level, and the gate is now `--audit-level=moderate`.)*
+            **Monaco vendors DOMPurify 3.4.8** (`monaco-editor/esm/vs/base/browser/dompurify/`) —
             four advisories up to one moderate XSS (GHSA-vxr8-fq34-vvx9; fixed ≥ 3.4.13, latest
             3.4.15). `monaco-editor 0.56.0` is the latest release. **A pnpm override would not help**:
             the package-level `dompurify` it would bump is not the code monaco runs. Re-check on the
@@ -8741,6 +8743,23 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-09-26 sweep)* `cargo update` → 57 lock changes, driven by **tauri 2.12.0** (`tauri-build`/
+     `-codegen`/`-macros`/`-plugin` 2.7.0, `tao 0.37`, `muda 0.20`, `tray-icon 0.25`) plus `aegis 0.9.20`,
+     `fancy-regex 0.19`, `brotli 9`. **`tauri-build 2.7.0` is the release carrying tauri#15831, so
+     `vendor/tauri-build` and the `[patch.crates-io]` table are retired** — the guard that was
+     written to fire on exactly this (`vendored_tauri_build_retires_…`) is replaced by
+     `tauri_build_resolves_from_crates_io_at_the_fixed_release` (registry-sourced, never ≤ 2.6.3).
+     Verified on Linux: `cargo clippy -p nanna-gui` builds with the crates.io copy and the sidecar
+     lands at `target/debug/nanna-daemon`, not under `build/`. `tauri 2.12` adds four ACL entries to
+     `gen/schemas` (`core:app:{allow,deny}-exit`, `core:window:{allow,deny}-set-fullscreen-on-monitor`),
+     committed as generated. `cargo upgrade --incompatible` offered nothing. Both pin-backs again:
+     `libc 0.2.189 → 0.2.186` and `malachite-bigint 0.12.0 → 0.9.2`.
+     GUI: `vitest 5.0.2`, `@tauri-apps/{api,cli} 2.12.0` (lockstep with the Rust side),
+     **`monaco-editor 0.57.0`, which vendors DOMPurify 3.4.15** — so `pnpm audit` is clean at every
+     level and the audit gate moved from `--audit-level=high` to `moderate` (the monaco exemption was
+     the only reason for `high`). TypeScript 7 still blocked (`vue-tsc` still 3.3.11).
+     Verified: clippy 0 warnings, **2616 Rust tests / 88 binaries, 0 failures**, 403 vitest,
+     typecheck clean, `pnpm build` clean. Toolchain pin not moved this run.
    - *(2026-09-23 sweep)* `cargo update` → 4 compatible bumps (`aegis 0.9.16 → 0.9.19`,
      `glib 0.22.9 → 0.22.10`, `libredox 0.1.24 → 0.1.25`, plus `libc`'s usual walk).
      `cargo upgrade --incompatible` offered **nothing at all** — 80 non-local packages already at
