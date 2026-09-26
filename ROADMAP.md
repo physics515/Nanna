@@ -8413,6 +8413,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       accepted that last object as a clean stop, but only closed the blocks — the object's own
       text, tool calls and `done_reason` were dropped from a reply reported as complete. It now
       goes through `on_object` like every other line. 1 test.
+      *(later)* `x-ratelimit-reset-*`: `OpenAI` sends these as Go durations (`"6m0s"`, `"250ms"`)
+      and they were parsed as bare integers — always `None` — and no error path read response
+      headers at all: every 429's `retry-after` was dropped and the caller backed off on a guess.
+      `LlmError::from_response` (now used by the ten error sites that built from the body) fills a
+      rate limit's wait from `retry-after`, else from the reset of each bucket the headers show
+      exhausted (`x-ratelimit-remaining-*` = 0; the longest), via `parse_reset_secs` (integer
+      millisecond arithmetic, rounded up). 2 tests.
 - [~] *(2026-09-26 — the Boa loop half, plus the `exec`-style cap for `python.exec` noted on the
       "Smaller" line.)* Boa has no interrupt API, so a timed-out script cannot be stopped from
       outside and its blocking thread kept spinning a core for the life of the process. Every tool

@@ -906,6 +906,29 @@ impl LlmError {
         }
     }
 
+    /// [`Self::from_api_response`] for a failed HTTP response, with the wait
+    /// the response's headers name when the body names none.
+    ///
+    /// A 429's headers are where most providers say when to come back —
+    /// Anthropic's `retry-after`, `OpenAI`'s `x-ratelimit-reset-*` — and the
+    /// error used to be built from the body alone, so every one of them was
+    /// dropped and the caller backed off on a guess.
+    pub async fn from_response(response: reqwest::Response) -> Self {
+        let status = response.status().as_u16();
+        let header_wait = retry_after_from_headers(response.headers());
+        let message = response.text().await.unwrap_or_default();
+        match Self::from_api_response(status, message) {
+            Self::RateLimit {
+                message,
+                retry_after,
+            } => Self::RateLimit {
+                message,
+                retry_after: retry_after.or(header_wait),
+            },
+            other => other,
+        }
+    }
+
     /// Parse an API error response to extract rate limit info
     #[must_use]
     pub fn from_api_response(status: u16, message: String) -> Self {
@@ -3546,9 +3569,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         };
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         let mut result: AnthropicResponse = response.json().await?;
@@ -3605,9 +3626,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
         learn_rate_limit_headers(self.provider, response.headers());
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         let result: serde_json::Value = response.json().await?;
@@ -3743,9 +3762,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         let result: serde_json::Value = response.json().await?;
@@ -4022,9 +4039,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         let result: serde_json::Value = response.json().await?;
@@ -4736,9 +4751,7 @@ impl EmbeddingClient {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         // Heal malformed embedding JSON bodies (some proxies/wrappers garble arrays).
@@ -4827,9 +4840,7 @@ impl EmbeddingClient {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+            return Err(LlmError::from_response(response).await);
         }
 
         let raw = response.text().await?;
@@ -5364,9 +5375,7 @@ impl LlmClient {
             }
 
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                yield Err(LlmError::from_api_response(status, message));
+                yield Err(LlmError::from_response(response).await);
                 return;
             }
 
@@ -5460,9 +5469,7 @@ impl LlmClient {
             learn_rate_limit_headers(provider, response.headers());
 
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                yield Err(LlmError::from_api_response(status, message));
+                yield Err(LlmError::from_response(response).await);
                 return;
             }
 
@@ -5556,9 +5563,7 @@ impl LlmClient {
             };
 
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                yield Err(LlmError::from_api_response(status, message));
+                yield Err(LlmError::from_response(response).await);
                 return;
             }
 
@@ -5721,9 +5726,7 @@ impl LlmClient {
             learn_rate_limit_headers(provider, response.headers());
 
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                yield Err(LlmError::from_api_response(status, message));
+                yield Err(LlmError::from_response(response).await);
                 return;
             }
 
@@ -6595,6 +6598,72 @@ fn legacy_embed_may_answer(status: u16, body: &str) -> bool {
             .map_or(true, |value| value.get("error").is_none())
 }
 
+/// Seconds to wait before retrying, as a rate-limited response's headers say.
+///
+/// `retry-after` wins when present (Anthropic sends it on every 429; plain
+/// seconds). Otherwise the reset of each exhausted bucket — `OpenAI`'s
+/// `x-ratelimit-remaining-{requests,tokens}` at `0` — and the longest of those,
+/// since the request needs both. A bucket not known to be exhausted says
+/// nothing about this refusal.
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(wait) = header("retry-after").and_then(parse_reset_secs) {
+        return Some(wait);
+    }
+    ["requests", "tokens"]
+        .iter()
+        .filter(|bucket| {
+            header(&format!("x-ratelimit-remaining-{bucket}")).is_some_and(|v| v.trim() == "0")
+        })
+        .filter_map(|bucket| {
+            header(&format!("x-ratelimit-reset-{bucket}")).and_then(parse_reset_secs)
+        })
+        .max()
+}
+
+/// Whole seconds (rounded up) in a reset value: plain seconds (`"20"`), or a
+/// Go-style duration as `OpenAI` sends it (`"6m0s"`, `"1.5s"`, `"250ms"`).
+/// These used to be parsed as bare integers, so every duration form was `None`.
+fn parse_reset_secs(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs);
+    }
+    let mut millis: u64 = 0;
+    let mut rest = value;
+    while !rest.is_empty() {
+        let number_len = rest.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+        let unit_len = rest[number_len..]
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(rest.len() - number_len);
+        let (number, unit) = (
+            &rest[..number_len],
+            &rest[number_len..number_len + unit_len],
+        );
+        let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+        let whole: u64 = if whole.is_empty() {
+            0
+        } else {
+            whole.parse().ok()?
+        };
+        // Milliseconds of the fraction: its first three digits, zero-padded.
+        let fraction_millis: u64 = format!("{fraction:0<3}").get(..3)?.parse().ok()?;
+        let unit_millis: u64 = match unit {
+            "h" => 3_600_000,
+            "m" => 60_000,
+            "s" => 1_000,
+            "ms" => 1,
+            "us" | "µs" | "ns" => 0,
+            _ => return None,
+        };
+        millis = millis
+            .saturating_add(whole.saturating_mul(unit_millis))
+            .saturating_add(fraction_millis.saturating_mul(unit_millis) / 1_000);
+        rest = &rest[number_len + unit_len..];
+    }
+    Some(millis.div_ceil(1_000))
+}
+
 /// The error an OpenAI-compatible stream sends in place of a chunk, if `data`
 /// is one: `{"error": {"message": …, "code": 429 | "…", "type": …}}`.
 ///
@@ -7274,6 +7343,52 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Reset values in every form providers send, rounded up to whole seconds.
+    #[test]
+    fn reset_values_parse_in_every_form() {
+        assert_eq!(parse_reset_secs("20"), Some(20));
+        assert_eq!(parse_reset_secs("6m0s"), Some(360));
+        assert_eq!(parse_reset_secs("1.5s"), Some(2));
+        assert_eq!(parse_reset_secs("250ms"), Some(1));
+        assert_eq!(parse_reset_secs("1h2m3s"), Some(3723));
+        assert_eq!(parse_reset_secs("0s"), Some(0));
+        assert_eq!(parse_reset_secs("soon"), None);
+        assert_eq!(parse_reset_secs("5x"), None);
+    }
+
+    /// `retry-after` wins; otherwise only an exhausted bucket's reset counts.
+    #[test]
+    fn a_rate_limit_waits_as_the_headers_say() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut openai = HeaderMap::new();
+        openai.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("12"),
+        );
+        openai.insert("x-ratelimit-reset-requests", HeaderValue::from_static("1s"));
+        openai.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("0"),
+        );
+        openai.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("6m0s"));
+        assert_eq!(retry_after_from_headers(&openai), Some(360));
+
+        openai.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(
+            retry_after_from_headers(&openai),
+            Some(7),
+            "retry-after wins"
+        );
+
+        let mut unknown = HeaderMap::new();
+        unknown.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("6m0s"));
+        assert_eq!(
+            retry_after_from_headers(&unknown),
+            None,
+            "not known to be exhausted"
+        );
+    }
 
     /// A non-streaming completion is held to the agent path's rules: an
     /// abort is an error, and a think block is not part of the reply.
