@@ -8570,12 +8570,23 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       "random" vectors; now `/2^24`, pinned by a range test. It feeds only latency benches, so no
       baseline moves. **Installer manifest:** orphaned (written by an agent run, referenced by
       nothing, not a workspace member) — deleted. **Still open:** `search` buffer limits.
-- [ ] **aarch64 is lint-dirty and nothing looks.** `cargo clippy -p nanna-simd --target
+- [~] **aarch64 is lint-dirty and nothing looks.** `cargo clippy -p nanna-simd --target
       aarch64-unknown-linux-gnu --all-targets` reports ~24 warnings no x86 run can see — 10 lossy
       `as` casts (owner rule: route through `nanna-numeric`), 4 `mul_add`, doc backticks, a
       wildcard `std::arch::aarch64::*`, and `wide` unused on that target (make it an
       x86_64-only dependency). The numeric edits need the NEON tests *run*, not just checked —
       qemu-user or a CI arm64 runner — so they were not changed blind (2026-09-26).
+      *(2026-09-26, later — done, with the NEON tests run.)* They run on this x86 host without a
+      cross C toolchain: the musl target links with `rust-lld` and executes under qemu-user —
+      `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64-static cargo test -p nanna-simd
+      --target aarch64-unknown-linux-musl` (17 pass, the 7 NEON ones included). The lossy casts
+      were all in tests and now build their data with lossless `f32::from(u16)`; the scalar
+      remainders use `mul_add` (fused, as the vector body already is); the wildcard import names
+      its seven intrinsics; `wide` is an `x86_64`-only dependency; `simd_tier` is `const` off
+      `x86_64`; two needless `return`s and seven doc backticks. `cargo clippy -p nanna-simd
+      --target aarch64-unknown-linux-gnu --all-targets`: 0 warnings (x86: still 0). **Still
+      open:** a CI job that runs this (nothing does yet, which is how the semicolons shipped).
 
 #### Considered and rejected — do not re-raise
 
