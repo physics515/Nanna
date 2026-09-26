@@ -379,13 +379,6 @@ pub const FOLDS_PER_CYCLE_MAX: usize = 32;
 /// after a busy day without ever scanning the whole closed history.
 pub const FOLD_SCAN_MAX: usize = FOLDS_PER_CYCLE_MAX * 8;
 
-/// Events a folded card keeps; the rest are decimated and marked.
-///
-/// Bound justification: two dozen lines is a readable account of one card's
-/// life, and at the timeline's per-event content cap it stays within what a
-/// single memory is meant to hold.
-pub const FOLD_BUDGET: usize = 24;
-
 /// A card with fewer events than this has nothing to compress: its episodes
 /// already read as a summary.
 pub const FOLD_MIN_EVENTS: usize = 3;
@@ -431,7 +424,9 @@ pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Res
         if events.len() < FOLD_MIN_EVENTS {
             continue;
         }
-        let Some(fold) = nanna_timeline::compress_episode(&events, FOLD_BUDGET) else {
+        let Some(fold) =
+            nanna_timeline::compress_episode(&events, nanna_timeline::DREAM_FOLD_BUDGET)
+        else {
             continue;
         };
         let metadata = HashMap::from([

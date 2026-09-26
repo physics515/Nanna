@@ -26,7 +26,7 @@
 use nanna_storage::{MemoryEventRow, NewMemoryEvent, Storage, StorageError};
 
 pub mod compress;
-pub use compress::{CompressedEpisode, compress_episode};
+pub use compress::{CompressedEpisode, DREAM_FOLD_BUDGET, compress_episode};
 
 /// Largest content an episode stores, in characters.
 ///

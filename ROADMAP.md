@@ -7910,7 +7910,14 @@ as its turn (`TurnAdmission`, scope default `session`).
       "Dreaming operates only on these copies" holds by construction: nothing in dreaming reads
       `task_notes`. 2 tests, one end-to-end (card → post → complete = three linked copies, none for
       a session card on the same store).
-- [~] *(2026-09-26 — steps (1), (2) and (3) landed; (4) open.)* **Step (3): the dream fold.**
+- [x] *(2026-09-26 — all four steps landed.)* **Step (4): gated.** `memory_events` joined
+      `SALVAGE_TABLES` earlier this run; two budget rows now gate the fold beside
+      `dreaming.compression` — `dreaming.timeline_compression` ≥ 0.75 (measured **0.76**: a
+      100-event fixed-seed card series folds to 24) and `dreaming.timeline_transition_retention`
+      = 1.0 (10/10 outcomes kept) — from `budget_gate_timeline_fold`, a new step in
+      `budget-gate.yml`, with rows in `BASELINE.md` Suite 3. The fold budget moved into the crate
+      as `DREAM_FOLD_BUDGET` so the number gated is the number the daemon ships.
+      **Step (3): the dream fold.**
       After each scheduled dream, `run_board_fold` (same live-mission guard, same dream latch)
       folds up to `FOLDS_PER_CYCLE_MAX` (32) of the `FOLD_SCAN_MAX` most recently closed board
       cards into ONE memory each: the card's episodes (`MemoryEventRepository::for_source`,

@@ -32,6 +32,14 @@ pub const PEAK_FLOOR: f32 = 0.5;
 /// Smallest meaningful budget: the two endpoints.
 pub const MIN_BUDGET: usize = 2;
 
+/// Events a dream keeps when it folds one card's series.
+///
+/// Bound justification: two dozen lines is a readable account of one card's
+/// life, and at the timeline's per-event content cap it stays within what a
+/// single memory is meant to hold. Shared by the daemon's fold phase and the
+/// `dreaming.timeline_*` budgets, so the number gated is the number shipped.
+pub const DREAM_FOLD_BUDGET: usize = 24;
+
 /// One series folded into one episode, with the arithmetic of the fold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompressedEpisode {
@@ -224,6 +232,36 @@ mod tests {
             .content
             .lines()
             .any(|line| line.ends_with(&format!(" event {i}")))
+    }
+
+    /// The `dreaming.timeline_compression` and
+    /// `dreaming.timeline_transition_retention` budgets (bench/budgets.toml):
+    /// a 100-event series folded at the shipped budget drops at least 75% of
+    /// its events and keeps every transition.
+    #[test]
+    fn budget_gate_timeline_fold() {
+        let events = series(2026, 100);
+        let transitions: Vec<usize> = (0..events.len())
+            .filter(|&i| events[i].kind == "outcome")
+            .collect();
+        assert!(
+            transitions.len() + MIN_BUDGET <= DREAM_FOLD_BUDGET,
+            "the corpus must leave room for every transition"
+        );
+        let folded = compress_episode(&events, DREAM_FOLD_BUDGET).expect("folds");
+        let compression = 1.0 - f64::from(u32::try_from(folded.kept).unwrap_or(u32::MAX)) / 100.0;
+        println!(
+            "dreaming.timeline_compression = {compression:.2}; transitions kept {}/{}",
+            transitions
+                .iter()
+                .filter(|&&i| contains_event(&folded, i))
+                .count(),
+            transitions.len()
+        );
+        assert!(compression >= 0.75, "compression {compression}");
+        for &i in &transitions {
+            assert!(contains_event(&folded, i), "transition {i} was dropped");
+        }
     }
 
     #[test]
