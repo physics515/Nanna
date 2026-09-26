@@ -14,7 +14,6 @@ pub mod harness;
 pub mod image_util;
 mod loop_runner;
 pub mod model_stats;
-mod multi;
 mod numeric;
 pub mod planner;
 pub mod prompts;
@@ -43,12 +42,6 @@ pub use loop_runner::{
     budget_warning_message, claim_nudge_message, is_work_evidence_tool, min_viable_num_ctx,
     narration_nudge_message, repetition_nudge_message, thinking_spiral_nudge_message,
     tool_loop_nudge_message, wrapup_nudge_due, wrapup_nudge_message,
-};
-pub use multi::{
-    AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, CriticalPathMetrics,
-    TaskStatus, SwarmConfig, SwarmResult, SwarmTaskResult,
-    // Swarm Coordinator
-    SwarmCoordinator, DecomposedTask, DomainAgent, Subtask,
 };
 pub use summarizer::{
     Summarizer,
