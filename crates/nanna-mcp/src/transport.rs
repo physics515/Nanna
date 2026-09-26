@@ -419,6 +419,21 @@ pub mod stdio {
                     }
                 }
             }
+            // Nothing will answer the calls still waiting: drop their senders
+            // so each fails now as `ConnectionClosed`, instead of every one of
+            // them sitting out the full request timeout against a dead server.
+            let orphaned = {
+                let mut waiting = pending.lock().await;
+                let orphaned = waiting.len();
+                waiting.clear();
+                orphaned
+            };
+            if orphaned > 0 {
+                warn!(
+                    orphaned,
+                    "MCP server stream ended with calls in flight; failing them now"
+                );
+            }
         }
 
         /// Deliver one server line to where its shape says it belongs.
@@ -477,7 +492,7 @@ pub mod stdio {
             }
 
             // Wait for response with timeout
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            match tokio::time::timeout(crate::MCP_REQUEST_TIMEOUT, rx).await {
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(_)) => Err(McpError::ConnectionClosed),
                 Err(_) => {
@@ -596,6 +611,44 @@ pub mod stdio {
             assert!(
                 status.is_some_and(|s| !s.success()),
                 "killed, not exited: {status:?}"
+            );
+        }
+
+        /// A server that reads the request and dies without answering. Its
+        /// waiter used to stay in `pending` and sit out the whole request
+        /// timeout; the reader now fails it the moment stdout ends.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_server_that_dies_mid_call_fails_the_call_at_once() {
+            let transport =
+                super::StdioTransport::spawn("sh", &["-c", "read line; exit 0"]).unwrap();
+            let started = std::time::Instant::now();
+            let answer = transport
+                .request(super::JsonRpcRequest::new(1_i64, "tools/list", None))
+                .await;
+            assert!(
+                matches!(answer, Err(super::McpError::ConnectionClosed)),
+                "{answer:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "failed on EOF, not after the {:?} timeout: {:?}",
+                crate::MCP_REQUEST_TIMEOUT,
+                started.elapsed()
+            );
+        }
+
+        #[test]
+        fn the_registry_deadline_sits_past_the_transport_timeout() {
+            let transport = crate::MCP_REQUEST_TIMEOUT.as_secs();
+            let registry = transport + crate::MCP_DEADLINE_MARGIN_SECS;
+            assert!(
+                registry > transport,
+                "the transport's own timeout must fire first"
+            );
+            assert_eq!(
+                crate::streamable_http::HTTP_REQUEST_TIMEOUT.as_secs(),
+                transport
             );
         }
 

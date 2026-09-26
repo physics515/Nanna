@@ -296,8 +296,12 @@ mod tools_impl {
             Ok(tool_result)
         }
 
+        /// The registry's deadline sits just past the transport's own, so the
+        /// transport's timeout — which names the server — is the one a slow
+        /// call reports, not the registry's generic one. The two used to
+        /// disagree outright: 60 s advertised here, 30 s enforced below.
         fn timeout_secs(&self) -> Option<u64> {
-            Some(60) // MCP tools may be slower
+            Some(crate::MCP_REQUEST_TIMEOUT.as_secs() + crate::MCP_DEADLINE_MARGIN_SECS)
         }
     }
 

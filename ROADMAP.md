@@ -8359,6 +8359,16 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       registered; it now follows `nextCursor`, bounded (`TOOL_LIST_PAGES_MAX` 64) and stopped by a
       repeating cursor. 2 tests (spec-shaped result with all five block kinds; three-page and
       stuck-cursor servers).
+      *(2026-09-26, later)* **Timeout and EOF.** The registry advertised 60 s for every MCP tool
+      while stdio and Streamable HTTP both gave up at 30 s — and per P24.12 the inner bound must be
+      the one that fires, so its message (which names the server) reaches the model. One
+      `MCP_REQUEST_TIMEOUT` (60 s) now feeds both transports, and the registry deadline is derived
+      from it plus `MCP_DEADLINE_MARGIN_SECS`. When a stdio server's stdout ends, the reader now
+      clears `pending`, so in-flight calls fail at once as `ConnectionClosed` instead of each
+      sitting out the full timeout against a dead process (`a_server_that_dies_mid_call_…` returns
+      in milliseconds). **Still open:** logging `tools/list` failures, and deleting the legacy
+      `HttpTransport` (its whole-request `.timeout(30 s)` would cut its own long-lived SSE GET —
+      but it is on the delete list, not the fix list).
 - [ ] Browser (kept as tools): `navigate` needs a deadline and must not hold the browser lock
       across it; `close` must close the target; `wait_for_selector` must wait; escape selectors
       (`cdp.rs:140,489`, `playwright.rs:254`).
