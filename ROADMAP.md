@@ -8285,9 +8285,20 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       nothing. Deduplicating less is the safe direction. 1 new test, 1 extended.
 - [ ] `verified_outcomes` needs a reduction path (fold read-only successes, cap by budget) and
       must be pruned when an item is reopened as regressed (`loop_runner.rs:7188`, `harness.rs:3574`).
-- [ ] `is_context_length_error` must not match provider 400s about `max_tokens`; the token-budget
+- [x] `is_context_length_error` must not match provider 400s about `max_tokens`; the token-budget
       check must run after the paid-for reply is stored; a cancel after a finalised `tool_use` must
       pair it with "[Skipped]" results (`loop_runner.rs:8130,4587,4592`).
+      *(2026-09-26)* All three. The classifier is an explicit phrase list with explicit
+      exclusions: the `400 && "token"` catch-all matched Anthropic's *output*-budget refusal
+      (`max_tokens: N > M … output tokens`), per-minute token rate limits and any 400 naming a
+      token, and each one halved the conversation — a remedy that destroys context and fixes none
+      of them. `stop_after_stored_reply` now owns both early exits after a reply is stored: the
+      budget check runs **after** the reply is stored and taken as the final text (it used to run
+      first, so the answer just paid for was discarded and the run ended on the previous round's
+      text), and a Stop or a spent budget pairs every call in the stored reply with a
+      `[Skipped: …]` result (`pair_unrun_calls`, malformed-call results included) — left unpaired,
+      the conversation's **next** request is one Anthropic rejects outright. 2 tests; the
+      classifier's is red on the old catch-all.
 - [ ] `dispatch_tool_calls` runs a turn's calls concurrently but presents them sequentially:
       either serialise writes-before-execs or say so in the results (`loop_runner.rs:7442`).
 - [ ] Model routing strips the provider prefix but always calls the primary provider

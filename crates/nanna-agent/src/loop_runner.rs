@@ -4599,7 +4599,6 @@ impl Agent {
         )
         .await;
         self.post_hoc_spiral_nudge(state, &result).await?;
-        Self::enforce_token_budget(state, options)?;
 
         let salvage = self.salvage_prose_calls(state, &mut result).await;
 
@@ -4616,11 +4615,16 @@ impl Agent {
         if !result.text.is_empty() {
             state.final_text = result.text;
         }
-        // Mid-stream cancel closes the LLM call with partial text; fold it and exit.
-        if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-            // Content blocks may already be stored above — finish_cancelled
-            // de-dupes the cancel marker message.
-            return ControlFlow::Break(RunExit::Cancelled);
+        if let Some(exit) = self
+            .stop_after_stored_reply(
+                state,
+                options,
+                &result.tool_uses,
+                &result.error_tool_results,
+            )
+            .await
+        {
+            return ControlFlow::Break(exit);
         }
 
         // If no tool calls, check for narration loop before exiting.
@@ -5783,6 +5787,78 @@ impl Agent {
             return ControlFlow::Break(RunExit::Next);
         }
         ControlFlow::Continue(())
+    }
+
+    /// The exits taken once a reply is stored, before any of its calls run:
+    /// a mid-stream cancel, then a spent token budget. Each pairs the reply's
+    /// calls with "skipped" results first, so the stored turn stays valid.
+    ///
+    /// The budget check runs HERE, after the reply is stored and taken as the
+    /// final text. It used to run first, so the reply just paid for was thrown
+    /// away and the run ended on the previous round's text.
+    async fn stop_after_stored_reply(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        tool_uses: &[(String, String, Value)],
+        error_tool_results: &[ContentBlock],
+    ) -> Option<RunExit> {
+        // Mid-stream cancel closes the LLM call with partial text; fold it and
+        // exit. finish_cancelled de-dupes the cancel marker message.
+        let (exit, why) = if options
+            .cancel
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+        {
+            (
+                RunExit::Cancelled,
+                "the user cancelled the run before this tool started",
+            )
+        } else if let ControlFlow::Break(exit) = Self::enforce_token_budget(state, options) {
+            (
+                exit,
+                "the run's token budget ran out before this tool started",
+            )
+        } else {
+            return None;
+        };
+        self.pair_unrun_calls(tool_uses, error_tool_results, why)
+            .await;
+        Some(exit)
+    }
+
+    /// Pair every call in a stored reply that will never run with a result
+    /// saying so, before the loop exits without reaching `execute_tools`.
+    ///
+    /// The stored assistant turn carries its `tool_use` blocks; left unpaired,
+    /// the NEXT request is one Anthropic rejects outright (every `tool_use`
+    /// needs its `tool_result`), so a Stop or a spent budget broke the
+    /// conversation's following turn. Malformed calls already carry their
+    /// synthesized error results, which are stored the same way.
+    async fn pair_unrun_calls(
+        &self,
+        tool_uses: &[(String, String, Value)],
+        error_tool_results: &[ContentBlock],
+        why: &str,
+    ) {
+        if tool_uses.is_empty() && error_tool_results.is_empty() {
+            return;
+        }
+        let mut blocks: Vec<ContentBlock> = tool_uses
+            .iter()
+            .map(|(id, _, _)| ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: format!("[Skipped: {why}. Nothing was executed.]"),
+                is_error: Some(true),
+            })
+            .collect();
+        blocks.extend(error_tool_results.iter().cloned());
+        debug_assert!(!blocks.is_empty(), "only called with calls to pair");
+        self.context
+            .write()
+            .await
+            .messages
+            .push(AnthropicMessage::user(blocks));
     }
 
     /// End the run once the token budget is spent; warn as it nears.
@@ -8146,13 +8222,32 @@ impl Agent {
     /// - `OpenAI`: "maximum context length" / "reduce the length"
     /// - Anthropic: "prompt is too long"
     fn is_context_length_error(error: &str) -> bool {
+        const INPUT_TOO_LONG: [&str; 8] = [
+            "context_length_exceeded",
+            "maximum context length",
+            "reduce the length",
+            "prompt is too long",
+            "too many tokens",
+            "exceeds the context length",
+            "exceeds the context window",
+            "input is too long",
+        ];
         let lower = error.to_lowercase();
-        lower.contains("context_length_exceeded")
-            || lower.contains("maximum context length")
-            || lower.contains("reduce the length")
-            || lower.contains("prompt is too long")
-            || lower.contains("too many tokens")
-            || (lower.contains("400") && lower.contains("token"))
+        // A refusal of the OUTPUT budget is not a context overflow. Anthropic's
+        // "max_tokens: N > M, which is the maximum allowed number of output
+        // tokens" is a 400 that mentions tokens, and the old catch-all
+        // `400 && "token"` matched it — so the loop halved the conversation, a
+        // remedy that destroys context and cannot fix a `max_tokens` setting.
+        // Same for a per-minute token RATE limit ("tokens per min", "TPM"):
+        // waiting fixes it, shrinking the conversation does not.
+        if lower.contains("max_tokens")
+            || lower.contains("output tokens")
+            || lower.contains("rate limit")
+            || lower.contains("per min")
+        {
+            return false;
+        }
+        INPUT_TOO_LONG.iter().any(|phrase| lower.contains(phrase))
     }
 
     /// Compress large tool results in older messages using the summarization-model
@@ -10277,6 +10372,120 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_result_ids(message: &AnthropicMessage) -> Vec<String> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A Stop, or a spent budget, after a reply with calls is stored: every
+    /// call gets a "skipped" result, or the next request carries an unpaired
+    /// `tool_use` that Anthropic rejects outright. And the budget exit keeps
+    /// the reply it just paid for as the answer.
+    #[tokio::test]
+    async fn a_stopped_round_pairs_its_calls_and_keeps_its_reply() {
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let agent = Agent::new(AgentConfig::default(), llm, Arc::new(ToolRegistry::new()));
+        let calls = vec![
+            (
+                "call-1".to_string(),
+                "read".to_string(),
+                serde_json::json!({}),
+            ),
+            (
+                "call-2".to_string(),
+                "write".to_string(),
+                serde_json::json!({}),
+            ),
+        ];
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let options = RunOptions {
+            cancel: Some(cancel),
+            ..RunOptions::default()
+        };
+        let mut state = RunState::new();
+        let exit = agent
+            .stop_after_stored_reply(&mut state, &options, &calls, &[])
+            .await;
+        assert!(matches!(exit, Some(RunExit::Cancelled)));
+        let last = agent
+            .context()
+            .await
+            .messages
+            .last()
+            .cloned()
+            .expect("a message");
+        assert_eq!(tool_result_ids(&last), ["call-1", "call-2"]);
+
+        let options = RunOptions {
+            token_budget: Some(100),
+            ..RunOptions::default()
+        };
+        let mut state = RunState::new();
+        state.input_tokens = 150;
+        state.final_text = "the reply just paid for".to_string();
+        let exit = agent
+            .stop_after_stored_reply(&mut state, &options, &calls, &[])
+            .await;
+        assert!(matches!(exit, Some(RunExit::Respond { truncated: true })));
+        assert!(
+            state.final_text.starts_with("the reply just paid for"),
+            "{}",
+            state.final_text
+        );
+        let last = agent
+            .context()
+            .await
+            .messages
+            .last()
+            .cloned()
+            .expect("a message");
+        assert_eq!(tool_result_ids(&last), ["call-1", "call-2"]);
+
+        let mut state = RunState::new();
+        assert!(
+            agent
+                .stop_after_stored_reply(&mut state, &RunOptions::default(), &calls, &[])
+                .await
+                .is_none(),
+            "a round that is not stopping pairs nothing"
+        );
+    }
+
+    /// Only an INPUT overflow halves the conversation. The old catch-all
+    /// (`400` and `token`) also matched Anthropic's output-budget refusal and
+    /// per-minute token rate limits, and destroyed context for both.
+    #[test]
+    fn only_an_input_overflow_reads_as_a_context_length_error() {
+        for overflow in [
+            "API error: 400 - prompt is too long: 210000 tokens > 200000 maximum",
+            "This model's maximum context length is 128000 tokens (context_length_exceeded)",
+            "the input length exceeds the context length",
+            "Please reduce the length of the messages.",
+        ] {
+            assert!(Agent::is_context_length_error(overflow), "{overflow}");
+        }
+        for not_overflow in [
+            "API error: 400 - max_tokens: 100000 > 64000, which is the maximum allowed number \
+             of output tokens for claude-sonnet-5",
+            "Rate limit reached for gpt-5 on tokens per min (TPM): too many tokens",
+            "API error: 400 - invalid token in request body",
+            "API error: 401 - invalid x-api-key",
+        ] {
+            assert!(
+                !Agent::is_context_length_error(not_overflow),
+                "{not_overflow}"
+            );
+        }
+    }
 
     /// Mid-stream provider errors end the call as a failure — the retry and
     /// escalation machinery only ever sees an `Err` — while ordinary events
