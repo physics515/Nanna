@@ -8542,6 +8542,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       the limit, and a runaway `while (true)` throws within about twice the timeout (the test's
       ends in 0.07 s). **Still open:** regex catastrophic backtracking (not a loop), the Python
       engine and the registry backstop for undeclared timeouts.
+      *(2026-09-26, later — the backstop, examined, no change.)* `run_under_backstop` gives every
+      tool that declares a ceiling an outer timer strictly above its own deadline
+      (`supervising_timeout_ms` = the engine's real deadline + one handoff margin), and lets a
+      tool that declares none run under its caller's cancellation — the documented design, and
+      now true of every tool family: scripted tools and MCP tools declare, and manifest skills
+      enforce their own (below). What remains is **the Python engine**: RustPython runs on its
+      own thread and a timeout abandons it rather than stopping it — the same class as the Boa
+      loop, needing an interrupt hook.
       *(2026-09-26, later)* Manifest (`tool.yaml`) skills enforce their own timeout and kill the
       whole tree. The timeout used to exist only as the registry dropping the future, which
       killed nothing: the shell and anything it started ran on, orphaned. `run_contained` now
