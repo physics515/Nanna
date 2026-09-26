@@ -8392,8 +8392,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (release build, 2026-09-26) — so a loop that could finish within its timeout never reaches
       the limit, and a runaway `while (true)` throws within about twice the timeout (the test's
       ends in 0.07 s). **Still open:** regex catastrophic backtracking (not a loop), the Python
-      engine, `SystemExit` status, manifest skills' `kill_on_drop`, and the registry backstop
-      for undeclared timeouts.
+      engine, manifest skills' `kill_on_drop`, and the registry backstop for undeclared
+      timeouts.
+      *(2026-09-26, later)* `SystemExit` carries its status: the Python wrapper swallowed it,
+      so `sys.exit(3)` — or `sys.exit('bad input')` — came back `success: true`. A non-zero or
+      message exit is now a failure naming the status (stdout before it is kept); `exit()`,
+      `exit(0)`, `exit(None)` stay successes, as to a shell. The result-extraction fallback also
+      reported success when it could not read the result back; it now says it could not. 1 test.
       *(2026-09-26, later)* `js_to_json` is bounded: 64 levels deep (`serde_json` refuses past
       128; real results are a few levels) and 1 M values in total — the depth bound alone lets a
       DAG whose levels share one sub-object (`n = {a: n, b: n}` ×40) convert 2^40 times. A tool
