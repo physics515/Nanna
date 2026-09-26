@@ -8452,7 +8452,7 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       cap; `dump_empty_step` unbounded log outside the data dir; strict `as_u64` where Boa hands
       over `f64`; `fit_image_to_limit` ignores `quality` (`bridge.rs`, `scripted.rs:83`,
       `git.rs:206`, `tasks.rs:2344`, `server.rs:916`, `image_util.rs`).
-- [~] MCP (kept, healthiest crate): transport timeout must honour the advertised 60 s and not cut
+- [x] MCP (kept, healthiest crate): transport timeout must honour the advertised 60 s and not cut
       SSE bodies; `ToolContent` must accept `resource_link`/`audio`; drain `pending` on EOF; follow
       `next_cursor`; log `tools/list` failures; drop the dead duplicates
       (`transport.rs:480,404,823`, `protocol.rs:409`, `client.rs:296,378`).
@@ -8477,6 +8477,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       in milliseconds). **Still open:** logging `tools/list` failures, and deleting the legacy
       `HttpTransport` (its whole-request `.timeout(30 s)` would cut its own long-lived SSE GET —
       but it is on the delete list, not the fix list).
+      *(2026-09-26, later — both done; the line is complete.)* The connect-time pre-fetch of
+      `tools/list` (and `resources/list`, `prompts/list`) swallowed its error with `let Ok`, so a
+      server that connected but whose listing failed simply had no tools and no trace in the log;
+      each failure is now a `warn!` naming the server and the error. The legacy `HttpTransport`
+      (≈400 lines, plus `McpClient::<HttpTransport>::connect`) is deleted: nothing in the
+      workspace or the GUI constructed it — `sse_legacy` has been the HTTP+SSE fallback since
+      2026-09-17.
 - [~] Browser (kept as tools): `navigate` needs a deadline and must not hold the browser lock
       across it; `close` must close the target; `wait_for_selector` must wait; escape selectors
       (`cdp.rs:140,489`, `playwright.rs:254`).

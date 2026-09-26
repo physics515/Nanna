@@ -300,20 +300,31 @@ impl<T: Transport> McpClient<T> {
         *self.capabilities.write().await = Some(result.capabilities.clone());
         *self.initialized.write().await = true;
 
-        if result.capabilities.tools.is_some()
-            && let Ok(tools_result) = self.list_tools_internal().await
-        {
-            *self.tools.write().await = Self::gate_tool_schemas(tools_result.tools);
+        // A failed pre-fetch leaves that list empty — for tools, a server that
+        // connected but offers nothing. That used to be silent, so "my MCP tools
+        // are missing" had no trace in the log; now it names the server and why.
+        let server = &result.server_info.name;
+        if result.capabilities.tools.is_some() {
+            match self.list_tools_internal().await {
+                Ok(tools_result) => {
+                    *self.tools.write().await = Self::gate_tool_schemas(tools_result.tools);
+                }
+                Err(e) => warn!(%server, error = %e, "MCP tools/list failed; no tools registered"),
+            }
         }
-        if result.capabilities.resources.is_some()
-            && let Ok(resources_result) = self.list_resources_internal().await
-        {
-            *self.resources.write().await = resources_result.resources;
+        if result.capabilities.resources.is_some() {
+            match self.list_resources_internal().await {
+                Ok(resources_result) => {
+                    *self.resources.write().await = resources_result.resources;
+                }
+                Err(e) => warn!(%server, error = %e, "MCP resources/list failed"),
+            }
         }
-        if result.capabilities.prompts.is_some()
-            && let Ok(prompts_result) = self.list_prompts_internal().await
-        {
-            *self.prompts.write().await = prompts_result.prompts;
+        if result.capabilities.prompts.is_some() {
+            match self.list_prompts_internal().await {
+                Ok(prompts_result) => *self.prompts.write().await = prompts_result.prompts,
+                Err(e) => warn!(%server, error = %e, "MCP prompts/list failed"),
+            }
         }
     }
 
@@ -819,22 +830,6 @@ impl McpClient<crate::StdioTransport> {
         let transport = crate::StdioTransport::spawn_with_env(program, args, env)?;
         let client = Self::new(transport);
         client.initialize().await?;
-        Ok(client)
-    }
-}
-
-#[cfg(feature = "http")]
-impl McpClient<crate::HttpTransport> {
-    /// Connect to an HTTP MCP server
-    ///
-    /// # Errors
-    ///
-    /// Returns error if connection or initialization fails
-    pub async fn connect(url: impl Into<String>) -> Result<Self> {
-        let transport = crate::HttpTransport::connect(url).await?;
-        let client = Self::new(transport);
-        // The deprecated HTTP+SSE transport predates the modern era entirely.
-        client.initialize_legacy().await?;
         Ok(client)
     }
 }
