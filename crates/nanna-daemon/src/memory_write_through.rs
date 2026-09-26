@@ -366,6 +366,108 @@ pub async fn run(
     }
 }
 
+/// Closed cards folded per dream cycle.
+///
+/// Bound justification: each fold is one bounded event read and one durable
+/// memory insert, so 32 keeps a cycle's fold phase to well under a second
+/// while a board closing a few dozen cards a day never falls behind.
+pub const FOLDS_PER_CYCLE_MAX: usize = 32;
+
+/// Most recently closed cards a cycle looks at for an unfolded one.
+///
+/// Bound justification: eight cycles' worth of folds — enough to catch up
+/// after a busy day without ever scanning the whole closed history.
+pub const FOLD_SCAN_MAX: usize = FOLDS_PER_CYCLE_MAX * 8;
+
+/// Events a folded card keeps; the rest are decimated and marked.
+///
+/// Bound justification: two dozen lines is a readable account of one card's
+/// life, and at the timeline's per-event content cap it stays within what a
+/// single memory is meant to hold.
+pub const FOLD_BUDGET: usize = 24;
+
+/// A card with fewer events than this has nothing to compress: its episodes
+/// already read as a summary.
+pub const FOLD_MIN_EVENTS: usize = 3;
+
+/// The dream fold (P25 "DSP timeline compression", step 3).
+///
+/// Each recently closed board card's episode series becomes ONE memory,
+/// carrying the lineage back to the card. The thread itself is never touched
+/// (decision 14); only its episodes are read.
+///
+/// Idempotent: a card that already has a fold is skipped, so re-running a
+/// cycle writes nothing twice. Returns how many cards were folded.
+///
+/// # Errors
+/// Returns a message when the store cannot be read or a memory write fails;
+/// folds written before the failure stay written.
+pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Result<usize, String> {
+    let already: std::collections::HashSet<String> = memory
+        .list_all()
+        .await
+        .into_iter()
+        .filter(|m| m.metadata.get("board_event").map(String::as_str) == Some("episode"))
+        .filter_map(|m| m.metadata.get("source_task_id").cloned())
+        .collect();
+    let cards = storage
+        .tasks()
+        .closed_board_cards(FOLD_SCAN_MAX)
+        .await
+        .map_err(|e| format!("listing closed cards: {e}"))?;
+    let mut folded = 0usize;
+    for card in cards {
+        if folded == FOLDS_PER_CYCLE_MAX {
+            break;
+        }
+        if already.contains(&card.id.to_string()) {
+            continue;
+        }
+        let events = storage
+            .memory_events()
+            .for_source(&format!("task:{}", card.id), nanna_storage::MAX_EVENT_PAGE)
+            .await
+            .map_err(|e| format!("reading card #{}'s episodes: {e}", card.id))?;
+        if events.len() < FOLD_MIN_EVENTS {
+            continue;
+        }
+        let Some(fold) = nanna_timeline::compress_episode(&events, FOLD_BUDGET) else {
+            continue;
+        };
+        let metadata = HashMap::from([
+            ("source".to_string(), "task_board".to_string()),
+            ("source_task_id".to_string(), card.id.to_string()),
+            ("board_event".to_string(), "episode".to_string()),
+            ("episode_events".to_string(), events.len().to_string()),
+            ("episode_kept".to_string(), fold.kept.to_string()),
+        ]);
+        let content = format!(
+            "The story of card #{} \"{}\" ({} events, {} shown):\n{}",
+            card.id,
+            card.title,
+            events.len(),
+            fold.kept,
+            fold.episode.content
+        );
+        memory
+            .remember_deferred_vector(
+                &content,
+                metadata,
+                FOLD_IMPORTANCE,
+                fold.episode.workspace_id,
+            )
+            .await
+            .map_err(|e| format!("writing card #{}'s folded episode: {e}", card.id))?;
+        folded += 1;
+    }
+    debug_assert!(folded <= FOLDS_PER_CYCLE_MAX, "the fold phase is bounded");
+    Ok(folded)
+}
+
+/// Importance of a folded card, above a single copy's: it is the account of a
+/// whole card, the memory recall should prefer over any one of its posts.
+const FOLD_IMPORTANCE: f32 = 4.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +565,72 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         storage.memory_events().recent(50).await.expect("events")
+    }
+
+    /// Step 3: a closed card's series folds into ONE memory that points back
+    /// at the card; a second cycle writes nothing twice; a card with too few
+    /// events is left as it is; and `task:1`'s fold never reads `task:10`'s.
+    #[tokio::test]
+    async fn a_closed_cards_series_folds_once_into_one_memory() {
+        let memory = Arc::new(MemoryService::new(
+            nanna_memory::MemoryServiceConfig::default(),
+        ));
+        let storage = board_feeding(Some(Arc::clone(&memory))).await;
+        let tasks = storage.tasks();
+        let card = |title: &str| NewTask {
+            scope: "workspace".to_string(),
+            scope_id: Some("ws1".to_string()),
+            title: title.to_string(),
+            priority: 3,
+            ..NewTask::default()
+        };
+        let busy = tasks.create(card("busy")).await.expect("card");
+        for n in 0..4 {
+            tasks
+                .post(
+                    busy.id,
+                    Some("gui"),
+                    None,
+                    TaskNoteKind::Progress,
+                    &format!("step {n}"),
+                )
+                .await
+                .expect("post");
+        }
+        tasks
+            .complete(busy.id, Some("gui"), None)
+            .await
+            .expect("complete");
+        let quiet = tasks.create(card("quiet")).await.expect("card");
+        tasks
+            .complete(quiet.id, Some("gui"), None)
+            .await
+            .expect("complete");
+        // busy: 4 posts + its verdict; quiet: its verdict.
+        assert_eq!(wait_for_episodes(&storage, 6).await.len(), 6);
+
+        let folded = fold_closed_cards(&storage, &memory).await.expect("fold");
+        assert_eq!(folded, 1, "only the card with a series worth folding");
+        let folds: Vec<_> = memory
+            .list_all()
+            .await
+            .into_iter()
+            .filter(|m| m.metadata.get("board_event").map(String::as_str) == Some("episode"))
+            .collect();
+        assert_eq!(folds.len(), 1);
+        assert_eq!(
+            folds[0].metadata.get("source_task_id"),
+            Some(&busy.id.to_string())
+        );
+        assert!(folds[0].content.contains("step 3"), "{}", folds[0].content);
+        assert!(!folds[0].content.contains("quiet"), "{}", folds[0].content);
+        assert_eq!(folds[0].workspace_id.as_deref(), Some("ws1"));
+
+        assert_eq!(
+            fold_closed_cards(&storage, &memory).await.expect("fold"),
+            0,
+            "idempotent"
+        );
     }
 
     /// The timeline half: a card's thread is an event series. Each post is a

@@ -870,6 +870,42 @@ impl TaskRepository {
         Ok(notes)
     }
 
+    /// The `limit` most recently closed board cards (done or cancelled, any
+    /// scope but `session`), newest first — the dream fold's candidates.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0.
+    pub async fn closed_board_cards(&self, limit: usize) -> Result<Vec<Task>, StorageError> {
+        assert!(
+            limit > 0,
+            "a scan for closed cards is bounded and non-empty"
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TASK_COLUMNS} FROM tasks \
+                     WHERE status IN ('done', 'cancelled') AND scope != 'session' \
+                     ORDER BY COALESCE(completed_at, updated_at) DESC, id DESC LIMIT ?1"
+                ),
+                turso::params![limit],
+            )
+            .await?;
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next().await? {
+            cards.push(decode_task_row(&row)?);
+        }
+        drop(rows);
+        drop(conn);
+        debug_assert!(cards.iter().all(|t| is_closed_status(&t.status)));
+        Ok(cards)
+    }
+
     /// One thread post by its id.
     ///
     /// Task events name a post by id rather than carrying it (the bus is not a

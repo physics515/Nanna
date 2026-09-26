@@ -7910,7 +7910,18 @@ as its turn (`TurnAdmission`, scope default `session`).
       "Dreaming operates only on these copies" holds by construction: nothing in dreaming reads
       `task_notes`. 2 tests, one end-to-end (card → post → complete = three linked copies, none for
       a session card on the same store).
-- [~] *(2026-09-26 — steps (1) and (2) landed; (3)–(4) open.)* **Step (2):
+- [~] *(2026-09-26 — steps (1), (2) and (3) landed; (4) open.)* **Step (3): the dream fold.**
+      After each scheduled dream, `run_board_fold` (same live-mission guard, same dream latch)
+      folds up to `FOLDS_PER_CYCLE_MAX` (32) of the `FOLD_SCAN_MAX` most recently closed board
+      cards into ONE memory each: the card's episodes (`MemoryEventRepository::for_source`,
+      matched on the quoted lineage id so `task:1` never reads `task:10`) through
+      `compress_episode(…, 24)`, stored with `board_event = episode` and `source_task_id`, at
+      importance 4 (above a single post's copy). Idempotent — a card with a fold is skipped — and
+      a card with fewer than 3 episodes is left alone; the thread itself is never read, only its
+      episodes (decision 14). Deterministic and model-free, so it runs whether or not the
+      model-driven cycle consolidated anything. **Known gap:** a card reopened and closed again
+      keeps its first fold; re-folding on a new verdict is the obvious follow-up. 2 tests.
+      **Step (2):
       `nanna_timeline::compress_episode(events, budget)`** — pure, deterministic, no model, no
       clock. Keeps both endpoints, every `outcome` (a transition), and every local salience peak ≥
       `PEAK_FLOOR` (0.5 — an ordinary comment's salience, so a peak among progress lines is noise);

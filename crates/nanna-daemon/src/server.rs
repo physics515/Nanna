@@ -2581,6 +2581,36 @@ async fn run_scheduled_consolidation(
     outcome
 }
 
+/// The board fold (P25 DSP step 3), run right after each scheduled dream.
+///
+/// It writes memories, so it takes the same guards the dream does: skipped
+/// while a harness run is live, and only with the dream latch claimed.
+/// Deterministic and model-free, so it runs whether or not the model-driven
+/// cycle found anything to consolidate.
+async fn run_board_fold(
+    dreaming: Option<&Arc<nanna_memory::DreamingService>>,
+    storage: Option<&Arc<nanna_storage::Storage>>,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    dream_in_flight: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    let (Some(dreaming), Some(storage)) = (dreaming, storage) else {
+        return;
+    };
+    if chat_runs.any_active().await
+        || dream_in_flight.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let folded =
+        crate::memory_write_through::fold_closed_cards(storage, &dreaming.memory_arc()).await;
+    dream_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+    match folded {
+        Ok(0) => {}
+        Ok(count) => info!("Dream fold: {count} closed cards folded into memory"),
+        Err(e) => warn!("Dream fold failed: {e}"),
+    }
+}
+
 /// One dream cycle, with the latch already claimed by the caller.
 ///
 /// The idle gate AND the full cycle (feedback flush -> FSRS testing-effect
@@ -3624,7 +3654,7 @@ impl DaemonServer {
                 let started_at = chrono::Utc::now();
                 let (success, output, error) = match task.name.as_str() {
                     "memory_consolidation" => {
-                        run_scheduled_consolidation(
+                        let outcome = run_scheduled_consolidation(
                             dreaming.as_ref(),
                             &agent,
                             &router,
@@ -3633,7 +3663,15 @@ impl DaemonServer {
                             &dream_in_flight,
                             dream,
                         )
-                        .await
+                        .await;
+                        run_board_fold(
+                            dreaming.as_ref(),
+                            storage.as_ref(),
+                            &chat_runs,
+                            &dream_in_flight,
+                        )
+                        .await;
+                        outcome
                     }
                     TASK_RECURRENCE_SWEEP_TASK => run_recurrence_sweep(storage.as_ref()).await,
                     TOOL_CALL_LOG_PRUNE_TASK => run_tool_call_log_prune(storage.as_ref()).await,
