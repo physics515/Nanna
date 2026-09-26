@@ -8391,6 +8391,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       detection like the streaming path; `embed_ollama_one` must read the error body before falling
       back; `x-ratelimit-reset-*` parsing, `think` on the stream body, `done:true` without newline
       (`nanna-llm/src/lib.rs:5096,7165,6593,3977,4815,4364,5603,6330`).
+      *(2026-09-26, later — the OpenAI-format one.)* An error envelope sent in place of a chunk
+      (`data: {"error":{"code":429,…}}` — `OpenRouter` does this when an upstream fails after the
+      `200` is out) decoded as no chunk, was skipped, and the stream ended as an empty `end_turn`
+      reply: a silent "success", never retried, never the 429 it was. `stream_error_envelope`
+      now turns it into the error a response status would have been (numeric `code` when it is an
+      HTTP status, else 429 for a rate-limit `type`, else 500, then `from_api_response`), and both
+      OpenAI-format streams (`stream_openai`, `stream_anthropic_via_openai`) end with it. 1 test.
 - [~] *(2026-09-26 — the Boa loop half, plus the `exec`-style cap for `python.exec` noted on the
       "Smaller" line.)* Boa has no interrupt API, so a timed-out script cannot be stopped from
       outside and its blocking thread kept spinning a core for the life of the process. Every tool

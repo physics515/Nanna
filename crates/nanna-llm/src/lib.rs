@@ -5464,7 +5464,13 @@ impl LlmClient {
                     let line = buffer[..line_end].trim().to_string();
                     buffer = buffer[line_end + 1..].to_string();
 
-                    let (events, finished) = state.on_line::<OpenAiChunkDelta>(&line);
+                    let (events, finished) = match state.on_line::<OpenAiChunkDelta>(&line) {
+                        Ok(translated) => translated,
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    };
                     for event in events {
                         yield Ok(event);
                     }
@@ -5721,7 +5727,13 @@ impl LlmClient {
                     let line = buffer[..line_end].trim().to_string();
                     buffer = buffer[line_end + 1..].to_string();
 
-                    let (events, finished) = state.on_line::<OpenAiRoleCheckedDelta>(&line);
+                    let (events, finished) = match state.on_line::<OpenAiRoleCheckedDelta>(&line) {
+                        Ok(translated) => translated,
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    };
                     for event in events {
                         yield Ok(event);
                     }
@@ -6539,6 +6551,43 @@ struct OpenAiFunctionDelta {
     arguments: Option<String>,
 }
 
+/// The error an OpenAI-compatible stream sends in place of a chunk, if `data`
+/// is one: `{"error": {"message": …, "code": 429 | "…", "type": …}}`.
+///
+/// `OpenRouter` sends exactly this mid-stream when an upstream rate-limits or
+/// fails after the `200` is already out; `OpenAI` does for server errors. It
+/// decodes as no chunk, so it used to be skipped as noise, the stream ran to its
+/// end, and the caller got an empty reply ending `end_turn` — a "successful"
+/// silence, never retried, never classified as the 429 it was. The status is the
+/// numeric `code` when it is an HTTP status, else 429 for a rate-limit `type`,
+/// else 500; the message then classifies exactly as a response status would.
+fn stream_error_envelope(data: &str) -> Option<LlmError> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let error = value.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| error.to_string(), str::to_string);
+    let kind = error
+        .get("type")
+        .or_else(|| error.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let status = error
+        .get("code")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(|code| (400..=599).contains(code))
+        .unwrap_or_else(|| {
+            if kind.contains("rate_limit") {
+                429
+            } else {
+                500
+            }
+        });
+    Some(LlmError::from_api_response(status, message))
+}
+
 /// Block bookkeeping while translating an OpenAI-compatible SSE stream into
 /// Anthropic stream events: text is block 0, tool call `i` is block `i + 1`.
 #[derive(Default)]
@@ -6567,23 +6616,31 @@ impl OpenAiStreamState {
     /// Translate one SSE line into the events to yield, in order, and whether
     /// the message ended (`[DONE]` or a `finish_reason`). Lines that are not
     /// `data:` lines, and chunks that do not decode as `D`, yield nothing.
-    fn on_line<D>(&mut self, line: &str) -> (Vec<StreamEvent>, bool)
+    ///
+    /// # Errors
+    ///
+    /// An error envelope in place of a chunk (see [`stream_error_envelope`]),
+    /// classified as the same error in a response status would be.
+    fn on_line<D>(&mut self, line: &str) -> Result<(Vec<StreamEvent>, bool), LlmError>
     where
         D: serde::de::DeserializeOwned + Into<OpenAiChunkDelta>,
     {
         let Some(data) = line.strip_prefix("data: ") else {
-            return (Vec::new(), false);
+            return Ok((Vec::new(), false));
         };
+        if let Some(error) = stream_error_envelope(data) {
+            return Err(error);
+        }
 
         if data == "[DONE]" {
             // Close any open blocks
             let mut events = self.close_blocks();
             events.push(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
-            return (events, true);
+            return Ok((events, true));
         }
 
         let Ok(chunk) = serde_json::from_str::<OpenAiStreamChunk<D>>(data) else {
-            return (Vec::new(), false);
+            return Ok((Vec::new(), false));
         };
         let mut events = Vec::new();
         for choice in chunk.choices {
@@ -6601,10 +6658,10 @@ impl OpenAiStreamState {
                     other => other,
                 };
                 events.push(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
-                return (events, true);
+                return Ok((events, true));
             }
         }
-        (events, false)
+        Ok((events, false))
     }
 
     /// Append the events for one choice delta: text, then tool-call starts and
@@ -7173,6 +7230,47 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A mid-stream error envelope is the error it names — classified, so a
+    /// 429 is a rate limit — not a chunk to skip on the way to an empty reply.
+    #[test]
+    fn a_stream_error_envelope_is_an_error_not_an_empty_reply() {
+        let mut state = OpenAiStreamState::default();
+        let rate = state.on_line::<OpenAiChunkDelta>(
+            r#"data: {"error":{"code":429,"message":"Provider returned error: rate-limited upstream"}}"#,
+        );
+        assert!(matches!(rate, Err(LlmError::RateLimit { .. })), "{rate:?}");
+
+        let typed = stream_error_envelope(
+            r#"{"error":{"message":"slow down","type":"rate_limit_exceeded","code":null}}"#,
+        );
+        assert!(
+            matches!(typed, Some(LlmError::RateLimit { .. })),
+            "{typed:?}"
+        );
+        let server = stream_error_envelope(r#"{"error":{"message":"boom","type":"server_error"}}"#);
+        assert!(
+            matches!(server, Some(LlmError::Api { status: 500, ref message }) if message == "boom"),
+            "{server:?}"
+        );
+
+        // Ordinary chunks and the terminator are untouched.
+        let text = state
+            .on_line::<OpenAiChunkDelta>(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#)
+            .expect("a chunk");
+        assert!(!text.1);
+        assert!(
+            text.0
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "hi"))
+        );
+        assert!(
+            state
+                .on_line::<OpenAiChunkDelta>("data: [DONE]")
+                .expect("done")
+                .1
+        );
+    }
 
     // -----------------------------------------------------------------
     // GGUF metadata, which is namespaced by architecture
