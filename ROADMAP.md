@@ -8112,9 +8112,27 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       all three verbs. `memory_search_and_list_agree_on_the_global_scope` was confirmed red on the
       old parse (`["global","scoped"]` vs `["global"]`). The GUI sends no scope to search, so it is
       unaffected.
-- [ ] Migrations: wrap each in a transaction where turso allows, or make `ADD COLUMN` idempotent
+- [x] Migrations: wrap each in a transaction where turso allows, or make `ADD COLUMN` idempotent
       by probing `pragma_table_info` first; add `memory_events` to `SALVAGE_TABLES`; salvage by
       column name, not position (`migrations.rs:111`, `recovery.rs:51,383`).
+      *(2026-09-26)* **Both halves, after probing what turso 0.6.1 really does** (a rolled-back
+      `CREATE TABLE` and `ADD COLUMN` both vanish; `INSERT OR REPLACE` and `pragma_table_info`
+      work). Each migration and its `_migrations` row now commit together in one transaction
+      (`apply_migrations`), and an `ADD COLUMN` whose column already exists is skipped with a WARN
+      (`add_column_target` + `column_exists`) — the transaction stops new half-applied databases,
+      the probe rescues ones half-applied before it. `every_shipped_add_column_is_probeable` keeps
+      the parser honest against every shipped migration. The loop's `SELECT` cursor is now dropped
+      before the writes (it was safe only because an unapplied check had already exhausted it).
+      **Salvage was missing two tables, not one:** `memory_events` *and* `members` — so a page-level
+      recovery dropped every custom agent and left cards assigned to ids that no longer resolve
+      (`tasks.assignee` is a hard reference since 017). `every_migrated_table_is_salvaged` now
+      derives the list from the migrations. Salvage matches columns **by name** (a quarantined
+      file can predate a migration — pre-021 `task_activity` failed every row on width) and uses
+      `OR REPLACE`, because the fresh store is seeded: a user's renamed `human` must win over the
+      default instead of being skipped as a duplicate. **Side-find:** the deeper migrate future
+      tripped `recursion_depth_exceeding_limit` (rust#159228) in every test root holding a
+      `Storage` future; boxing it as `dyn Future + Send` ends the proof there instead of adding
+      `recursion_limit` to each consumer. 7 tests.
 - [ ] `prune_tool_call_log` cutoff format; hourly vs daily tool aggregates disagree on
       short-circuited calls; `create_gui_session_with_workspace` unescaped JSON; `tasks.rs:828`
       `clear` treating a read error as "already deleted" (`nanna-storage/src/lib.rs:1226,1034,229`).

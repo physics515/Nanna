@@ -24,7 +24,7 @@ pub use tasks::*;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 use turso::{Builder, Connection};
 
 #[derive(Error, Debug)]
@@ -127,32 +127,18 @@ impl Storage {
         )
         .await?;
 
-        // Run migrations
-        for (name, sql) in migrations::MIGRATIONS {
-            let mut rows = conn
-                .query("SELECT 1 FROM _migrations WHERE name = ?1", turso::params![*name])
-                .await?;
-
-            let applied = rows.next().await?.is_some();
-
-            if !applied {
-                info!("Running migration: {}", name);
-                // Execute each statement in the migration — split by a lexer
-                // that knows comments and quotes, not by every ';'.
-                for statement in migrations::split_statements(sql) {
-                    conn.execute(&statement, ()).await?;
-                }
-                conn.execute(
-                    "INSERT INTO _migrations (name, applied_at) VALUES (?1, datetime('now'))",
-                    turso::params![*name],
-                )
-                .await?;
-            }
-        }
+        // Boxed as `dyn Future + Send` so proving `Storage::new` is `Send` stops
+        // here. Unboxed, the proof walks every nested migration future and
+        // overruns the solver's depth limit (the future-incompatible
+        // `recursion_depth_exceeding_limit`, rust#159228) in every crate and
+        // test that holds a `Storage` future — one allocation per boot instead.
+        let run: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + '_>,
+        > = Box::pin(apply_migrations(&conn, migrations::MIGRATIONS));
+        let result = run.await;
         // Held across every migration and its `_migrations` record.
         drop(conn);
-
-        Ok(())
+        result
     }
 
     /// Get connection reference
@@ -445,6 +431,91 @@ impl Storage {
     }
 }
 
+/// Apply every migration in `migrations` that `_migrations` does not record,
+/// each inside its own transaction.
+///
+/// A migration and its `_migrations` row commit together or not at all. Before
+/// this, a failure between two statements left half a migration applied and
+/// unrecorded, so every later boot re-ran it from the top and died on the first
+/// statement that had already landed (`duplicate column name` is the usual
+/// one). Turso rolls DDL back (verified: a rolled-back `CREATE TABLE` and
+/// `ADD COLUMN` both vanish), so the transaction is the real fix; the
+/// `ADD COLUMN` probe covers databases that were half-migrated before it.
+///
+/// # Errors
+/// Returns the first failing statement's error, after rolling its migration back.
+pub(crate) async fn apply_migrations(
+    conn: &Connection,
+    migrations: &[(&str, &str)],
+) -> Result<(), StorageError> {
+    for (name, sql) in migrations {
+        debug_assert!(!name.is_empty(), "a migration has a name");
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM _migrations WHERE name = ?1",
+                turso::params![*name],
+            )
+            .await?;
+        let applied = rows.next().await?.is_some();
+        // An open cursor on this connection swallows later writes.
+        drop(rows);
+        if applied {
+            continue;
+        }
+        info!("Running migration: {}", name);
+        conn.execute("BEGIN", ()).await?;
+        match apply_one_migration(conn, name, sql).await {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await?;
+            }
+            Err(e) => {
+                if let Err(rollback) = conn.execute("ROLLBACK", ()).await {
+                    warn!("Rolling back migration {name} failed too: {rollback}");
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One migration's statements plus its `_migrations` row, inside the caller's
+/// transaction.
+async fn apply_one_migration(conn: &Connection, name: &str, sql: &str) -> Result<(), StorageError> {
+    // Split by a lexer that knows comments and quotes, not by every ';'.
+    for statement in migrations::split_statements(sql) {
+        if let Some((table, column)) = migrations::add_column_target(&statement)
+            && column_exists(conn, &table, &column).await?
+        {
+            warn!(
+                "Migration {name}: {table}.{column} already exists (a partial earlier run); skipping its ADD COLUMN"
+            );
+            continue;
+        }
+        conn.execute(&statement, ()).await?;
+    }
+    conn.execute(
+        "INSERT INTO _migrations (name, applied_at) VALUES (?1, datetime('now'))",
+        turso::params![name],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Whether `table` currently has a column named `column` (case-insensitive,
+/// as SQLite identifiers are).
+async fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StorageError> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM pragma_table_info(?1) WHERE lower(name) = lower(?2)",
+            turso::params![table, column],
+        )
+        .await?;
+    let exists = rows.next().await?.is_some();
+    drop(rows);
+    Ok(exists)
+}
+
 /// Byte offset at or below `max_bytes` that a slice can end on.
 ///
 /// A session id is whatever the caller stored: `nanna chat --session <ID>` and
@@ -465,6 +536,97 @@ const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn table_names(conn: &Connection) -> Vec<String> {
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+                (),
+            )
+            .await
+            .expect("schema");
+        let mut names = Vec::new();
+        while let Some(row) = rows.next().await.expect("row") {
+            names.push(row.get::<String>(0).expect("name"));
+        }
+        names
+    }
+
+    async fn recorded(conn: &Connection, name: &str) -> bool {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM _migrations WHERE name = ?1",
+                turso::params![name],
+            )
+            .await
+            .expect("query");
+        rows.next().await.expect("row").is_some()
+    }
+
+    /// A migration that fails part-way used to leave its first statements
+    /// applied and itself unrecorded, so every later boot re-ran it and died on
+    /// what had already landed. Now it commits whole or not at all.
+    #[tokio::test]
+    async fn a_failing_migration_leaves_no_trace() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let conn = storage.conn().lock().await;
+        let broken: &[(&str, &str)] = &[(
+            "900_broken",
+            "CREATE TABLE half_done (id INTEGER); ALTER TABLE half_done ADD COLUMN x TEXT; \
+             INSERT INTO no_such_table VALUES (1);",
+        )];
+        assert!(apply_migrations(&conn, broken).await.is_err());
+        assert!(
+            !table_names(&conn).await.contains(&"half_done".to_string()),
+            "rolled back"
+        );
+        assert!(!recorded(&conn, "900_broken").await);
+
+        // The same name, fixed, applies cleanly on the next boot.
+        let fixed: &[(&str, &str)] = &[(
+            "900_broken",
+            "CREATE TABLE half_done (id INTEGER); ALTER TABLE half_done ADD COLUMN x TEXT;",
+        )];
+        apply_migrations(&conn, fixed)
+            .await
+            .expect("the fixed migration applies");
+        let is_recorded = recorded(&conn, "900_broken").await;
+        drop(conn);
+        assert!(is_recorded);
+    }
+
+    /// A database half-migrated before migrations ran in a transaction: the
+    /// column landed, the record did not. The ADD COLUMN probe lets the rerun
+    /// through instead of wedging every boot on `duplicate column name`.
+    #[tokio::test]
+    async fn a_half_applied_add_column_is_not_fatal() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let conn = storage.conn().lock().await;
+        conn.execute("CREATE TABLE legacy (id INTEGER)", ())
+            .await
+            .expect("create");
+        conn.execute("ALTER TABLE legacy ADD COLUMN landed TEXT", ())
+            .await
+            .expect("the half that landed");
+        let rerun: &[(&str, &str)] = &[(
+            "901_partial",
+            "ALTER TABLE legacy ADD COLUMN landed TEXT; ALTER TABLE legacy ADD COLUMN missing TEXT;",
+        )];
+        apply_migrations(&conn, rerun)
+            .await
+            .expect("the rerun completes");
+        let is_recorded = recorded(&conn, "901_partial").await;
+        let missing_added = column_exists(&conn, "legacy", "missing")
+            .await
+            .expect("probe");
+        let landed_seen = column_exists(&conn, "LEGACY", "Landed")
+            .await
+            .expect("probe");
+        drop(conn);
+        assert!(is_recorded);
+        assert!(missing_added, "the half that had not landed is applied");
+        assert!(landed_seen, "the probe is case-insensitive");
+    }
 
     /// Usage rolls up per day and per month, prices from the 1-hour column, and
     /// ignores what falls outside the window.

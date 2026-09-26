@@ -787,9 +787,85 @@ fn push_statement(statements: &mut Vec<String>, current: &mut String) {
     current.clear();
 }
 
+/// `(table, column)` when `statement` is `ALTER TABLE <table> ADD [COLUMN]
+/// <column> …`, else `None`.
+///
+/// The one DDL form SQLite cannot make idempotent in the statement itself —
+/// there is no `ADD COLUMN IF NOT EXISTS` — so a database that applied half a
+/// migration before migrations ran in a transaction fails every later boot
+/// with `duplicate column name`. `Storage::migrate` asks this, then probes the
+/// live schema and skips an ADD whose column is already there. Identifiers are
+/// matched case-insensitively and may be quoted with `"`, `` ` `` or `[]`.
+#[must_use]
+pub fn add_column_target(statement: &str) -> Option<(String, String)> {
+    let mut words = statement.split_whitespace();
+    let mut keyword = |expected: &str| {
+        words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case(expected))
+    };
+    if !(keyword("ALTER") && keyword("TABLE")) {
+        return None;
+    }
+    let table = unquote(words.next()?);
+    if !words.next()?.eq_ignore_ascii_case("ADD") {
+        return None;
+    }
+    let mut column = words.next()?;
+    if column.eq_ignore_ascii_case("COLUMN") {
+        column = words.next()?;
+    }
+    let column = unquote(column);
+    debug_assert!(
+        !table.is_empty() && !column.is_empty(),
+        "both names are words"
+    );
+    Some((table, column))
+}
+
+/// An identifier without its SQL quoting.
+fn unquote(word: &str) -> String {
+    word.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'))
+        .to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MIGRATIONS, split_statements};
+    use super::{MIGRATIONS, add_column_target, split_statements};
+
+    #[test]
+    fn add_column_targets_are_recognised_and_nothing_else_is() {
+        let target = |t: &str, c: &str| Some((t.to_string(), c.to_string()));
+        assert_eq!(
+            add_column_target("ALTER TABLE tasks ADD COLUMN deadline_at TEXT"),
+            target("tasks", "deadline_at")
+        );
+        assert_eq!(
+            add_column_target("alter  table \"Tasks\"\n  add `Due` TEXT DEFAULT 'x'"),
+            target("tasks", "due"),
+            "case, quoting, COLUMN omitted and line breaks"
+        );
+        assert_eq!(add_column_target("ALTER TABLE tasks RENAME TO cards"), None);
+        assert_eq!(add_column_target("CREATE TABLE t (x TEXT)"), None);
+        assert_eq!(add_column_target("ALTER TABLE"), None);
+    }
+
+    /// Every ADD COLUMN a shipped migration runs must be one the probe can
+    /// see, or a half-applied database would still wedge on it.
+    #[test]
+    fn every_shipped_add_column_is_probeable() {
+        for (name, sql) in MIGRATIONS {
+            for statement in split_statements(sql) {
+                let lower = statement.to_ascii_lowercase();
+                if lower.starts_with("alter table") && lower.contains(" add ") {
+                    assert!(
+                        add_column_target(&statement).is_some(),
+                        "{name}: `{statement}` is an ADD the probe cannot parse"
+                    );
+                }
+            }
+        }
+    }
 
     /// Strip `--` line comments the way a reader does, so what is left is the
     /// SQL the database would actually see.
