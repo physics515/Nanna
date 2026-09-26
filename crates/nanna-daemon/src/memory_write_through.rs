@@ -15,6 +15,13 @@
 //! order. A full queue is reported, never waited on: the sink is called from
 //! the task store's write path, and that path must not block.
 //!
+//! **The same events feed the episodic timeline** (`memory_events`, via
+//! `nanna_timeline`): every thread post as a `message` episode and every status
+//! change or verdict as an `outcome`, each carrying the card (and post) ids as
+//! its lineage. A card's thread is an event series — this is the raw series
+//! the DSP compression step will fold (P25 "DSP timeline compression", step 1).
+//! The timeline needs only storage, so it is fed even when memory is disabled.
+//!
 //! **Board cards only.** A `session`-scoped task is chat scaffolding — the
 //! harness writes dozens per turn — and P25 decision 9 deletes that scope.
 //! Copying those would flood memory with plan steps; they are skipped until
@@ -77,6 +84,115 @@ impl Trigger {
                 .map(|note_id| Self::Posted { note_id }),
             _ => None,
         }
+    }
+}
+
+/// Which timeline episode a store event becomes, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeTrigger {
+    /// A thread post: a turn of the card's conversation.
+    Posted { note_id: i64 },
+    /// The card changed status, or a verdict closed it.
+    Transition,
+}
+
+impl EpisodeTrigger {
+    /// The episode trigger for `event`, or `None`. Board cards only, as for
+    /// memory copies.
+    #[must_use]
+    pub fn of(event: &TaskEvent) -> Option<Self> {
+        if event.scope == "session" {
+            return None;
+        }
+        match event.kind {
+            TaskEventKind::Posted => event
+                .detail
+                .get("note_id")
+                .and_then(serde_json::Value::as_i64)
+                .map(|note_id| Self::Posted { note_id }),
+            TaskEventKind::StatusChanged | TaskEventKind::Verdict => Some(Self::Transition),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the write-through worker has anything to do for `event`: a memory
+/// copy, a timeline episode, or both. The sink queues only these.
+#[must_use]
+pub fn is_board_record(event: &TaskEvent) -> bool {
+    Trigger::of(event).is_some() || EpisodeTrigger::of(event).is_some()
+}
+
+/// Salience of a thread post by its kind.
+///
+/// Salience decides which episodes survive decimation, so it ranks by how much
+/// a post changes the card's course: a verdict decides it and a question
+/// blocks it; a comment informs; a progress line is the most compressible.
+const fn post_salience(kind: nanna_storage::TaskNoteKind) -> f32 {
+    match kind {
+        nanna_storage::TaskNoteKind::Verdict => 0.9,
+        nanna_storage::TaskNoteKind::Question => 0.8,
+        nanna_storage::TaskNoteKind::Comment => 0.5,
+        nanna_storage::TaskNoteKind::Progress => 0.3,
+    }
+}
+
+/// The timeline episode for `trigger` on `task`. Pure.
+#[must_use]
+pub fn board_episode(
+    task: &Task,
+    event: &TaskEvent,
+    trigger: EpisodeTrigger,
+    post: Option<&nanna_storage::TaskNote>,
+    ts_unix_ms: i64,
+) -> nanna_timeline::Episode {
+    let mut source_ids = vec![format!("task:{}", task.id)];
+    let (kind, content, salience) =
+        if let (EpisodeTrigger::Posted { note_id }, Some(note)) = (trigger, post) {
+            source_ids.push(format!("task_note:{note_id}"));
+            let by = note
+                .author_member_id
+                .as_deref()
+                .or(note.author.as_deref())
+                .unwrap_or("someone");
+            (
+                nanna_timeline::EventKind::Message,
+                format!(
+                    "#{} \"{}\" — {} by {by}: {}",
+                    task.id,
+                    task.title,
+                    note.kind.as_str(),
+                    note.content
+                ),
+                post_salience(note.kind),
+            )
+        } else {
+            let verdict = event.kind == TaskEventKind::Verdict;
+            let status = event
+                .detail
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(task.status.as_str());
+            (
+                nanna_timeline::EventKind::Outcome,
+                if verdict {
+                    format!("#{} \"{}\" — completed (verdict)", task.id, task.title)
+                } else {
+                    format!("#{} \"{}\" — status {status}", task.id, task.title)
+                },
+                if verdict { 0.9 } else { 0.4 },
+            )
+        };
+    debug_assert!((0.0..=1.0).contains(&salience), "salience is normalized");
+    nanna_timeline::Episode {
+        kind,
+        ts_unix_ms,
+        workspace_id: (task.scope == "workspace")
+            .then(|| task.scope_id.clone())
+            .flatten(),
+        content,
+        salience,
+        source_ids,
     }
 }
 
@@ -159,59 +275,93 @@ pub fn board_copy(
     }
 }
 
-/// Write one event's copy. `Ok(None)` when there was nothing to write — the
-/// card or post was deleted before the worker reached it.
+/// What one event produced on the board's record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoardRecord {
+    /// The memory copy's id, when one was written.
+    pub memory_id: Option<String>,
+    /// The timeline episode's id, when one was appended.
+    pub episode_id: Option<String>,
+}
+
+/// Record one event: its memory copy (when `memory` is present) and its
+/// timeline episode. Nothing is recorded for a card or post deleted before the
+/// worker reached it.
 ///
 /// # Errors
-/// Returns a message when the store cannot be read or the memory write fails.
+/// Returns a message when the store cannot be read or a write fails. The two
+/// writes are independent: a failed memory copy still attempts the episode's
+/// write only if it came first — each failure is reported, neither is retried.
 pub async fn write_one(
     storage: &Storage,
-    memory: &MemoryService,
+    memory: Option<&MemoryService>,
     event: &TaskEvent,
-) -> Result<Option<String>, String> {
-    let Some(trigger) = Trigger::of(event) else {
-        return Ok(None);
-    };
+) -> Result<BoardRecord, String> {
+    let copy = Trigger::of(event).filter(|_| memory.is_some());
+    let episode = EpisodeTrigger::of(event);
+    if copy.is_none() && episode.is_none() {
+        return Ok(BoardRecord::default());
+    }
     let task = match storage.tasks().get(event.task_id).await {
         Ok(task) => task,
-        Err(StorageError::NotFound(_)) => return Ok(None),
+        Err(StorageError::NotFound(_)) => return Ok(BoardRecord::default()),
         Err(e) => return Err(format!("reading card #{}: {e}", event.task_id)),
     };
-    let post = match trigger {
-        Trigger::Posted { note_id } => match storage.tasks().note(note_id).await {
+    let note_id = match (copy, episode) {
+        (Some(Trigger::Posted { note_id }), _) | (_, Some(EpisodeTrigger::Posted { note_id })) => {
+            Some(note_id)
+        }
+        _ => None,
+    };
+    let post = match note_id {
+        Some(note_id) => match storage.tasks().note(note_id).await {
             Ok(note) => Some(note),
-            Err(StorageError::NotFound(_)) => return Ok(None),
+            Err(StorageError::NotFound(_)) => return Ok(BoardRecord::default()),
             Err(e) => return Err(format!("reading post #{note_id}: {e}")),
         },
-        Trigger::Created | Trigger::Closed { .. } => None,
+        None => None,
     };
-    let copy = board_copy(&task, trigger, post.as_ref());
-    memory
-        .remember_deferred_vector(
-            &copy.content,
-            copy.metadata,
-            COPY_IMPORTANCE,
-            copy.workspace_id,
-        )
-        .await
-        .map(|(id, _)| Some(id))
-        .map_err(|e| format!("writing the memory copy of card #{}: {e}", task.id))
+
+    let mut record = BoardRecord::default();
+    if let (Some(trigger), Some(memory)) = (copy, memory) {
+        let copy = board_copy(&task, trigger, post.as_ref());
+        let (id, _) = memory
+            .remember_deferred_vector(
+                &copy.content,
+                copy.metadata,
+                COPY_IMPORTANCE,
+                copy.workspace_id,
+            )
+            .await
+            .map_err(|e| format!("writing the memory copy of card #{}: {e}", task.id))?;
+        record.memory_id = Some(id);
+    }
+    if let Some(trigger) = episode {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let episode = board_episode(&task, event, trigger, post.as_ref(), now_ms);
+        let id = nanna_timeline::Timeline::new(storage)
+            .append(&episode)
+            .await
+            .map_err(|e| format!("appending card #{}'s timeline episode: {e}", task.id))?;
+        record.episode_id = Some(id);
+    }
+    Ok(record)
 }
 
 /// Drain the write-through queue until every sender is gone.
 ///
-/// Sequential on purpose: one card's created → posted → completed copies land
-/// in the order they happened, and each write is a single durable insert.
+/// Sequential on purpose: one card's created → posted → completed records
+/// land in the order they happened, and each write is a single durable insert.
+/// `memory` is `None` when memory is disabled: the timeline is still fed.
 pub async fn run(
     mut events: mpsc::Receiver<TaskEvent>,
     storage: Arc<Storage>,
-    memory: Arc<MemoryService>,
+    memory: Option<Arc<MemoryService>>,
 ) {
     while let Some(event) = events.recv().await {
-        match write_one(&storage, &memory, &event).await {
-            Ok(Some(id)) => debug!("board copy {id} written for card #{}", event.task_id),
-            Ok(None) => {}
-            Err(e) => warn!("board memory write-through failed: {e}"),
+        match write_one(&storage, memory.as_deref(), &event).await {
+            Ok(record) => debug!("board record for card #{}: {record:?}", event.task_id),
+            Err(e) => warn!("board write-through failed: {e}"),
         }
     }
 }
@@ -282,18 +432,100 @@ mod tests {
 
     /// A store whose task events feed a running write-through worker.
     async fn board_with_write_through() -> (Arc<Storage>, Arc<MemoryService>) {
+        let memory = Arc::new(MemoryService::new(
+            nanna_memory::MemoryServiceConfig::default(),
+        ));
+        let storage = board_feeding(Some(Arc::clone(&memory))).await;
+        (storage, memory)
+    }
+
+    /// A store whose task events feed a running worker; `memory` optional.
+    async fn board_feeding(memory: Option<Arc<MemoryService>>) -> Arc<Storage> {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
         let (bus, _keep) = tokio::sync::broadcast::channel(64);
         let (queue_tx, queue_rx) = mpsc::channel(WRITE_THROUGH_QUEUE_MAX);
         let bridge =
             crate::task_event_bridge::TaskEventBridge::new(bus).with_memory_write_through(queue_tx);
         assert!(storage.set_task_events(Arc::new(bridge) as Arc<dyn TaskEventSink>));
-        let memory = Arc::new(MemoryService::new(
-            nanna_memory::MemoryServiceConfig::default(),
-        ));
-        tokio::spawn(run(queue_rx, Arc::clone(&storage), Arc::clone(&memory)));
+        tokio::spawn(run(queue_rx, Arc::clone(&storage), memory));
+        storage
+    }
 
-        (storage, memory)
+    async fn wait_for_episodes(
+        storage: &Storage,
+        want: usize,
+    ) -> Vec<nanna_storage::MemoryEventRow> {
+        for _ in 0..200 {
+            let rows = storage.memory_events().recent(50).await.expect("events");
+            if rows.len() >= want {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        storage.memory_events().recent(50).await.expect("events")
+    }
+
+    /// The timeline half: a card's thread is an event series. Each post is a
+    /// `message` episode and each transition an `outcome`, carrying the card
+    /// (and post) as lineage — and it is fed with memory switched off too,
+    /// since it needs only storage.
+    #[tokio::test]
+    async fn a_cards_thread_and_transitions_feed_the_timeline_without_memory() {
+        let storage = board_feeding(None).await;
+        let tasks = storage.tasks();
+        let card = tasks
+            .create(NewTask {
+                scope: "workspace".to_string(),
+                scope_id: Some("ws1".to_string()),
+                title: "Ship it".to_string(),
+                priority: 2,
+                ..NewTask::default()
+            })
+            .await
+            .expect("card");
+        let note = tasks
+            .post(
+                card.id,
+                Some("gui"),
+                None,
+                TaskNoteKind::Question,
+                "Which tag?",
+            )
+            .await
+            .expect("post");
+        tasks
+            .complete(card.id, Some("gui"), None)
+            .await
+            .expect("complete");
+
+        let rows = wait_for_episodes(&storage, 2).await;
+        let message = rows
+            .iter()
+            .find(|r| r.kind == "message")
+            .expect("the post's episode");
+        assert!(
+            message.content.contains("Which tag?"),
+            "{}",
+            message.content
+        );
+        assert_eq!(
+            message.source_ids,
+            [
+                format!("task:{}", card.id),
+                format!("task_note:{}", note.id)
+            ]
+        );
+        assert!(
+            (message.salience - 0.8).abs() < f32::EPSILON,
+            "a question blocks"
+        );
+        assert_eq!(message.workspace_id.as_deref(), Some("ws1"));
+        let outcome = rows
+            .iter()
+            .find(|r| r.kind == "outcome")
+            .expect("the verdict's episode");
+        assert!(outcome.content.contains("completed"), "{}", outcome.content);
+        assert_eq!(outcome.source_ids, [format!("task:{}", card.id)]);
     }
 
     /// The whole path: a card's life on the board lands in memory as three

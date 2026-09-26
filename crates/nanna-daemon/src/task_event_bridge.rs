@@ -45,7 +45,7 @@ impl TaskEventBridge {
         let Some(queue) = self.write_through.as_ref() else {
             return;
         };
-        if crate::memory_write_through::Trigger::of(event).is_none() {
+        if !crate::memory_write_through::is_board_record(event) {
             return;
         }
         // `Ok`, and `Closed` — no worker, because memory is not configured on

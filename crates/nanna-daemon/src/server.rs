@@ -5153,24 +5153,28 @@ impl DaemonServer {
         }
     }
 
-    /// Start draining the board memory write-through queue (P25 Stage 1).
+    /// Start draining the board write-through queue (P25 Stage 1): memory
+    /// copies when memory is enabled, timeline episodes whenever storage is.
     ///
-    /// Runs at most once: the receiver is taken. Without storage or memory the
-    /// receiver is dropped here, and the sink reads the closed queue as "no
-    /// copies owed" instead of filling it.
+    /// Runs at most once: the receiver is taken. Without storage the receiver
+    /// is dropped here, and the sink reads the closed queue as "nothing owed"
+    /// instead of filling it.
     fn start_board_write_through(&self, memory: Option<&Arc<MemoryService>>) {
         let queue = self
             .board_copies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let (Some(queue), Some(storage), Some(memory)) = (queue, self.storage.as_ref(), memory) {
+        if let (Some(queue), Some(storage)) = (queue, self.storage.as_ref()) {
             tokio::spawn(crate::memory_write_through::run(
                 queue,
                 Arc::clone(storage),
-                Arc::clone(memory),
+                memory.cloned(),
             ));
-            info!("Board memory write-through running: every card and post becomes a memory");
+            info!(
+                memory_copies = memory.is_some(),
+                "Board write-through running: cards and posts feed the timeline and memory"
+            );
         }
     }
 

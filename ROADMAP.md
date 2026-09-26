@@ -7910,7 +7910,18 @@ as its turn (`TurnAdmission`, scope default `session`).
       "Dreaming operates only on these copies" holds by construction: nothing in dreaming reads
       `task_notes`. 2 tests, one end-to-end (card → post → complete = three linked copies, none for
       a session card on the same store).
-- [ ] **DSP timeline compression — feed the North Star's moat.** *(owner 2026-09-23: "add that to
+- [~] *(2026-09-26 — step (1) landed; steps (2)–(4) open.)* **Step (1): the board feeds
+      `memory_events`.** The write-through worker now also appends one `nanna_timeline` episode per
+      thread post (`message`) and per status change or verdict (`outcome`), with `source_ids` =
+      `task:<id>` (+ `task_note:<id>`), workspace-scoped, through `Timeline::append` so the
+      crate's content cap and visible-truncation rule hold. Post salience ranks by how much a post
+      moves the card (verdict 0.9, question 0.8, comment 0.5, progress 0.3; a verdict transition
+      0.9, any other status change 0.4) — salience is what step (2)'s decimation keeps. The
+      timeline needs only storage, so it is fed **even with memory disabled** (the worker now runs
+      whenever storage exists; memory copies stay conditional). `memory_events` joined
+      `SALVAGE_TABLES` earlier this run, so the series also survives a page-level recovery. 1
+      end-to-end test (memory off).
+      **DSP timeline compression — feed the North Star's moat.** *(owner 2026-09-23: "add that to
       the roadmap".)* `nanna-timeline` (`EventKind{Message,ToolCall,Recall,Outcome}`, `Episode`,
       `Timeline`) and migration 014's `memory_events` exist with **no consumer**; the dreaming item
       at the top of this file still lists phase (e) as open. The board gives it a natural feed: a

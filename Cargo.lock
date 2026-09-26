@@ -5704,6 +5704,7 @@ dependencies = [
  "nanna-proc",
  "nanna-scripting",
  "nanna-storage",
+ "nanna-timeline",
  "nanna-tools",
  "reqwest",
  "serde",
