@@ -4,20 +4,23 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | ✅ |
-| < 0.2   | ❌ |
+| Latest `0.3.x` beta | ✅ |
+| Older betas | ❌ |
 
-The public beta (`0.2.x`) is the only actively supported line. Security fixes
-land on `master` and ship in the next beta/patch release; we do not back-port
-to archive tags.
+Nanna is in public beta and ships from `master`. Only the latest beta release
+is supported: security fixes land on `master` and ship in the next beta, which
+installed copies pick up through the built-in updater. We do not back-port to
+older tags.
 
 ## Reporting a vulnerability
 
 **Please do not open a public GitHub issue for security reports.**
 
-Email **security@nanna.bot** (or, if that address is unreachable, open a
-[private security advisory](https://github.com/physics515/Nanna/security/advisories/new)
-on the GitHub repository).
+Report it privately through GitHub:
+**[Report a vulnerability](https://github.com/basic-automation/Nanna/security/advisories/new)**
+(the repository's *Security* tab → *Report a vulnerability*). Only the
+maintainers can see the report, and the fix can be discussed and prepared in
+that private advisory before anything is public.
 
 Include, where you can:
 

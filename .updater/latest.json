@@ -5,11 +5,11 @@
   "platforms": {
     "windows-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXI3d0dDbGYxbE9zV2F2Qk85TGdENzV6c29BVnpIc3VMa1RQZnJETXNRaTJNUTFoV0lUbnFzM2lDcGlMckdvVzRpaVZmcjdoWk9BUkRiaklucTJWK1FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMjc5MTY5CWZpbGU6TmFubmFfMC4zLjMwX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMzAKQzlXUXl2andpclgxRzJTeVZEdnhOOEhaL1VWcFR6dU83MTY3ZzkzTXBoMFBEMUx4Q3pUVlhQcHl4VkY2NDloV2xQKytEdGY5OVorOGNGRXZieUtIQnc9PQo=",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.30-beta.39/Nanna_0.3.30_x64-setup.exe"
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.30-beta.39/Nanna_0.3.30_x64-setup.exe"
     },
     "linux-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXFRTEJ2T0hSZnA2WTFjbFJFZE9iU3EveVoxaFMvdU9MSEZZNXhDZ3crWkVLOTNlUURIVnFlY1ZGY2dkR20zV2M3TWlUTWtNQ0hUdGNpLzdNa240VUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMjc3NDk0CWZpbGU6TmFubmFfMC4zLjMwX2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC4zLjMwCnlLOCtGekZHQTBGOEo1NndUR1I4cVMzL3FvQ1VNR1NINkNCZ3NMZExuTjJ6VitWU3J3NUYxRWNSSzdvNEU0MmI5Zkg0U1pKS1Q0MmZZcGY0SklLL0JBPT0K",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.30-beta.39/Nanna_0.3.30_amd64.AppImage"
+      "url": "https://github.com/basic-automation/Nanna/releases/download/v0.3.30-beta.39/Nanna_0.3.30_amd64.AppImage"
     }
   }
 }
