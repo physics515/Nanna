@@ -8324,8 +8324,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       elision and re-condensation) now `forget_summarized_hashes`, since a hash that says "the
       summary covers this" after that part of the summary is gone points a placeholder at
       nothing. Deduplicating less is the safe direction. 1 new test, 1 extended.
-- [ ] `verified_outcomes` needs a reduction path (fold read-only successes, cap by budget) and
+- [~] `verified_outcomes` needs a reduction path (fold read-only successes, cap by budget) and
       must be pruned when an item is reopened as regressed (`loop_runner.rs:7188`, `harness.rs:3574`).
+      *(2026-09-26 — the pruning half.)* Both regression-reopen sites (end-of-run and mid-run
+      sweep) now call `forget_verified(id)`, dropping the item from `verified_outcomes` and
+      `verified_this_run`. Left in, the do-not-regress digest told the model "#1 … VERIFIED
+      WORKING right now" in the very prompt that sent it back to repair #1, and a re-earned verdict
+      was listed twice in the run report. The mid-run test now asserts both, red without the
+      call. **Still open:** the context slot's reduction path (`AgentContext::verified_outcomes`,
+      which only grows; the digest side is already byte-capped).
 - [x] `is_context_length_error` must not match provider 400s about `max_tokens`; the token-budget
       check must run after the paid-for reply is stored; a cancel after a finalised `tool_use` must
       pair it with "[Skipped]" results (`loop_runner.rs:8130,4587,4592`).
