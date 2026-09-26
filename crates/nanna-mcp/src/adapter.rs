@@ -276,18 +276,7 @@ mod tools_impl {
             let content = result
                 .content
                 .iter()
-                .filter_map(|c| match c {
-                    ToolContent::Text { text } => Some(text.clone()),
-                    ToolContent::Image { data, mime_type } => {
-                        Some(format!("[Image: {mime_type}, {} bytes]", data.len()))
-                    }
-                    ToolContent::Resource { resource } => resource.text.clone().or_else(|| {
-                        resource
-                            .blob
-                            .as_ref()
-                            .map(|b| format!("[Blob: {} bytes]", b.len()))
-                    }),
-                })
+                .filter_map(ToolContent::to_text)
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -783,18 +772,7 @@ impl<T: Transport + 'static> McpToolAdapter<T> {
         let content = result
             .content
             .iter()
-            .filter_map(|c| match c {
-                ToolContent::Text { text } => Some(text.clone()),
-                ToolContent::Image { data, mime_type } => {
-                    Some(format!("[Image: {mime_type}, {} bytes]", data.len()))
-                }
-                ToolContent::Resource { resource } => resource.text.clone().or_else(|| {
-                    resource
-                        .blob
-                        .as_ref()
-                        .map(|b| format!("[Blob: {} bytes]", b.len()))
-                }),
-            })
+            .filter_map(ToolContent::to_text)
             .collect::<Vec<_>>()
             .join("\n");
 

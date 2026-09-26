@@ -8344,10 +8344,21 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       cap; `dump_empty_step` unbounded log outside the data dir; strict `as_u64` where Boa hands
       over `f64`; `fit_image_to_limit` ignores `quality` (`bridge.rs`, `scripted.rs:83`,
       `git.rs:206`, `tasks.rs:2344`, `server.rs:916`, `image_util.rs`).
-- [ ] MCP (kept, healthiest crate): transport timeout must honour the advertised 60 s and not cut
+- [~] MCP (kept, healthiest crate): transport timeout must honour the advertised 60 s and not cut
       SSE bodies; `ToolContent` must accept `resource_link`/`audio`; drain `pending` on EOF; follow
       `next_cursor`; log `tools/list` failures; drop the dead duplicates
       (`transport.rs:480,404,823`, `protocol.rs:409`, `client.rs:296,378`).
+      *(2026-09-26 — the content and pagination halves; the transport half is open.)* **Content was
+      worse than two missing types:** `rename_all` on a tagged enum renames the *variants*, not their
+      fields, so `Image` expected `mime_type` where every server sends `mimeType` — any image block
+      failed to deserialize and took the **whole `tools/call` result** with it, text included
+      (`PromptContent::Image` had the same bug). Fields renamed by hand; `Audio` and
+      `ResourceLink` added; a `#[serde(other)] Unknown` means one future block type can no longer
+      discard its siblings. The two duplicated adapter conversions are now `ToolContent::to_text`.
+      **Pagination:** `tools/list` read one page, so a paginating server's later tools never
+      registered; it now follows `nextCursor`, bounded (`TOOL_LIST_PAGES_MAX` 64) and stopped by a
+      repeating cursor. 2 tests (spec-shaped result with all five block kinds; three-page and
+      stuck-cursor servers).
 - [ ] Browser (kept as tools): `navigate` needs a deadline and must not hold the browser lock
       across it; `close` must close the target; `wait_for_selector` must wait; escape selectors
       (`cdp.rs:140,489`, `playwright.rs:254`).
