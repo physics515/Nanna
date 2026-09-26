@@ -8111,6 +8111,19 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       zero period panics `tokio::time::interval`), `beat` sends on each tick, and a tick whose
       previous beat got no op 11 ACK leaves the zombie connection and resumes (Discord's rule).
       1 paused-clock test. Not driven against a live gateway (no bot token on this host).
+      *(later)* **Signal/WhatsApp 120 s cut:** both SSE listeners built their client with a
+      120 s whole-request `timeout`, which in reqwest covers reading the body — so every healthy
+      stream was cut at two minutes, recorded as a connection failure against the circuit
+      breaker, and messages arriving during the reconnect were missed. They now share
+      `sse::long_lived_client` (10 s connect timeout, 60 s TCP keepalive, no body deadline); the
+      WhatsApp poll request, which relied on the client-wide timeout, sets its own 30 s.
+      **Queue write-lock send:** `MessageQueue` awaited a bounded (1000) event `send` while holding
+      its write lock, so with nobody reading events the 1001st enqueue blocked forever, and every
+      queue operation with it. Events are advisory: `emit` uses `try_send` and drops on a full
+      channel, and stays synchronous so ordering under the lock holds. 1 test (1 100 enqueues,
+      no reader). (`MessageQueue` has no caller today — it is on the rotting-exports list.)
+      **Stale:** byte chunking — `split_for_length` already counts Unicode scalars.
+      **Still open:** composite `reply_to` ids, legacy Markdown, dead signald/Slack upload paths.
 - [ ] `nanna-server` webhooks (`slack.rs`, `discord.rs`, `telegram.rs`, `signal.rs`): full turn
       before ack, own replay check, webhook-reply Markdown, Signal bypassing `process_message`,
       unbounded `AppState.agents`. What stays of `nanna-server` is decided when remote board access
