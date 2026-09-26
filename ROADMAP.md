@@ -8202,8 +8202,10 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       root crate named any of them (the GUI's `AgentStats` is its own type). Workspace clippy clean
       after. Also `MessageQueue` (`nanna-channels`) has no caller — fixed today rather than
       deleted only because its deadlock was the finding in hand; it belongs on this list.
-      **Still open:** `MultiAgent`, the Rust built-in tools, the Deno path, `WorkspaceManager`,
-      `McpManager`, `re_embed_mismatched`, `tool_stats` per-session half, `MessageQueue`.
+      *(later)* `McpManager` (the standalone multi-server manager in `nanna-mcp`'s adapter) and
+      `VectorStore::re_embed_mismatched` (with `preview`, its only helper) — no callers. **Still
+      open:** `MultiAgent`, the Rust built-in tools, the Deno path, `WorkspaceManager` (still
+      re-exported by `nanna-agent`), `tool_stats` per-session half, `MessageQueue`.
 
 **Stage 1 — store, memory, storage:**
 - [x] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and

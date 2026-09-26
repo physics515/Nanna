@@ -68,13 +68,6 @@ mod lossy {
     }
 }
 
-/// At most the first 40 bytes of `content`, cut back to a char boundary, for
-/// log lines. A raw `&content[..40]` panics when byte 40 lands inside a
-/// multi-byte character — the same crash class that once wedged a chat turn.
-fn preview(content: &str) -> &str {
-    &content[..content.floor_char_boundary(40)]
-}
-
 pub use activity::ActivityClock;
 
 pub use chunk_rank::{collapse_chunk_hits, ChunkHit};
@@ -1892,83 +1885,6 @@ impl VectorStore {
         Ok(())
     }
 
-    pub async fn re_embed_mismatched<F, Fut>(
-        &self,
-        expected_dim: usize,
-        embed_fn: F,
-    ) -> usize
-    where
-        F: Fn(String) -> Fut,
-        Fut: std::future::Future<Output = Result<Vec<f32>, String>>,
-    {
-        let mut entries = self.entries.write().await;
-        let total = entries.len();
-        let mismatched_count = entries.iter()
-            .filter(|e| e.embedding.len() != expected_dim)
-            .count();
-
-        if mismatched_count == 0 {
-            return 0;
-        }
-
-        info!(
-            "Re-embedding {} of {} entries ({} dims → {} dims)...",
-            mismatched_count, total,
-            entries.iter().find(|e| e.embedding.len() != expected_dim)
-                .map_or(0, |e| e.embedding.len()),
-            expected_dim
-        );
-
-        let mut re_embedded = 0usize;
-        let mut failed = 0usize;
-
-        for entry in entries.iter_mut() {
-            if entry.embedding.len() == expected_dim {
-                continue;
-            }
-
-            match (embed_fn)(entry.content.clone()).await {
-                Ok(mut new_embedding) => {
-                    if new_embedding.len() == expected_dim {
-                        normalize_f32(&mut new_embedding);
-                        entry.embedding = new_embedding;
-                        re_embedded += 1;
-                    } else {
-                        warn!(
-                            "Re-embed returned wrong dimension for '{}': expected {}, got {}",
-                            preview(&entry.content),
-                            expected_dim, new_embedding.len()
-                        );
-                        failed += 1;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to re-embed '{}': {}",
-                        preview(&entry.content), e
-                    );
-                    failed += 1;
-                }
-            }
-        }
-
-        // Remove entries that failed to re-embed
-        if failed > 0 {
-            entries.retain(|e| e.embedding.len() == expected_dim);
-            warn!("Dropped {} entries that failed to re-embed", failed);
-        }
-
-        info!(
-            "Re-embedding complete: {} succeeded, {} failed, {} total entries",
-            re_embedded, failed, entries.len()
-        );
-        // Held across every re-embed and the retain, so no reader sees the
-        // store half re-embedded.
-        drop(entries);
-
-        re_embedded
-    }
-
     /// Get the current configured dimension
     #[must_use]
     pub fn dimension(&self) -> usize {
@@ -2435,15 +2351,6 @@ mod tests {
             all.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             vec![2, 4, 1, 0, 3]
         );
-    }
-
-    #[test]
-    fn preview_never_splits_a_character() {
-        // 39 ASCII bytes then a 3-byte char straddling byte 40.
-        let text = format!("{}€ tail", "a".repeat(39));
-        assert_eq!(preview(&text), "a".repeat(39));
-        assert_eq!(preview("short"), "short");
-        assert_eq!(preview(&"b".repeat(50)), "b".repeat(40));
     }
 
     fn store_of_width(width: usize) -> VectorStore {
