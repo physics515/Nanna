@@ -4792,6 +4792,12 @@ impl EmbeddingClient {
                     && !emb.is_empty() {
                         return Ok(emb);
                     }
+        } else {
+            let status = response.status().as_u16();
+            let message = response.text().await.unwrap_or_default();
+            if !legacy_embed_may_answer(status, &message) {
+                return Err(LlmError::from_api_response(status, message));
+            }
         }
 
         // Fall back to legacy API: POST /api/embeddings { model, prompt }
@@ -4821,6 +4827,14 @@ impl EmbeddingClient {
                     .map_err(|e2| LlmError::Json(format!("ollama embedding after heal: {e2}")))?
             }
         };
+        // `embedding` defaults to empty when absent: an empty vector is no
+        // embedding, and storing it would poison every similarity it meets.
+        if result.embedding.is_empty() {
+            return Err(LlmError::Api {
+                status: 502,
+                message: format!("ollama returned no embedding for model {}", self.model),
+            });
+        }
         Ok(result.embedding)
     }
 
@@ -6551,6 +6565,20 @@ struct OpenAiFunctionDelta {
     arguments: Option<String>,
 }
 
+/// Whether a failed `/api/embed` may be retried on the legacy `/api/embeddings`.
+///
+/// Only when the endpoint itself is missing — an Ollama older than `/api/embed`
+/// answers `404` with a plain-text body. Any error Ollama itself reports is a
+/// JSON `{"error": …}` (a missing model is a `404` too) and is the answer: the
+/// fallback used to discard it and report the legacy call's error instead, so
+/// the caller saw the wrong reason — and `embed_one`'s input-overflow heal,
+/// which reads that message, never saw the overflow it exists to heal.
+fn legacy_embed_may_answer(status: u16, body: &str) -> bool {
+    status == 404
+        && serde_json::from_str::<serde_json::Value>(body)
+            .map_or(true, |value| value.get("error").is_none())
+}
+
 /// The error an OpenAI-compatible stream sends in place of a chunk, if `data`
 /// is one: `{"error": {"message": …, "code": 429 | "…", "type": …}}`.
 ///
@@ -7230,6 +7258,22 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Only a missing endpoint falls back to the legacy embeddings API; an
+    /// error Ollama reports is the answer.
+    #[test]
+    fn only_a_missing_embed_endpoint_falls_back() {
+        assert!(legacy_embed_may_answer(404, "404 page not found"));
+        assert!(!legacy_embed_may_answer(
+            404,
+            r#"{"error":"model \"nomic\" not found"}"#
+        ));
+        assert!(!legacy_embed_may_answer(
+            400,
+            r#"{"error":"input length 9000 exceeds maximum context length 8192"}"#
+        ));
+        assert!(!legacy_embed_may_answer(500, "internal error"));
+    }
 
     /// A mid-stream error envelope is the error it names — classified, so a
     /// 429 is a rate limit — not a chunk to skip on the way to an empty reply.

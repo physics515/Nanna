@@ -8398,6 +8398,11 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       now turns it into the error a response status would have been (numeric `code` when it is an
       HTTP status, else 429 for a rate-limit `type`, else 500, then `from_api_response`), and both
       OpenAI-format streams (`stream_openai`, `stream_anthropic_via_openai`) end with it. 1 test.
+      *(later)* `embed_ollama_one` now reads `/api/embed`'s error and returns it unless the
+      endpoint itself is missing (`404` with a non-JSON body — an Ollama older than the endpoint):
+      a missing model or an input overflow used to be discarded for the legacy call's error, so
+      the caller saw the wrong reason and `embed_one`'s overflow heal never saw the overflow it
+      reads for. An empty legacy `embedding` is now an error, not a zero-length vector. 1 test.
 - [~] *(2026-09-26 — the Boa loop half, plus the `exec`-style cap for `python.exec` noted on the
       "Smaller" line.)* Boa has no interrupt API, so a timed-out script cannot be stopped from
       outside and its blocking thread kept spinning a core for the life of the process. Every tool
