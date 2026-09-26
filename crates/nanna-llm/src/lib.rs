@@ -3972,16 +3972,6 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             num_ctx: Option<u32>,
         }
 
-        #[derive(Deserialize)]
-        struct OllamaResponse {
-            message: OllamaResponseMessage,
-        }
-
-        #[derive(Deserialize)]
-        struct OllamaResponseMessage {
-            content: String,
-        }
-
         pace_provider_requests(self.provider).await;
 
         let messages: Vec<OllamaMessage> = request
@@ -4037,9 +4027,34 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             return Err(LlmError::from_api_response(status, message));
         }
 
-        let result: OllamaResponse = response.json().await?;
-        Ok(result.message.content)
+        let result: serde_json::Value = response.json().await?;
+        ollama_completion_text(&result)
     }
+}
+
+/// The text of a non-streaming Ollama `/api/chat` completion, held to what
+/// [`ollama_response_to_anthropic`] holds the agent's own path to.
+///
+/// `done: false` is an aborted generation, not a short answer, and inline
+/// `<think>…</think>` is reasoning, not reply. This path — dream summaries,
+/// context compression, multi-agent decomposition — used to take `content`
+/// as-is, so an abort became an empty or truncated "summary" and a reasoning
+/// model's think block was stored as memory text.
+fn ollama_completion_text(response: &serde_json::Value) -> Result<String, LlmError> {
+    if response.get("done").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Err(LlmError::from_api_response(
+            502,
+            "Ollama aborted generation mid-response (done=false)".to_string(),
+        ));
+    }
+    let content = response["message"]["content"].as_str().ok_or_else(|| {
+        LlmError::Json("ollama completion: no message.content in the response".to_string())
+    })?;
+    Ok(if content.contains("<think>") {
+        strip_think_tags(content)
+    } else {
+        content.to_string()
+    })
 }
 
 // ============================================================================
@@ -7259,7 +7274,29 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
 #[cfg(test)]
 mod tests {
 
-    /// Only a missing endpoint falls back to the legacy embeddings API; an
+    /// A non-streaming completion is held to the agent path's rules: an
+    /// abort is an error, and a think block is not part of the reply.
+    #[test]
+    fn a_plain_ollama_completion_drops_think_and_refuses_an_abort() {
+        let thinking = serde_json::json!({
+            "message": { "role": "assistant", "content": "<think>plan it</think>\nThe summary." },
+            "done": true
+        });
+        assert_eq!(
+            ollama_completion_text(&thinking).expect("text"),
+            "The summary."
+        );
+        let plain = serde_json::json!({ "message": { "content": "  as is  " }, "done": true });
+        assert_eq!(ollama_completion_text(&plain).expect("text"), "  as is  ");
+        let aborted = serde_json::json!({ "message": { "content": "half a sen" }, "done": false });
+        assert!(matches!(
+            ollama_completion_text(&aborted),
+            Err(LlmError::Api { status: 502, .. })
+        ));
+        assert!(ollama_completion_text(&serde_json::json!({ "done": true })).is_err());
+    }
+
+/// Only a missing endpoint falls back to the legacy embeddings API; an
     /// error Ollama reports is the answer.
     #[test]
     fn only_a_missing_embed_endpoint_falls_back() {

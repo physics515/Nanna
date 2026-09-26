@@ -8403,6 +8403,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       a missing model or an input overflow used to be discarded for the legacy call's error, so
       the caller saw the wrong reason and `embed_one`'s overflow heal never saw the overflow it
       reads for. An empty legacy `embedding` is now an error, not a zero-length vector. 1 test.
+      *(later)* `complete_ollama` — the non-streaming path under dream summaries, context
+      compression and multi-agent decomposition — now holds to the agent path's rules
+      (`ollama_completion_text`): `done: false` is a 502 (an aborted generation became an empty
+      or truncated "summary"), and inline `<think>…</think>` is stripped (a reasoning model's think
+      block was stored as memory text). 1 test. **Still open on this line:** native Anthropic
+      stream errors reaching the chain walk as `Err`, `x-ratelimit-reset-*` parsing, `think` on
+      the stream body, `done:true` without a trailing newline.
 - [~] *(2026-09-26 — the Boa loop half, plus the `exec`-style cap for `python.exec` noted on the
       "Smaller" line.)* Boa has no interrupt API, so a timed-out script cannot be stopped from
       outside and its blocking thread kept spinning a core for the life of the process. Every tool
