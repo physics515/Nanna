@@ -8179,9 +8179,23 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       another. The existing reassembly tests cover the path unchanged.
 
 **Stage 2 — router, scheduler, IPC, config:**
-- [ ] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
+- [x] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
+      *(2026-09-26)* Heartbeat: first timer a full period out (the retune path already did this),
+      and the run is spawned under the same `InFlightClaim` due tasks use, so a slow heartbeat
+      neither blocks the `select!` (every due task and shutdown used to wait on the model turn) nor
+      stacks on the next tick. A paused-clock test (`start_paused`, `test-util` added to
+      nanna-core's dev-deps) proves both, red on the old code.
+      **`nanna serve` was worse than two schedulers.** Both loaded the same persisted jobs; the
+      server state's one "completed" every non-dreaming row by echoing its payload (a one-shot
+      reminder: marked done and deleted, never sent), and the CLI's ran *every* row as an agent
+      prompt — the daemon's recurrence sweep and reminders included. Now one scheduler: the server
+      state's is off (`.scheduler(false)`), and the CLI's classifies each row
+      (`classify_scheduled`): consolidation → the server's `DreamingRuntime` (the route the
+      disabled scheduler had), the daemon's own machinery (`nanna_daemon::server::DAEMON_SYSTEM_TASKS`,
+      which the daemon now uses for its own names) and empty payloads → skipped, the rest →
+      prompts. Consolidation is still registered when dreaming exists. 2 tests.
 - [x] `llm_router::model_health` cooldown never expires (`retry_after` recomputed per call);
       `dream_summarizer` double-waits and exits without waiting on the last round
       (`llm_router.rs:508`, `dream_summarizer.rs:228`).

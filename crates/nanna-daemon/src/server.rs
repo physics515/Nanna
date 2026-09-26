@@ -3028,7 +3028,23 @@ async fn run_recurrence_sweep(
 }
 
 /// Name of the scheduled task that prunes the raw tool-call log.
-const TOOL_CALL_LOG_PRUNE_TASK: &str = "tool_call_log_prune";
+pub const TOOL_CALL_LOG_PRUNE_TASK: &str = "tool_call_log_prune";
+
+/// Name of the P15 recurrence sweep (which also announces due/overdue cards).
+pub const TASK_RECURRENCE_SWEEP_TASK: &str = "task_recurrence_sweep";
+
+/// Scheduled tasks that are the daemon's own machinery, not prompts.
+///
+/// They live in the same persisted `cron_jobs` table as the user's jobs, so any
+/// other scheduler over that table — `nanna serve` runs one — must recognise
+/// them and leave them alone. Unrecognised, a scheduler that runs payloads as
+/// agent prompts hands "Reopen recurring tasks…" (or a reminder's text) to the
+/// model, and one that fakes success consumes a one-shot reminder unsent.
+pub const DAEMON_SYSTEM_TASKS: &[&str] = &[
+    TASK_RECURRENCE_SWEEP_TASK,
+    TOOL_CALL_LOG_PRUNE_TASK,
+    crate::reminder_service::REMINDER_TASK_NAME,
+];
 
 /// Days of raw `tool_call_log` rows kept.
 ///
@@ -3504,14 +3520,14 @@ impl DaemonServer {
         // engine — recurring todo items are reopened here, not by a second
         // clock inside the task store.
         if self.storage.is_some() {
-            let deduped = scheduler.deduplicate_by_name("task_recurrence_sweep").await;
+            let deduped = scheduler.deduplicate_by_name(TASK_RECURRENCE_SWEEP_TASK).await;
             if deduped > 0 {
                 info!("Removed {deduped} duplicate recurrence sweep tasks");
             }
-            if !scheduler.has_task_named("task_recurrence_sweep").await {
+            if !scheduler.has_task_named(TASK_RECURRENCE_SWEEP_TASK).await {
                 scheduler
                     .add_task(nanna_core::recurring_task(
-                        "task_recurrence_sweep",
+                        TASK_RECURRENCE_SWEEP_TASK,
                         std::time::Duration::from_secs(300),
                         "Reopen recurring tasks whose next occurrence has arrived.",
                     ))
@@ -3630,9 +3646,7 @@ impl DaemonServer {
                         )
                         .await
                     }
-                    "task_recurrence_sweep" => {
-                        run_recurrence_sweep(storage.as_ref()).await
-                    }
+                    TASK_RECURRENCE_SWEEP_TASK => run_recurrence_sweep(storage.as_ref()).await,
                     TOOL_CALL_LOG_PRUNE_TASK => run_tool_call_log_prune(storage.as_ref()).await,
                     crate::reminder_service::REMINDER_TASK_NAME => {
                         deliver_scheduled_reminder(&sessions, &events, &task, reminder_tick).await

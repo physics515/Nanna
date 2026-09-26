@@ -749,7 +749,12 @@ impl Scheduler {
             // The heartbeat period is retunable at runtime, so track the value
             // this timer was built from and rebuild when it changes.
             let mut heartbeat_secs = runtime.heartbeat_interval().as_secs();
-            let mut heartbeat_interval = interval(Duration::from_secs(heartbeat_secs));
+            // A full period out, like the retune below: `interval()` fires its
+            // first tick immediately, which ran a model turn at every boot.
+            let mut heartbeat_interval = {
+                let period = Duration::from_secs(heartbeat_secs);
+                interval_at(Instant::now() + period, period)
+            };
             let mut check_interval = interval(config.check_interval);
 
             info!(
@@ -767,16 +772,21 @@ impl Scheduler {
                     }
                     _ = heartbeat_interval.tick() => {
                         if runtime.enabled() && runtime.heartbeat_enabled() {
-                            debug!("Heartbeat tick");
-                            let task = heartbeat_task(&config.heartbeat_prompt);
-                            let result = executor(task).await;
-
-                            // Record heartbeat run
-                            record_run_in(&history, "heartbeat", &result).await;
-
-                            if !result.success {
-                                warn!("Heartbeat failed: {:?}", result.error);
-                            }
+                            // Spawned like every due task, never awaited here:
+                            // a heartbeat is a model turn, and awaiting it in
+                            // this `select!` stalled every other due task (and
+                            // shutdown) behind it. The claim keeps a slow one
+                            // from overlapping the next tick.
+                            let Some(claim) = InFlightClaim::take(&in_flight, HEARTBEAT_CLAIM) else {
+                                debug!("Heartbeat still running; skipping this tick");
+                                continue;
+                            };
+                            tokio::spawn(run_heartbeat(
+                                claim,
+                                executor.clone(),
+                                history.clone(),
+                                config.heartbeat_prompt.clone(),
+                            ));
                         }
                     }
                     _ = check_interval.tick() => {
@@ -851,6 +861,30 @@ impl Scheduler {
 /// restart does not silently retry it. (Before this, a fired `Delayed` task
 /// was disabled in memory only; storage kept `enabled = 1`, so every daemon
 /// restart re-armed it and it fired again.)
+/// In-flight key for the heartbeat. Not a task id: the heartbeat is built
+/// fresh on every tick, so its own id would never repeat and never collide.
+const HEARTBEAT_CLAIM: &str = "\0heartbeat";
+
+/// One heartbeat run, holding `claim` until it has been recorded.
+async fn run_heartbeat(
+    claim: InFlightClaim,
+    executor: TaskExecutor,
+    history: Arc<RwLock<HashMap<String, Vec<JobRun>>>>,
+    prompt: String,
+) {
+    debug_assert_eq!(
+        claim.task_id, HEARTBEAT_CLAIM,
+        "the heartbeat holds its own claim"
+    );
+    debug!("Heartbeat tick");
+    let result = executor(heartbeat_task(&prompt)).await;
+    record_run_in(&history, "heartbeat", &result).await;
+    if !result.success {
+        warn!("Heartbeat failed: {:?}", result.error);
+    }
+    drop(claim);
+}
+
 async fn run_due_task(
     claim: InFlightClaim,
     task: ScheduledTask,
@@ -1283,6 +1317,66 @@ mod tests {
             peak.load(Ordering::SeqCst),
             1,
             "never two runs of one task at once"
+        );
+    }
+
+    /// The heartbeat is a model turn. It used to be awaited inside the loop's
+    /// `select!`, so one that took long — here, one that never returns — froze
+    /// every other due task; and `interval()` fired it once at boot. Paused
+    /// clock: the 30 s period passes instantly.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_never_fires_at_boot_and_never_stalls_due_tasks() {
+        let heartbeats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (heartbeats_in, runs_in) = (heartbeats.clone(), runs.clone());
+        let executor: TaskExecutor = Arc::new(move |task: ScheduledTask| {
+            let (heartbeats, runs) = (heartbeats_in.clone(), runs_in.clone());
+            Box::pin(async move {
+                if task.name == "heartbeat" {
+                    heartbeats.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+                runs.fetch_add(1, Ordering::SeqCst);
+                TaskResult {
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    success: true,
+                    output: None,
+                    error: None,
+                    duration_ms: 0,
+                    started_at: Utc::now(),
+                    finished_at: Utc::now(),
+                }
+            })
+        });
+        let config = SchedulerConfig {
+            heartbeat_enabled: true,
+            heartbeat_interval: Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS),
+            check_interval: Duration::from_millis(10),
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = Scheduler::new(config).with_executor(executor);
+        scheduler
+            .add_task(recurring_task("sweep", Duration::from_nanos(1), "x"))
+            .await;
+        scheduler.start();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(heartbeats.load(Ordering::SeqCst), 0, "no heartbeat at boot");
+
+        tokio::time::sleep(Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS + 1)).await;
+        assert_eq!(
+            heartbeats.load(Ordering::SeqCst),
+            1,
+            "one heartbeat per period"
+        );
+        let before = runs.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let after = runs.load(Ordering::SeqCst);
+        scheduler.stop().await;
+        assert!(
+            after > before,
+            "due tasks keep running beside a stuck heartbeat ({before} → {after})"
         );
     }
 
