@@ -8549,7 +8549,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       now true of every tool family: scripted tools and MCP tools declare, and manifest skills
       enforce their own (below). What remains is **the Python engine**: RustPython runs on its
       own thread and a timeout abandons it rather than stopping it — the same class as the Boa
-      loop, needing an interrupt hook.
+      loop, needing an interrupt hook. Scoped the same day: rustpython-vm 0.5 has one —
+      `signal::user_signal_channel()` + `Interpreter::set_user_signal_channel`, a closure run
+      at the eval loop's `check_signals` that can raise — but `check_signals` gates on a
+      process-GLOBAL `ANY_TRIGGERED` flag that any concurrently running interpreter can consume
+      (so a timeout could be swallowed by another `python.exec`), it returns early unless the
+      VM's `signal_handlers` are initialised, and user code's bare `except:` catches the raised
+      exception. A correct fix re-sends until the thread reports back and is tested with two
+      interpreters running at once.
       *(2026-09-26, later)* Manifest (`tool.yaml`) skills enforce their own timeout and kill the
       whole tree. The timeout used to exist only as the registry dropping the future, which
       killed nothing: the shell and anything it started ran on, orphaned. `run_contained` now
