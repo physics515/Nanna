@@ -2233,26 +2233,57 @@ fn imported_config(
 
 /// Import config from TOML string
 ///
+/// The daemon performs the import (`config.import`): it files any secret the
+/// text brings in, keeps every stored one the text leaves out, saves, and
+/// applies the result live. This command used to only write `config.toml` —
+/// the running daemon never saw the import until a restart, and this process's
+/// cached copy lost every keychain secret, because an export carries none.
+/// The cached copy is then refilled from the store the daemon just settled.
+///
 /// # Errors
 ///
-/// Returns `Failed to parse config: …` when the text is not a valid config
-/// (nothing changes then), and `Failed to save config: …` when `config.toml`
-/// cannot be written (the cached config has already been replaced then).
+/// Returns `Failed to parse config: …` when the text is not a valid config,
+/// the daemon's refusal when it refuses, or the transport error when it cannot
+/// be reached; nothing changes in any of those cases.
 #[tauri::command]
 pub async fn import_config(
     state: State<'_, Arc<RwLock<AppState>>>,
     config: String,
 ) -> Result<(), String> {
-    let mut state_guard = state.write().await;
     let store = nanna_config::SecureStore::new();
-    let new_config = imported_config(&config, &state_guard.config, &store)?;
-    state_guard.config = new_config;
-    state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {e}"))?;
-    drop(state_guard);
+    let (running_host, mut new_config) = {
+        let state_guard = state.read().await;
+        let running_host = state_guard.config.memory.ollama_host.clone();
+        (
+            running_host,
+            imported_config(&config, &state_guard.config, &store)?,
+        )
+    };
+    // The daemon gets the text's own config — secrets it brings in included,
+    // for the daemon to file — not this copy, whose Ollama token is ours.
+    let as_written: nanna_config::Config =
+        toml::from_str(&config).map_err(|e| format!("Failed to parse config: {e}"))?;
+    let wire =
+        serde_json::to_value(&as_written).map_err(|e| format!("Failed to encode config: {e}"))?;
+    let reply = backend_handle(&state).await.config_import(wire).await?;
+    import_refusal(&reply)?;
 
+    new_config.refill_secrets_replacing(&running_host, &store);
+    state.write().await.config = new_config;
     info!("Config imported from TOML");
     Ok(())
+}
+
+/// The daemon's refusal in a `config.import` reply, if it refused.
+fn import_refusal(reply: &serde_json::Value) -> Result<(), String> {
+    let Some(error) = reply.get("error") else {
+        return Ok(());
+    };
+    let reason = reply
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| error.to_string(), str::to_string);
+    Err(format!("config import refused: {reason}"))
 }
 
 // =============================================================================
@@ -2774,6 +2805,23 @@ pub async fn save_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal is surfaced with the daemon's message; an import is not.
+    #[test]
+    fn an_import_refusal_carries_the_daemons_message() {
+        assert_eq!(
+            import_refusal(&serde_json::json!({ "status": "imported" })),
+            Ok(())
+        );
+        let refused =
+            serde_json::json!({ "error": "secret_store_failed", "message": "keyring locked" });
+        assert_eq!(
+            import_refusal(&refused),
+            Err("config import refused: keyring locked".to_string())
+        );
+        let bare = serde_json::json!({ "error": "import_failed" });
+        assert!(import_refusal(&bare).is_err_and(|e| e.contains("import_failed")));
+    }
 
     /// The proxy setting lives in memory, not the process environment, and
     /// keeps the old command semantics: enabling may set a URL, disabling

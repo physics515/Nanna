@@ -8501,7 +8501,7 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       feature is off and its crate is not even fetched here, so it cannot be verified.
 
 **Stage 4 — the board client and what it must not port:**
-- [~] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
+- [x] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
       (`scheduler.rs:28`, `settings.rs:454,519,550` and siblings); no `unsafe set_var` from
       commands; `import_config` must reload secrets; `search_memory` must slice on char
       boundaries (or be replaced by the daemon's `memory.search`).
@@ -8529,6 +8529,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       raced every concurrent `getenv` on the multi-threaded runtime only for this same process
       to read them back — nothing else saw them. 1 test. **Still open:** `import_config`
       reloading secrets.
+      *(2026-09-26, later — the line is complete.)* `import_config` now goes through the daemon's
+      `config.import`, which files any secret the text brings in, keeps every stored one it leaves
+      out, saves, and applies the result live. The command used to only write `config.toml`, so
+      the running daemon ignored an import until a restart, and the GUI's cached copy lost every
+      keychain secret (an export carries none). The daemon receives the text's own config; the
+      GUI's copy keeps the Ollama-token handling and is refilled from the store afterwards. A
+      refusal surfaces the daemon's message, and nothing changes on any failure. 1 test.
 - [x] CLI: `nanna sessions/chat/run` ignore `[general] data_dir` (`cli.rs:390`, `setup.rs:241`);
       `register_discover_tools` `.expect` on a user-editable file (`setup.rs:319`). The CLI's chat
       commands go with the chat; `run` becomes "create a card and watch it".
