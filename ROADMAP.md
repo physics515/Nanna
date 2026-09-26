@@ -8049,8 +8049,22 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       between the two leaves the row queued, which is also the safe direction.
       4 tests in `memory_content_invalidates_vector.rs`; **verified to fail against the old
       statement** (2 of the 4 flip red when the clear is reverted) rather than passing vacuously.
-- [ ] `rank_and_assemble`: keep global memories that matched only by chunk under a scoped recall;
+- [x] `rank_and_assemble`: keep global memories that matched only by chunk under a scoped recall;
       reject NaN scores before the gate and sort with a total order (`service.rs:1634-1662`).
+      *(2026-09-26)* **Both were real.** (1) The chunk SQL scopes as *this workspace OR global*,
+      then the chunk-only pass re-filtered with `owner == scope` and threw the globals away — so a
+      global memory reachable only through a chunk was found by the index and silently dropped from
+      every workspace-scoped recall. The rule now lives once, in `nanna_memory::visible_in_scope`,
+      used by the row scan and the chunk pass alike. (2) NaN compared false against the floor, so a
+      NaN row score (a zero-magnitude vector) was **admitted**, and `partial_cmp → Equal` then left
+      the whole answer's order to wherever it sat. A non-finite score is now "no evidence"
+      (`best_similarity` returns `None`), `collapse_chunk_hits` drops NaN chunks by name so they can
+      neither admit nor corroborate, and the sort is `total_cmp` behind a finiteness assert.
+      **The first version of the scope test passed against the old code** — a small store's row
+      scan returns every row (stale-width rows at −1.0), so chunk evidence admitted the global
+      memory through the *row* loop and the chunk-only pass never ran. The test now fills the row
+      over-fetch with another workspace's perfect matches, and was confirmed red on the old filter
+      (`["mine"]` vs `["global","mine"]`); the NaN test likewise. 4 tests.
 - [ ] `MemoryAction::Clear{scope:None}` must be durable or refuse; `save_entry`'s conflict
       fallback must propagate its three errors (`control/memory.rs:194`, `memory_persistence.rs:189`).
 - [ ] `memory.search` and `memory_in_scope` disagree on `scope:"global"`; one meaning

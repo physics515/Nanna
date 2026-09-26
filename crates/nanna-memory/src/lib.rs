@@ -188,6 +188,23 @@ pub struct MemoryStoreHealth {
     pub expected: usize,
 }
 
+/// Whether a memory owned by `memory_workspace` is visible to a recall scoped
+/// to `scope`.
+///
+/// One definition for every recall path. A workspace scope sees that
+/// workspace's memories *and* the global ones; the global scope sees every
+/// memory. The chunk SQL already applies exactly this rule, so a second,
+/// narrower copy downstream silently dropped a global memory that only its
+/// chunks matched — found by the 2026-09-22 review.
+#[must_use]
+pub fn visible_in_scope(memory_workspace: Option<&str>, scope: Option<&str>) -> bool {
+    debug_assert!(
+        scope.is_none_or(|s| !s.is_empty()),
+        "a scope names a workspace"
+    );
+    scope.is_none_or(|ws| memory_workspace.is_none_or(|owner| owner == ws))
+}
+
 /// What a search could actually COMPARE, measured during the scan it describes.
 ///
 /// An empty result set has three causes and they are not interchangeable:
@@ -1135,18 +1152,12 @@ impl VectorStore {
         // Get more to filter
         let (all_results, coverage) = self.search_with_coverage(query_embedding, top_k * 3).await;
 
-        let filtered: Vec<(MemoryEntry, f32)> = match workspace_id {
-            // Workspace scope: global + this workspace only
-            Some(ws_id) => all_results
-                .into_iter()
-                .filter(|(entry, _)| {
-                    entry.workspace_id.is_none() || entry.workspace_id.as_deref() == Some(ws_id)
-                })
-                .take(top_k)
-                .collect(),
-            // Global scope: all memories
-            None => all_results.into_iter().take(top_k).collect(),
-        };
+        // Workspace scope: global + this workspace only; global scope: all.
+        let filtered: Vec<(MemoryEntry, f32)> = all_results
+            .into_iter()
+            .filter(|(entry, _)| visible_in_scope(entry.workspace_id.as_deref(), workspace_id))
+            .take(top_k)
+            .collect();
 
         (filtered, coverage)
     }
@@ -2192,6 +2203,25 @@ fn chrono_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one scope rule every recall path shares.
+    #[test]
+    fn a_workspace_scope_sees_its_own_and_the_global_memories() {
+        assert!(
+            visible_in_scope(None, Some("a")),
+            "global is visible everywhere"
+        );
+        assert!(visible_in_scope(Some("a"), Some("a")), "own workspace");
+        assert!(
+            !visible_in_scope(Some("b"), Some("a")),
+            "never another workspace"
+        );
+        assert!(
+            visible_in_scope(Some("b"), None),
+            "the global scope sees everything"
+        );
+        assert!(visible_in_scope(None, None));
+    }
 
     /// What the ranking did before `rank_top_k`: a STABLE sort of all N on
     /// similarity alone, then `truncate`. Kept verbatim as the oracle, so the
