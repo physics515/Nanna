@@ -8470,9 +8470,21 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       in milliseconds). **Still open:** logging `tools/list` failures, and deleting the legacy
       `HttpTransport` (its whole-request `.timeout(30 s)` would cut its own long-lived SSE GET —
       but it is on the delete list, not the fix list).
-- [ ] Browser (kept as tools): `navigate` needs a deadline and must not hold the browser lock
+- [~] Browser (kept as tools): `navigate` needs a deadline and must not hold the browser lock
       across it; `close` must close the target; `wait_for_selector` must wait; escape selectors
       (`cdp.rs:140,489`, `playwright.rs:254`).
+      *(2026-09-26 — the CDP backend, verified live against headless Chromium.)* `navigate` runs
+      opening the target and the load wait under one `timeout_ms` deadline; it still holds the
+      read lock until the page settles (so `close()` cannot tear the browser down under it), but
+      a page that never loads now ends the call — and releases every queued `close()` — at the
+      deadline instead of never. `CdpPage::close` closes the target (dropping a `Page` closes
+      nothing, so every `navigate` leaked a tab). `wait_for_selector` polls every 100 ms until the
+      deadline — a lone `find_element` answered from the DOM as it was, so it failed at once for
+      an element still rendering (live: waited 820 ms for one added at 800 ms). Selectors and
+      attribute names are spliced as JSON string literals (`js_string`) instead of `'…'` with
+      only `'` escaped: a trailing `\` broke out of the literal. **Still open:** the Playwright
+      backend's `wait_for_selector` (`is_visible` answers at once, like the old CDP one) — the
+      feature is off and its crate is not even fetched here, so it cannot be verified.
 
 **Stage 4 — the board client and what it must not port:**
 - [~] The Tauri layer's lock discipline: never hold `AppState` across a daemon round trip
