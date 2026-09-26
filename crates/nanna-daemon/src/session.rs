@@ -660,9 +660,6 @@ pub struct SubSessionInfo {
     pub result: Option<String>,
     /// Error message (on failure)
     pub error: Option<String>,
-    /// Cancellation flag for cooperative shutdown
-    #[serde(skip)]
-    pub cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// A message in the sub-session mailbox
@@ -1534,9 +1531,15 @@ impl SessionManager {
     }
 
     /// Update sub-session state
+    ///
+    /// A killed sub-session stays killed: the run it belonged to may still
+    /// report in as it winds down, and that must not revive it.
     pub async fn set_sub_session_state(&self, session_id: &str, state: SubSessionState) {
         let mut subs = self.sub_sessions.write().await;
         if let Some(info) = subs.get_mut(session_id) {
+            if info.state == SubSessionState::Killed {
+                return;
+            }
             info.state = state;
             if matches!(state, SubSessionState::Completed | SubSessionState::Failed | SubSessionState::Killed) {
                 info.finished_at = Some(Utc::now());
@@ -1549,8 +1552,11 @@ impl SessionManager {
         let mut subs = self.sub_sessions.write().await;
         if let Some(info) = subs.get_mut(session_id) {
             info.result = Some(result);
-            info.state = SubSessionState::Completed;
-            info.finished_at = Some(Utc::now());
+            // Kept as what the run wrote, but a killed run did not complete.
+            if info.state != SubSessionState::Killed {
+                info.state = SubSessionState::Completed;
+                info.finished_at = Some(Utc::now());
+            }
         }
     }
 
@@ -1559,8 +1565,10 @@ impl SessionManager {
         let mut subs = self.sub_sessions.write().await;
         if let Some(info) = subs.get_mut(session_id) {
             info.error = Some(error);
-            info.state = SubSessionState::Failed;
-            info.finished_at = Some(Utc::now());
+            if info.state != SubSessionState::Killed {
+                info.state = SubSessionState::Failed;
+                info.finished_at = Some(Utc::now());
+            }
         }
     }
 
@@ -1596,14 +1604,11 @@ impl SessionManager {
             .collect()
     }
 
-    /// Kill a sub-session (set cancellation flag + state)
+    /// Mark a sub-session killed. Stopping its run is the caller's (the
+    /// control plane cancels the agent's chat for this session).
     pub async fn kill_sub_session(&self, session_id: &str) -> bool {
         let mut subs = self.sub_sessions.write().await;
         if let Some(info) = subs.get_mut(session_id) {
-            // Signal cancellation
-            if let Some(ref flag) = info.cancellation_flag {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
             info.state = SubSessionState::Killed;
             info.finished_at = Some(Utc::now());
             info!("Killed sub-session: {}", session_id);
@@ -2309,7 +2314,6 @@ mod tests {
             model: None,
             result: None,
             error: None,
-            cancellation_flag: None,
         };
         manager.register_sub_session(info).await;
 

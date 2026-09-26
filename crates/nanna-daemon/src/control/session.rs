@@ -104,8 +104,16 @@ impl SubSessionRun {
         } = self;
         let task_for_extraction = task.clone();
 
-        // Mark as running
+        // Mark as running — unless it was killed before it got here.
         sessions.set_sub_session_state(&sid, SubSessionState::Running).await;
+        if sessions
+            .get_sub_session(&sid)
+            .await
+            .is_some_and(|info| info.state == SubSessionState::Killed)
+        {
+            info!("Sub-session {} was killed before it started", sid);
+            return;
+        }
 
         // Set per-session workdir for the sub-agent from the parent's
         // snapshot. Explicitly keyed on `sid`, and now inside the scope
@@ -428,9 +436,6 @@ impl ControlPlane {
         let session = self.sessions.create(Some(session_name)).await;
         let session_id = session.id.clone();
 
-        // Create cancellation flag
-        let cancellation_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
         // Register sub-session metadata
         let info = SubSessionInfo {
             session_id: session_id.clone(),
@@ -443,7 +448,6 @@ impl ControlPlane {
             model: model.clone(),
             result: None,
             error: None,
-            cancellation_flag: Some(cancellation_flag.clone()),
         };
         self.sessions.register_sub_session(info).await;
 
@@ -683,6 +687,12 @@ Your task: {task}")
         if let Some(info) = self.sessions.resolve_sub_session(&target).await {
             let killed = self.sessions.kill_sub_session(&info.session_id).await;
             if killed {
+                // Stop the run itself. Kill used to set a flag nothing read, so
+                // a "killed" sub-agent ran on to the end — and its finish then
+                // overwrote `killed` with `completed`.
+                if let Some(ref agent) = self.agent {
+                    agent.cancel(&info.session_id).await;
+                }
                 // Emit event
                 self.emit(Event::SubSessionKilled {
                     session_id: info.session_id.clone(),

@@ -3038,3 +3038,85 @@ async fn a_timed_out_sub_session_leaves_no_live_run_behind() {
         "the timed-out run is gone: {cancel}"
     );
 }
+
+/// Killing a sub-session stops its run, and it stays killed. Kill used to set
+/// a flag nothing read: the sub-agent ran on to the end, and its finish then
+/// overwrote `killed` with `completed`.
+#[tokio::test]
+async fn a_killed_sub_session_stops_and_stays_killed() {
+    use nanna_daemon::protocol::{Action, SessionAction};
+
+    let ollama = ScriptedOllama::start(vec![
+        "WAIT 20000 Finished anyway.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    client
+        .request(Action::Session(SessionAction::SpawnSubSession {
+            task: "work slowly".to_string(),
+            label: Some("doomed".to_string()),
+            parent_id: None,
+            model: None,
+            max_iterations: None,
+            timeout_secs: None,
+            system_prompt: None,
+        }))
+        .await
+        .expect("spawn answers");
+    // Kill once the run is really in flight: the stub has seen its request.
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        while ollama.chat_bodies.lock().await.is_empty() {
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the sub-agent reaches the model");
+    let killed = client
+        .request(Action::Session(SessionAction::KillSubSession {
+            target: "doomed".to_string(),
+        }))
+        .await
+        .expect("kill answers");
+    assert_eq!(killed["status"], "killed", "{killed}");
+
+    // Without touching the run otherwise, it winds down well before the
+    // stub's 20 s reply: the kill itself stopped it.
+    let after = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = doomed_status(&client).await;
+            if status["result"].is_string() || status["error"].is_string() {
+                return status;
+            }
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the killed run stopped instead of running on");
+    assert!(
+        !after.to_string().contains("Finished anyway"),
+        "the run did not finish its work: {after}"
+    );
+    assert_eq!(
+        after["state"], "killed",
+        "still killed after the run ended: {after}"
+    );
+}
+
+/// `sessions.get_sub_session_status` for the sub-session labelled `doomed`.
+async fn doomed_status(client: &Client) -> serde_json::Value {
+    client
+        .request(nanna_daemon::protocol::Action::Session(
+            nanna_daemon::protocol::SessionAction::GetSubSessionStatus {
+                target: "doomed".to_string(),
+            },
+        ))
+        .await
+        .expect("status answers")
+}

@@ -8146,6 +8146,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       30 s grace, recording the timeout with whatever the run wrote as the partial result — a
       cancelled turn ends `Ok`, which the first version of this fix mistook for a completion.
       1 e2e test on the scripted-model rig (red without the fix: `cancelled`, not `not_active`).
+      *(later)* **Kill:** `KillSubSession` set a `cancellation_flag` nothing read, so a killed
+      sub-agent ran on to the end, and its finish overwrote `killed` with `completed`. Kill now
+      cancels the agent's chat for that session; `killed` is terminal in the store (a late result
+      or error is kept, the state is not changed, and `Running` cannot revive it); a run killed
+      before it starts returns at once. The dead flag is deleted. 1 e2e test — red without the
+      fix on both counts: the killed run waited out the stub's 20 s reply. **Still open:**
+      `SubSessionInfo` overwrite on other paths, `agent_service` `try_write` dropping deltas.
 - [ ] `chat_harness.rs` park-waiter hot loop and the continuation loop; GUI
       `subscribe_channel_status` task leak, per-channel pinned model, `daemon_client.rs` dead
       "not connected" path.
