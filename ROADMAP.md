@@ -8264,8 +8264,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `ask_parent` entirely (Stage 3), so delete rather than reconcile (`server.rs:4779`).
 
 **Stage 3 — runs, context, LLM, tools:**
-- [ ] Call `pin_live_request()` when the card's prompt is appended, and make the run's tests
+- [x] Call `pin_live_request()` when the card's prompt is appended, and make the run's tests
       drive compression through the real entry path (`context.rs:457`, `agent_service.rs:1347`).
+      *(2026-09-26)* Pinned in `add_user_message_with_budget` — the one place a run's request is
+      pushed, for chat turns and harness steps alike — with a `debug_assert` that the pin names
+      that message. Until now every cut path fell back to index 0, which in a long session is the
+      *oldest* message: compression protected a stale question and could cut away the live one.
+      `the_live_request_survives_every_cut_path` only ever passed because it pins by hand; the
+      new `the_runs_request_is_pinned_where_it_is_pushed` goes through the real entry path, so
+      together they cover pin-then-cut end to end.
 - [ ] `deduplicate_messages` must never replace the newest tool result, and chunk hashes must
       clear when their summary is dropped (`context.rs:779-866`, `2272`).
 - [ ] `verified_outcomes` needs a reduction path (fold read-only successes, cap by budget) and

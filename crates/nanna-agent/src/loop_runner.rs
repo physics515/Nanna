@@ -6720,6 +6720,16 @@ impl Agent {
             }
             ctx.messages.push(AnthropicMessage::user(blocks));
         }
+        // This message IS the live request. `pin_live_request` existed with no
+        // caller, so every cut path fell back to index 0 — the OLDEST message
+        // of a long session — and compression could cut away the very
+        // question the run was answering while protecting a stale one.
+        ctx.pin_live_request();
+        debug_assert_eq!(
+            ctx.pinned_index() + 1,
+            ctx.messages.len(),
+            "the pin names the message just pushed"
+        );
     }
 
     /// Cooperative cancel: preserve unfinished text in the response AND in the
@@ -12007,6 +12017,37 @@ mod repeat_failure_breaker_tests {
                 Ok(ToolResult::success("ok"))
             }
         }
+    }
+
+    /// The run's request is pinned by the one path that pushes it. The pin had
+    /// no caller at all, so every cut path fell back to index 0 — in a long
+    /// session, the OLDEST message — and `the_live_request_survives_every_cut_path`
+    /// only held because that test pins by hand.
+    #[tokio::test]
+    async fn the_runs_request_is_pinned_where_it_is_pushed() {
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let agent = Agent::new(AgentConfig::default(), llm, Arc::new(ToolRegistry::new()));
+        {
+            let mut ctx = agent.context.write().await;
+            for turn in ["an old question", "an old answer", "another old question"] {
+                ctx.messages.push(AnthropicMessage::user_text(turn));
+            }
+        }
+        agent
+            .add_user_message_with_budget("the live question", &RunOptions::default())
+            .await;
+
+        let ctx = agent.context().await;
+        assert_eq!(
+            ctx.pinned_index(),
+            3,
+            "the pin names the new request, not index 0"
+        );
+        let pinned = &ctx.messages[ctx.pinned_index()];
+        assert!(
+            format!("{pinned:?}").contains("the live question"),
+            "{pinned:?}"
+        );
     }
 
     async fn flaky_agent(fail: Arc<AtomicBool>, executions: Arc<AtomicUsize>) -> Agent {
