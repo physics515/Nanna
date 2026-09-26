@@ -50,5 +50,5 @@ a restart loaded the stale copy straight back.
 ---
 
 Updating from 0.3.28 or earlier? The
-[0.3.29 release notes](https://github.com/physics515/Nanna/releases/tag/v0.3.29-beta.38) cover
+[0.3.29 release notes](https://github.com/basic-automation/Nanna/releases/tag/v0.3.29-beta.38) cover
 the board's foundations — members, deadlines and card threads — and link back to 0.3.28's.
