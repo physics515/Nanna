@@ -8135,9 +8135,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
 - [ ] `session.rs`: `update()` persisting the row but not the messages, `Fork` copying messages
       only, `History` ignoring `before`, write guard held across `persist_message`,
       `recover_checkpoints` reporting success into a missing session.
-- [ ] `control/session.rs`: sub-session timeout leaking `active_chats`, `KillSubSession` flag
+- [~] `control/session.rs`: sub-session timeout leaking `active_chats`, `KillSubSession` flag
       nobody reads, `SubSessionInfo` state overwritten on finish; `agent_service.rs` `try_write`
       dropping stream deltas into the recovery buffers.
+      *(2026-09-26 — the timeout leak.)* A sub-session past its `timeout_secs` was dropped
+      mid-flight by `tokio::time::timeout`, skipping the run's own finish path: its
+      `active_chats` entry and queue depth were never released, so the dead run stayed "live"
+      (`chat.cancel` on it answered `cancelled` forever) and the agent service read as busy.
+      `cancel_timed_out` now cancels it (abortive, PR #143) and awaits the wind-down within a
+      30 s grace, recording the timeout with whatever the run wrote as the partial result — a
+      cancelled turn ends `Ok`, which the first version of this fix mistook for a completion.
+      1 e2e test on the scripted-model rig (red without the fix: `cancelled`, not `not_active`).
 - [ ] `chat_harness.rs` park-waiter hot loop and the continuation loop; GUI
       `subscribe_channel_status` task leak, per-channel pinned model, `daemon_client.rs` dead
       "not connected" path.

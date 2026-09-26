@@ -33,7 +33,57 @@ struct SubSessionRun {
     parent_workdir: Option<std::path::PathBuf>,
 }
 
+/// How long a timed-out sub-session's run gets to wind down after it is
+/// cancelled. Cancellation is abortive (the in-flight stream and tool awaits
+/// are dropped at once), so a run normally returns within milliseconds; this
+/// bounds only a pathological one, which is then dropped as before.
+const SUB_SESSION_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl SubSessionRun {
+    /// End a sub-session run that overran `timeout` seconds.
+    ///
+    /// It used to be dropped mid-flight, which skipped the run's own cleanup:
+    /// its `active_chats` entry and queue depth were never released, so the
+    /// agent service read as busy from then on (and Stop found a ghost). It is
+    /// now cancelled and awaited, so the run's finish path releases both; its
+    /// partial output, if any, rides the error as for any failed run.
+    async fn cancel_timed_out<F>(
+        agent: &crate::agent_service::AgentService,
+        sid: &str,
+        timeout: u64,
+        chat: std::pin::Pin<&mut F>,
+    ) -> Result<crate::agent_service::ChatResult, crate::agent_service::ChatError>
+    where
+        F: std::future::Future<
+                Output = Result<crate::agent_service::ChatResult, crate::agent_service::ChatError>,
+            >,
+    {
+        let message = format!("Sub-session timed out after {timeout}s");
+        if !agent.cancel(sid).await {
+            debug!("Sub-session {sid} timed out with no active chat to cancel");
+        }
+        match tokio::time::timeout(SUB_SESSION_CANCEL_GRACE, chat).await {
+            Ok(Err(e)) => Err(crate::agent_service::ChatError {
+                message,
+                partial_result: e.partial_result,
+            }),
+            // A cancelled turn ends as a stopped reply, which is `Ok` — but it
+            // was stopped because it overran, so it is the timeout, with what
+            // it wrote kept as the partial result.
+            Ok(Ok(stopped)) => Err(crate::agent_service::ChatError {
+                message,
+                partial_result: Some(Box::new(stopped)),
+            }),
+            Err(_) => {
+                warn!("Sub-session {sid} did not wind down within the cancel grace; dropping it");
+                Err(crate::agent_service::ChatError {
+                    message,
+                    partial_result: None,
+                })
+            }
+        }
+    }
+
     /// Run the sub-agent to completion and record its outcome. Must execute
     /// inside a `ToolRegistry::with_run_session` scope for `session_id`.
     async fn run(self) {
@@ -73,20 +123,15 @@ impl SubSessionRun {
         };
 
         // Apply timeout if specified
+        let chat = agent.chat_with_options(&sid, &task, Some(sys_prompt), &[], chat_options);
         let result = if let Some(timeout) = timeout_secs {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(timeout),
-                agent.chat_with_options(&sid, &task, Some(sys_prompt), &[], chat_options),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                Err(crate::agent_service::ChatError {
-                    message: format!("Sub-session timed out after {timeout}s"),
-                    partial_result: None,
-                })
-            })
+            tokio::pin!(chat);
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout), &mut chat).await {
+                Ok(result) => result,
+                Err(_) => Self::cancel_timed_out(&agent, &sid, timeout, chat).await,
+            }
         } else {
-            agent.chat_with_options(&sid, &task, Some(sys_prompt), &[], chat_options).await
+            chat.await
         };
 
         match result {

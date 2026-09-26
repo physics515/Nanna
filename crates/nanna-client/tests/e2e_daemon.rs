@@ -2970,3 +2970,71 @@ async fn a_request_longer_than_the_window_says_so() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// A sub-session that overruns its timeout is cancelled and wound down, not
+/// dropped mid-flight. Dropped, its chat's `active_chats` entry was never
+/// released: the daemon kept reporting the long-dead run as live — `chat.cancel`
+/// on it answered `cancelled` forever — and the agent service read as busy.
+#[tokio::test]
+async fn a_timed_out_sub_session_leaves_no_live_run_behind() {
+    use nanna_daemon::protocol::{Action, SessionAction};
+
+    // Every model reply is held back far past the sub-session's 1 s timeout.
+    let ollama =
+        ScriptedOllama::start(vec!["WAIT 20000 Too late.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let spawned = client
+        .request(Action::Session(SessionAction::SpawnSubSession {
+            task: "take your time".to_string(),
+            label: Some("slow".to_string()),
+            parent_id: None,
+            model: None,
+            max_iterations: None,
+            timeout_secs: Some(1),
+            system_prompt: None,
+        }))
+        .await
+        .expect("sessions.spawn_sub_session answers");
+    assert!(spawned.get("error").is_none(), "{spawned}");
+
+    let status = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            let status = client
+                .request(Action::Session(SessionAction::GetSubSessionStatus {
+                    target: "slow".to_string(),
+                }))
+                .await
+                .expect("status answers");
+            if status["error"].is_string() {
+                return status;
+            }
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the sub-session times out");
+    assert!(
+        status["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("timed out")),
+        "{status}"
+    );
+    let sub = status["session_id"].as_str().expect("an id").to_string();
+
+    let cancel = client
+        .chat()
+        .cancel(&sub)
+        .await
+        .expect("chat.cancel answers");
+    assert_eq!(
+        cancel["status"], "not_active",
+        "the timed-out run is gone: {cancel}"
+    );
+}
