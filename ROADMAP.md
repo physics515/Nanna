@@ -8392,8 +8392,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (release build, 2026-09-26) — so a loop that could finish within its timeout never reaches
       the limit, and a runaway `while (true)` throws within about twice the timeout (the test's
       ends in 0.07 s). **Still open:** regex catastrophic backtracking (not a loop), the Python
-      engine, manifest skills' `kill_on_drop`, and the registry backstop for undeclared
-      timeouts.
+      engine and the registry backstop for undeclared timeouts.
+      *(2026-09-26, later)* Manifest (`tool.yaml`) skills enforce their own timeout and kill the
+      whole tree. The timeout used to exist only as the registry dropping the future, which
+      killed nothing: the shell and anything it started ran on, orphaned. `run_contained` now
+      spawns with `kill_on_drop` + its own process group (Windows: a `ChildJob`), runs the stdin
+      write and the wait under the manifest deadline, and on expiry kills the tree
+      (`kill_process_tree` + job terminate) and says so; a run that finishes disarms the job like
+      `exec` does. Non-binary skills get a null stdin (`spawn` would inherit the daemon's). 2 tests
+      (a `sleep` grandchild is gone after a 1 s timeout; a quick skill is untouched).
       *(2026-09-26, later)* `SystemExit` carries its status: the Python wrapper swallowed it,
       so `sys.exit(3)` — or `sys.exit('bad input')` — came back `success: true`. A non-zero or
       message exit is now a failure naming the status (stdout before it is kept); `exit()`,

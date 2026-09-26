@@ -5950,6 +5950,7 @@ dependencies = [
  "lopdf",
  "nanna-browser",
  "nanna-llm",
+ "nanna-proc",
  "nanna-scripting",
  "nanna-simd",
  "nanna-storage",
