@@ -190,42 +190,50 @@ impl ControlPlane {
         }
     }
 
-    /// `MemoryAction::Clear`: all memories (in-memory only), or one scope's durably.
+    /// `MemoryAction::Clear`: every memory, or one scope's — durably either way.
+    ///
+    /// `None` used to empty RAM only and answer `"cleared"`, so the next restart
+    /// loaded every memory back from Turso. Both arms now go through
+    /// [`MemoryService::forget_many`], which removes a memory from RAM only once
+    /// its row is gone; a partial failure is reported as one, never as success.
+    ///
+    /// Destructive scopes stay narrow, unlike `list`'s: `"global"` clears only
+    /// unscoped memories, and a workspace id clears ONLY that workspace's —
+    /// never the globals its tab also displays.
     async fn memory_clear(memory: &MemoryService, scope: Option<String>) -> Value {
-        match scope.as_deref() {
-            None => {
-                memory.clear().await;
-                // Note: clear() removes all in-memory entries. Individual removes
-                // write-through to Turso, but bulk clear would require a separate
-                // DB call. For now we log a warning.
-                warn!("Memory cleared in-memory. Turso entries are NOT cleared — restart will reload them.");
-                info!("Cleared all memories (in-memory only)");
-                json!({ "status": "cleared", "scope": "all" })
-            }
-            Some(s) => {
-                // Scoped clear removes each matching entry via
-                // forget(), which write-throughs to Turso — durable,
-                // unlike the legacy all-clear above. "global" clears
-                // only unscoped entries; a workspace id clears ONLY
-                // that workspace's entries (never the globals its
-                // tab also displays — destructive ops stay narrow).
-                let target_global = s == "global";
-                let entries = memory.list_all().await;
-                let mut removed = 0usize;
-                for m in entries {
-                    let matches = if target_global {
-                        m.workspace_id.is_none()
-                    } else {
-                        m.workspace_id.as_deref() == Some(s)
-                    };
-                    if matches && memory.forget(&m.id).await.is_ok() {
-                        removed += 1;
-                    }
-                }
-                info!("Cleared {} memories in scope {}", removed, s);
-                json!({ "status": "cleared", "scope": s, "removed": removed })
-            }
+        let entries = memory.list_all().await;
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter(|m| match scope.as_deref() {
+                None => true,
+                Some("global") => m.workspace_id.is_none(),
+                Some(ws) => m.workspace_id.as_deref() == Some(ws),
+            })
+            .map(|m| m.id.as_str())
+            .collect();
+        let outcome = memory.forget_many(&ids).await;
+        let scope_name = scope.as_deref().unwrap_or("all");
+        info!(
+            "Cleared {} of {} memories in scope {} ({} refused)",
+            outcome.removed,
+            ids.len(),
+            scope_name,
+            outcome.failed
+        );
+        if outcome.failed > 0 {
+            return json!({
+                "error": "clear_incomplete",
+                "scope": scope_name,
+                "removed": outcome.removed,
+                "failed": outcome.failed,
+                "message": format!(
+                    "{} memories could not be deleted from storage and were kept: {}",
+                    outcome.failed,
+                    outcome.first_error.unwrap_or_default()
+                ),
+            });
         }
+        json!({ "status": "cleared", "scope": scope_name, "removed": outcome.removed })
     }
 
     /// `MemoryAction::Consolidate`: one explicit, non-idle-gated dream cycle.

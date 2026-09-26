@@ -578,7 +578,8 @@ pub async fn update_memory(
 /// # Errors
 ///
 /// Returns `Failed to clear memories: …` when the daemon cannot be reached or
-/// the `memory.clear` request is dropped or times out.
+/// the `memory.clear` request is dropped or times out, and the daemon's own
+/// message when it kept memories it could not delete from storage.
 #[tauri::command]
 pub async fn clear_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -586,11 +587,19 @@ pub async fn clear_memories(
     workspace_id: Option<String>,
 ) -> Result<(), String> {
     let effective = resolve_memory_scope(scope, workspace_id);
-    backend_handle(&state)
+    let reply = backend_handle(&state)
         .await
         .memory_clear(effective.as_deref())
         .await
         .map_err(|e| format!("Failed to clear memories: {e}"))?;
+    // A refused or partial clear arrives inside the `Ok` reply. Dropping it
+    // here toasted "All memories cleared" over memories that were kept.
+    if reply.get("error").is_some() {
+        return Err(reply["message"]
+            .as_str()
+            .unwrap_or("The daemon refused to clear memories")
+            .to_string());
+    }
     info!("Cleared memories (scope: {:?}, via daemon)", effective);
     Ok(())
 }

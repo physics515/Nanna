@@ -8065,8 +8065,23 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       memory through the *row* loop and the chunk-only pass never ran. The test now fills the row
       over-fetch with another workspace's perfect matches, and was confirmed red on the old filter
       (`["mine"]` vs `["global","mine"]`); the NaN test likewise. 4 tests.
-- [ ] `MemoryAction::Clear{scope:None}` must be durable or refuse; `save_entry`'s conflict
+- [x] `MemoryAction::Clear{scope:None}` must be durable or refuse; `save_entry`'s conflict
       fallback must propagate its three errors (`control/memory.rs:194`, `memory_persistence.rs:189`).
+      *(2026-09-26)* **The hole was wider than the clear.** `VectorStore::remove` — behind *every*
+      `forget`, so the IPC delete, the `memory.delete` tool and the scoped clear — removed from RAM
+      first and logged a backend failure as "non-fatal": a delete reported as done that a restart
+      undid. It now writes the backend **first** and returns its error, leaving RAM matching disk.
+      New `remove_many_durable` → `DurableRemoval { removed, failed, first_error }`: the batched
+      `remove_entries` is the fast path, but `bulk_delete` is not one transaction, so on failure it
+      falls back to per-id deletes (idempotent) to learn exactly which rows went, and only those
+      leave RAM. `MemoryService::clear` (RAM only, its sole caller the IPC handler) is **deleted** and
+      replaced by `forget_many`; both clear arms use it and a partial result answers
+      `clear_incomplete` with counts and the backend's message, never `cleared`. The GUI's
+      `clear_memories` also dropped the reply, so Settings → Data would have toasted "All memories
+      cleared" over kept memories; it now surfaces the error. `save_entry`'s conflict branch
+      returns each of its three writes' errors (content first, so a later failure leaves the row
+      queued for re-embedding, the safe direction). 4 tests; the single-delete one is red on the
+      old RAM-first order by construction.
 - [x] `memory.search` and `memory_in_scope` disagree on `scope:"global"`; one meaning
       (`control/memory.rs:14,125`). The board's memory page is the surviving consumer.
       *(2026-09-26)* `search` mapped `"global"` to *every* memory (its own comment said "global

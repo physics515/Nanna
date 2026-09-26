@@ -2114,3 +2114,120 @@ async fn memory_search_and_list_agree_on_the_global_scope() {
     let searched = cp.handle("test", Action::Memory(search)).await;
     assert_eq!(ids(&searched), ["global", "scoped"], "{searched}");
 }
+
+/// Records every row the daemon asks storage to delete, and refuses one.
+struct RecordingDeletes {
+    refuse: Option<&'static str>,
+    deleted: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl nanna_memory::MemoryPersistence for RecordingDeletes {
+    async fn save_entry(
+        &self,
+        _entry: &nanna_memory::MemoryEntry,
+    ) -> Result<(), nanna_memory::MemoryError> {
+        Ok(())
+    }
+    async fn remove_entry(&self, id: &str) -> Result<(), nanna_memory::MemoryError> {
+        if self.refuse == Some(id) {
+            return Err(nanna_memory::MemoryError::Persistence(
+                "disk I/O error".into(),
+            ));
+        }
+        self.deleted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id.to_string());
+        Ok(())
+    }
+    async fn update_entry_fsrs(
+        &self,
+        _id: &str,
+        _fsrs: &nanna_memory::FsrsState,
+    ) -> Result<(), nanna_memory::MemoryError> {
+        Ok(())
+    }
+    async fn update_entry_content(
+        &self,
+        _id: &str,
+        _content: &str,
+    ) -> Result<(), nanna_memory::MemoryError> {
+        Ok(())
+    }
+    async fn load_all(&self) -> Result<Vec<nanna_memory::MemoryEntry>, nanna_memory::MemoryError> {
+        Ok(Vec::new())
+    }
+}
+
+async fn clear_all_against(db: Arc<RecordingDeletes>) -> (Value, usize) {
+    let memory = Arc::new(
+        nanna_memory::MemoryService::new(nanna_memory::MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        })
+        .with_persistence(db),
+    );
+    for (id, workspace) in [("a", None), ("b", Some("ws")), ("c", None)] {
+        memory
+            .add_entry(nanna_memory::MemoryEntry {
+                id: id.to_string(),
+                content: format!("memory {id}"),
+                embeddings: std::collections::HashMap::new(),
+                embedding_model: None,
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                metadata: std::collections::HashMap::new(),
+                timestamp: 0,
+                fsrs: nanna_memory::FsrsState::default(),
+                workspace_id: workspace.map(str::to_string),
+            })
+            .await
+            .expect("add");
+    }
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.memory = Some(Arc::clone(&memory));
+    let resp = Arc::new(cp)
+        .handle("test", Action::Memory(MemoryAction::Clear { scope: None }))
+        .await;
+    (resp, memory.count().await)
+}
+
+/// "Delete All Memories" used to empty RAM only and answer `cleared`: the rows
+/// stayed in Turso and the next restart loaded every one of them back.
+#[tokio::test]
+async fn clearing_every_memory_deletes_the_rows() {
+    let db = Arc::new(RecordingDeletes {
+        refuse: None,
+        deleted: std::sync::Mutex::new(Vec::new()),
+    });
+    let (resp, left) = clear_all_against(Arc::clone(&db)).await;
+    assert_eq!(resp["status"], "cleared", "{resp}");
+    assert_eq!(resp["removed"], 3, "{resp}");
+    assert_eq!(left, 0);
+    let mut deleted = db.deleted.lock().expect("lock").clone();
+    deleted.sort();
+    assert_eq!(deleted, ["a", "b", "c"], "every row reached storage");
+}
+
+/// A row storage refused is kept, and the reply says so instead of `cleared`.
+#[tokio::test]
+async fn a_clear_storage_refused_is_reported_not_claimed() {
+    let db = Arc::new(RecordingDeletes {
+        refuse: Some("b"),
+        deleted: std::sync::Mutex::new(Vec::new()),
+    });
+    let (resp, left) = clear_all_against(db).await;
+    assert_eq!(resp["error"], "clear_incomplete", "{resp}");
+    assert_eq!(resp["removed"], 2, "{resp}");
+    assert_eq!(resp["failed"], 1, "{resp}");
+    assert!(
+        resp["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("disk I/O")),
+        "{resp}"
+    );
+    assert_eq!(
+        left, 1,
+        "the refused memory is still visible, as it is still on disk"
+    );
+}

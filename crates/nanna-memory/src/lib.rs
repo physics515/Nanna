@@ -188,6 +188,17 @@ pub struct MemoryStoreHealth {
     pub expected: usize,
 }
 
+/// What a durable batch removal did. See [`VectorStore::remove_many_durable`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DurableRemoval {
+    /// Entries whose row the backend confirmed gone, and which left RAM.
+    pub removed: usize,
+    /// Ids the backend refused to delete. They are still in RAM and on disk.
+    pub failed: usize,
+    /// The first backend error among `failed`, for the caller to report.
+    pub first_error: Option<String>,
+}
+
 /// Which memories a recall may return.
 ///
 /// One definition for every recall path, and the only place the rule lives.
@@ -1225,26 +1236,85 @@ impl VectorStore {
 
     /// Remove entry by ID.
     ///
+    /// Durable or refused: the persistence backend is written **first**, and a
+    /// failure there leaves the entry in RAM and returns the error. The old
+    /// order (RAM, then a logged-and-ignored backend error) reported a delete
+    /// that a restart undid — the memory came back from disk.
+    ///
     /// # Errors
     ///
-    /// Returns `MemoryError::NotFound` if no entry with the given ID exists.
+    /// Returns `MemoryError::NotFound` if no entry with the given ID exists,
+    /// and the backend's error if it could not delete the row.
     pub async fn remove(&self, id: &str) -> Result<(), MemoryError> {
+        if !self.entries.read().await.iter().any(|e| e.id == id) {
+            return Err(MemoryError::NotFound(id.to_string()));
+        }
+        if let Some(ref db) = self.db {
+            db.remove_entry(id).await?;
+        }
         let mut entries = self.entries.write().await;
-        let idx = entries
-            .iter()
-            .position(|e| e.id == id)
-            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
-        entries.remove(idx);
+        let before = entries.len();
+        entries.retain(|e| e.id != id);
+        debug_assert!(before - entries.len() <= 1, "memory ids are unique");
         drop(entries);
-
-        // Write-through: remove from persistence backend
-        if let Some(ref db) = self.db
-            && let Err(e) = db.remove_entry(id).await {
-                warn!("Failed to remove memory entry {} from persistence: {}", id, e);
-                // Non-fatal
-            }
-
         Ok(())
+    }
+
+    /// Remove many entries, durably: an entry leaves RAM only once the backend
+    /// has confirmed its row is gone.
+    ///
+    /// The fast path is the one batched [`MemoryPersistence::remove_entries`]
+    /// call. That batch is not one transaction, so when it fails it may have
+    /// stopped part-way; the fallback then deletes one id at a time (deleting
+    /// an already-deleted row is a no-op) to learn exactly which rows are gone,
+    /// and only those leave RAM. So the result can be trusted row by row:
+    /// what it reports removed will not come back on a restart, and what it
+    /// reports failed is still visible.
+    pub async fn remove_many_durable(&self, ids: &[&str]) -> DurableRemoval {
+        if ids.is_empty() {
+            return DurableRemoval::default();
+        }
+        let mut failed = 0usize;
+        let mut first_error = None;
+        let confirmed: Vec<&str> = match self.db {
+            None => ids.to_vec(),
+            Some(ref db) => match db.remove_entries(ids).await {
+                Ok(()) => ids.to_vec(),
+                Err(batch_error) => {
+                    warn!(
+                        "Batch removal of {} memories failed ({batch_error}); retrying one by one",
+                        ids.len()
+                    );
+                    let mut confirmed = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        match db.remove_entry(id).await {
+                            Ok(()) => confirmed.push(*id),
+                            Err(e) => {
+                                failed += 1;
+                                first_error.get_or_insert_with(|| e.to_string());
+                            }
+                        }
+                    }
+                    confirmed
+                }
+            },
+        };
+        let gone: std::collections::HashSet<&str> = confirmed.iter().copied().collect();
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        entries.retain(|e| !gone.contains(e.id.as_str()));
+        let removed = before - entries.len();
+        drop(entries);
+        debug_assert!(
+            removed <= ids.len(),
+            "removed more entries than ids requested"
+        );
+        debug_assert!(failed <= ids.len(), "more failures than ids");
+        DurableRemoval {
+            removed,
+            failed,
+            first_error,
+        }
     }
 
     /// Remove many entries by ID in one batch.
@@ -2807,6 +2877,108 @@ mod tests {
             fsrs: FsrsState::default(),
             workspace_id: None,
         }
+    }
+
+    /// A backend that refuses to delete one named row, and whose batch delete
+    /// always fails part-way — the shape of a real `bulk_delete`, which is not
+    /// one transaction.
+    struct RefusingDb {
+        refuse: &'static str,
+    }
+    #[async_trait]
+    impl MemoryPersistence for RefusingDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn remove_entry(&self, id: &str) -> Result<(), MemoryError> {
+            if id == self.refuse {
+                return Err(MemoryError::Persistence("database is locked".into()));
+            }
+            Ok(())
+        }
+        async fn remove_entries(&self, _ids: &[&str]) -> Result<(), MemoryError> {
+            Err(MemoryError::Persistence("batch stopped part-way".into()))
+        }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+            Ok(vec![])
+        }
+    }
+
+    fn refusing_store(refuse: &'static str) -> VectorStore {
+        VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        })
+        .with_persistence(Arc::new(RefusingDb { refuse }))
+    }
+
+    /// A delete the backend refused used to leave RAM first and log the
+    /// failure, so the caller was told "deleted" and a restart brought the
+    /// memory back. Now it is refused, and RAM still matches disk.
+    #[tokio::test]
+    async fn a_delete_the_backend_refuses_is_refused() {
+        let store = refusing_store("stuck");
+        store.add(entry_dim8("stuck")).await.unwrap();
+        store.add(entry_dim8("free")).await.unwrap();
+
+        let refused = store.remove("stuck").await;
+        assert!(
+            matches!(refused, Err(MemoryError::Persistence(_))),
+            "the backend's error is returned: {refused:?}"
+        );
+        assert!(
+            store.get("stuck").await.is_some(),
+            "kept, because disk kept it"
+        );
+
+        store
+            .remove("free")
+            .await
+            .expect("an ordinary delete still works");
+        assert!(store.get("free").await.is_none());
+        assert!(matches!(
+            store.remove("free").await,
+            Err(MemoryError::NotFound(_))
+        ));
+    }
+
+    /// The batch is not one transaction, so its failure says nothing about
+    /// which rows went. The durable path finds out one id at a time and removes
+    /// from RAM exactly the rows the backend confirmed gone.
+    #[tokio::test]
+    async fn a_failed_batch_removes_exactly_what_the_backend_confirmed() {
+        let store = refusing_store("m1");
+        for i in 0..3 {
+            store.add(entry_dim8(&format!("m{i}"))).await.unwrap();
+        }
+
+        let outcome = store.remove_many_durable(&["m0", "m1", "m2"]).await;
+
+        assert_eq!(outcome.removed, 2);
+        assert_eq!(outcome.failed, 1);
+        assert!(
+            outcome
+                .first_error
+                .as_deref()
+                .is_some_and(|e| e.contains("locked")),
+            "the refused row's own error is reported: {outcome:?}"
+        );
+        assert!(
+            store.get("m1").await.is_some(),
+            "the refused row stays visible"
+        );
+        assert_eq!(store.len().await, 1);
+        assert_eq!(
+            store.remove_many_durable(&[]).await,
+            DurableRemoval::default()
+        );
     }
 
     #[tokio::test]

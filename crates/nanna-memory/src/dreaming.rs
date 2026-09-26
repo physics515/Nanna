@@ -688,8 +688,9 @@ impl DreamingService {
     ///
     /// # Errors
     ///
-    /// Returns [`MemoryError::NotFound`] when no memory has `id`. Failing to
-    /// remove it from the persistence backend is logged, not returned.
+    /// Returns [`MemoryError::NotFound`] when no memory has `id`, and the
+    /// backend's error when it could not delete the row (the memory is then
+    /// kept, so RAM and disk still agree).
     pub async fn forget(&self, id: &str) -> Result<(), MemoryError> {
         self.memory.forget(id).await
     }

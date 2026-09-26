@@ -1985,10 +1985,19 @@ impl MemoryService {
         Ok(())
     }
 
-    /// Clear all memories
-    pub async fn clear(&self) {
-        self.store.clear().await;
-        info!("Cleared all memories");
+    /// Forget every memory in `ids`, durably. See
+    /// [`crate::VectorStore::remove_many_durable`]: a memory reported removed
+    /// is gone from disk too, and one reported failed is still there.
+    ///
+    /// Replaces a `clear()` that emptied RAM only — the daemon reported
+    /// "cleared" and the next restart loaded every memory back.
+    pub async fn forget_many(&self, ids: &[&str]) -> crate::DurableRemoval {
+        let outcome = self.store.remove_many_durable(ids).await;
+        info!(
+            "Forgot {} memories ({} refused by the backend)",
+            outcome.removed, outcome.failed
+        );
+        outcome
     }
 
     /// Save memories to file.
