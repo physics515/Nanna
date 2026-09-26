@@ -8228,10 +8228,26 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       under a read guard; `windows_service` reports Running after an early daemon exit; service
       plist/unit paths unquoted (`control/scheduler.rs:37`, `reminder_service.rs:218`,
       `windows_service.rs:362`, `service.rs:297`).
-- [ ] Config: `file_encryption_key` must pick one key source and stick to it; `SecureStore::set`
+- [x] Config: `file_encryption_key` must pick one key source and stick to it; `SecureStore::set`
       must remove the file copy like `delete` does; `save_to` writes atomically (tmp + rename)
       because the daemon watches the file; document env precedence (`credentials.rs:639,224`,
       `lib.rs:975,1667`); `hydrate_ollama_token` binds a blank token (`lib.rs:1195`).
+      *(2026-09-26)* **The key flip was a data-loss path.** "Keyring, else a key file" chose by
+      *availability*: one keyring hiccup (locked, D-Bus down) minted a fresh `credentials.key`,
+      `credentials.enc` stopped decrypting, and the next `set` re-encrypted it under the new key —
+      every credential the old key held, orphaned. And the reverse: a key file made during an
+      outage was ignored once the keyring came back, which then minted *another* key. The choice
+      is now a pure `choose_file_key(file_key, keyring, ciphertext)`: the key is **whichever one
+      opens the existing store**; a new key is generated only when no store exists; a store no key
+      at hand opens is refused (`Crypto`, naming the keyring when it is the likely holder) rather
+      than re-keyed. Exhaustively tested (8 cases). `set` now drops the file-fallback copy after a
+      keyring write — left behind it was the *old* secret, which `get` returned the next time the
+      keyring failed. The store's temp file is created 0600 like the key file. `save_to` is temp +
+      rename. **The Ollama "blank token" was a blank *host*:** binding an unbound token to an empty
+      running address recorded "no server", which matches no server ever — the token was silently
+      retired; both `hydrate_ollama_token` and `bind_unbound_ollama_token` now leave it unbound for
+      the first real server. Precedence documented on `with_env_overrides`: environment >
+      `config.toml` > secure store, blank = unset. 2 tests.
 - [ ] `ParentChannelImpl.model` is a boot-time clone; the router member's profile replaces
       `ask_parent` entirely (Stage 3), so delete rather than reconcile (`server.rs:4779`).
 
