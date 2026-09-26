@@ -1870,6 +1870,26 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete one message of a daemon session, by its message id.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
+    pub async fn delete_daemon_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        // The message id is stored in `tool_use_id` (see `add_daemon_message`).
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND tool_use_id = ?2",
+            turso::params![session_id, message_id],
+        )
+        .await?;
+        drop(conn);
+        Ok(())
+    }
+
     /// Delete a daemon session and its messages.
     ///
     /// # Errors

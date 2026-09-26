@@ -971,7 +971,35 @@ impl SessionManager {
             Err(e) => warn!("Failed to persist message {} in session {}: {}", msg.id, session_id, e),
         }
     }
-    
+
+    /// Fork session `id`: a new session in the same workspace, with the same
+    /// settings (`metadata`: pinned model, tools, …) and a copy of every
+    /// message under a fresh id, stored like any other. `None` if `id` does
+    /// not exist.
+    ///
+    /// The control plane used to copy only the messages — dropping the
+    /// workspace and settings — through [`Self::update`], which never stored
+    /// them: the fork came back empty after a restart.
+    pub async fn fork(&self, id: &str, name: Option<String>) -> Option<Session> {
+        let original = self.get(id).await?;
+        let name = name.or_else(|| original.name.as_ref().map(|n| format!("{n} (copy)")));
+        let mut forked = self
+            .create_in_workspace(name, original.workspace_id.clone())
+            .await;
+        forked.metadata = original.metadata.clone();
+        forked.messages = original
+            .messages
+            .iter()
+            .map(|m| SessionMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                ..m.clone()
+            })
+            .collect();
+        debug_assert_eq!(forked.messages.len(), original.messages.len());
+        self.replace(forked.clone()).await;
+        Some(forked)
+    }
+
     /// Create a session and return it
     pub async fn create(&self, name: Option<String>) -> Session {
         self.create_in_workspace(name, None).await
@@ -1228,6 +1256,49 @@ impl SessionManager {
     /// the live value wins and `update` stays pin-neutral — it can neither set
     /// nor clear a pin. A session the map has never seen has no live value to
     /// reconcile against, so its snapshot carries through as-is.
+    /// Replace a session wholesale: its row AND its messages, in memory and in
+    /// the store.
+    ///
+    /// [`Self::update`] persists only the row, so a caller that changed the
+    /// message list through it changed memory alone: Regenerate's dropped
+    /// reply came back from the store on the next restart, and a fork's copied
+    /// messages were never stored at all. Messages are matched by id: the ones
+    /// no longer present are deleted, the new ones written; unchanged ones are
+    /// left as they are.
+    pub async fn replace(&self, session: Session) {
+        let before: HashSet<String> = self
+            .sessions
+            .read()
+            .await
+            .get(&session.id)
+            .map(|live| live.messages.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        let after: HashSet<&str> = session.messages.iter().map(|m| m.id.as_str()).collect();
+        let removed: Vec<String> = before
+            .iter()
+            .filter(|id| !after.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let added: Vec<SessionMessage> = session
+            .messages
+            .iter()
+            .filter(|m| !before.contains(&m.id))
+            .cloned()
+            .collect();
+        let id = session.id.clone();
+        self.update(session).await;
+        if let Some(ref storage) = self.storage {
+            for message_id in &removed {
+                if let Err(e) = storage.delete_daemon_message(&id, message_id).await {
+                    warn!("Failed to delete message {message_id} in session {id}: {e}");
+                }
+            }
+        }
+        for message in &added {
+            self.persist_message(&id, message).await;
+        }
+    }
+
     pub async fn update(&self, mut session: Session) {
         let row = {
             let mut sessions = self.sessions.write().await;

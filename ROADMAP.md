@@ -8132,7 +8132,7 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       before ack, own replay check, webhook-reply Markdown, Signal bypassing `process_message`,
       unbounded `AppState.agents`. What stays of `nanna-server` is decided when remote board access
       is designed (collaboration); until then it is not a supported surface.
-- [~] `session.rs`: `update()` persisting the row but not the messages, `Fork` copying messages
+- [x] `session.rs`: `update()` persisting the row but not the messages, `Fork` copying messages
       only, `History` ignoring `before`, write guard held across `persist_message`,
       `recover_checkpoints` reporting success into a missing session.
       *(2026-09-26 — `History`'s `before`.)* It was destructured as `before: _`, so a client
@@ -8149,8 +8149,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       session read and write in the daemon for a disk write (this host's array measures 36 MB/s).
       Both now clone the message, release the guard, then persist; order is safe because the
       store sorts by `created_at`, assigned under the lock. Daemon 638 + e2e 44 green (the
-      restart-persistence e2e included). **Still open:** `update()` not persisting messages,
-      `Fork` copying messages only.
+      restart-persistence e2e included).
+      *(later — the line is complete.)* **`update()` stored the row only**, so its two callers
+      that changed the message list changed memory alone: Regenerate's dropped turn came back from
+      the store on the next start (with the question duplicated), and a fork's copied messages
+      were never stored — the fork came back empty. New `SessionManager::replace` syncs the
+      message set by id (deletes the removed through the new `delete_daemon_message`, stores the
+      added) and Regenerate uses it. **`Fork`** is now `SessionManager::fork`: same workspace, same
+      settings (`metadata` — pinned model, tools; they were dropped), and every message copied
+      under a fresh id, stored via `replace`. 2 e2e tests across a daemon restart (fork: 0 of 2
+      messages without the fix; regenerate: the first answer resurrected). Daemon + storage 845,
+      e2e 46 green.
 - [~] `control/session.rs`: sub-session timeout leaking `active_chats`, `KillSubSession` flag
       nobody reads, `SubSessionInfo` state overwritten on finish; `agent_service.rs` `try_write`
       dropping stream deltas into the recovery buffers.

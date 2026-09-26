@@ -3120,3 +3120,172 @@ async fn doomed_status(client: &Client) -> serde_json::Value {
         .await
         .expect("status answers")
 }
+
+/// A fork's copied conversation is stored like any other: it survives a
+/// restart, and the original keeps its own. The fork used to be written through
+/// `update`, which stores only the session row — its messages existed in memory
+/// alone and came back empty after a restart.
+#[tokio::test]
+async fn a_forked_conversation_survives_a_restart() {
+    use nanna_daemon::protocol::{Action, SessionAction};
+
+    let ollama =
+        ScriptedOllama::start(vec!["The original answer.\nTASK COMPLETE".to_string()]).await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), {
+        let host = host.clone();
+        move |b| {
+            b.with_model(STUB_MODEL)
+                .with_ollama_host(host)
+                .with_scheduler(false)
+        }
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let original = session_id_of(
+        &client
+            .sessions()
+            .create(Some("original".to_string()))
+            .await
+            .expect("create"),
+    );
+    converse(&client, &original, "ask something").await;
+    let count = |history: &serde_json::Value| history["messages"].as_array().map_or(0, Vec::len);
+    let before = count(
+        &client
+            .sessions()
+            .history(&original, None)
+            .await
+            .expect("history"),
+    );
+    assert!(before >= 2, "a question and an answer");
+
+    let forked = client
+        .request(Action::Session(SessionAction::Fork {
+            id: original.clone(),
+            name: Some("the fork".to_string()),
+        }))
+        .await
+        .expect("fork answers");
+    let fork_id = forked["session"]["id"]
+        .as_str()
+        .expect("the fork's id")
+        .to_string();
+
+    client.disconnect().await;
+    let restarted = TestDaemon::start_with(daemon.stop(), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = restarted.connect_client().await;
+    let fork_after = count(
+        &client
+            .sessions()
+            .history(&fork_id, None)
+            .await
+            .expect("history"),
+    );
+    let original_after = count(
+        &client
+            .sessions()
+            .history(&original, None)
+            .await
+            .expect("history"),
+    );
+    assert_eq!(fork_after, before, "the fork's messages were stored");
+    assert_eq!(original_after, before, "the original is untouched");
+    client.disconnect().await;
+    restarted.stop();
+}
+
+/// Regenerate's dropped reply leaves the store too: after a restart the
+/// conversation holds the question and the NEW answer only. It was dropped
+/// through `update`, which never deleted the old rows, so the stale answer
+/// came back from the store on the next start.
+#[tokio::test]
+async fn a_regenerated_reply_stays_replaced_after_a_restart() {
+    use nanna_daemon::protocol::{Action, ChatAction};
+
+    let ollama = ScriptedOllama::start(vec![
+        "The first answer.\nTASK COMPLETE".to_string(),
+        "The second answer.\nTASK COMPLETE".to_string(),
+    ])
+    .await;
+    let host = ollama.base_url.clone();
+    let daemon = TestDaemon::start_with(tempfile::tempdir().expect("temp dir"), {
+        let host = host.clone();
+        move |b| {
+            b.with_model(STUB_MODEL)
+                .with_ollama_host(host)
+                .with_scheduler(false)
+        }
+    })
+    .await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("regen".to_string()))
+            .await
+            .expect("create"),
+    );
+    converse(&client, &session, "ask once").await;
+    let mut events = client.subscribe_session(session.clone());
+    client
+        .request(Action::Chat(ChatAction::Regenerate {
+            session_id: session.clone(),
+        }))
+        .await
+        .expect("regenerate answers");
+    tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            if let Ok(nanna_client::Event::MessageEnd { .. }) = events.recv().await {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the regenerated turn ends");
+    let live = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("history");
+
+    client.disconnect().await;
+    let restarted = TestDaemon::start_with(daemon.stop(), move |b| {
+        b.with_model(STUB_MODEL)
+            .with_ollama_host(host)
+            .with_scheduler(false)
+    })
+    .await;
+    let client = restarted.connect_client().await;
+    let stored = client
+        .sessions()
+        .history(&session, None)
+        .await
+        .expect("history");
+    let texts = |h: &serde_json::Value| -> Vec<String> {
+        h["messages"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|m| m["content"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        texts(&stored),
+        texts(&live),
+        "the store matches what the client saw"
+    );
+    assert!(
+        !texts(&stored).iter().any(|t| t.contains("first answer")),
+        "the replaced reply stayed gone: {stored}"
+    );
+    client.disconnect().await;
+    restarted.stop();
+}

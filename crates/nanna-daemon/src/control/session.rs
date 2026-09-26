@@ -758,17 +758,10 @@ Your task: {task}")
 
     /// `SessionAction::Fork`: copy a session's messages into a new session.
     async fn fork_session(&self, id: String, name: Option<String>) -> Value {
-        if let Some(original) = self.sessions.get(&id).await {
-            let mut forked = self.sessions.create(
-                name.or_else(|| original.name.as_ref().map(|n| format!("{n} (copy)")))
-            ).await;
-            // Copy messages
-            forked.messages = original.messages.clone();
-            self.sessions.update(forked.clone()).await;
-            json!({ "session": forked })
-        } else {
-            json!({ "error": "not_found", "message": format!("Session {} not found", id) })
-        }
+        self.sessions.fork(&id, name).await.map_or_else(
+            || json!({ "error": "not_found", "message": format!("Session {id} not found") }),
+            |forked| json!({ "session": forked }),
+        )
     }
 
     /// `SessionAction::Clear`: wipe a session's messages — refused while a
