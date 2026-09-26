@@ -3646,7 +3646,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     }
 
     /// Convert `AnthropicRequest` → Ollama /api/chat and execute
-    async fn complete_anthropic_via_ollama(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+    async fn complete_anthropic_via_ollama(
+        &self,
+        request: &AnthropicRequest,
+    ) -> Result<AnthropicResponse, LlmError> {
         pace_provider_requests(self.provider).await;
         let (messages_json, tools_json) = anthropic_to_ollama_request(request);
 
@@ -3738,11 +3741,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // Enable thinking separation for models that support it (qwen3, deepseek-r1, etc.)
         // This makes Ollama return thinking in a separate `thinking` field instead of
         // embedding <think>...</think> tags inside `content`.
-        let model_lower = request.model.to_lowercase();
-        if model_lower.contains("qwen3")
-            || model_lower.contains("deepseek-r1")
-            || model_lower.contains("qwq")
-        {
+        if ollama_separates_thinking(&request.model) {
             body["think"] = serde_json::json!(true);
         }
 
@@ -5687,6 +5686,12 @@ impl LlmClient {
         if let Some(tools) = tools_json {
             body["tools"] = tools;
         }
+        // The same request the non-streaming path makes. Without it the agent's
+        // own (streaming) path got reasoning inline in `content`, leaving the
+        // tag splitter as the only thing keeping it out of the reply.
+        if ollama_separates_thinking(&request.model) {
+            body["think"] = serde_json::json!(true);
+        }
         body
     }
 
@@ -6598,6 +6603,17 @@ fn legacy_embed_may_answer(status: u16, body: &str) -> bool {
             .map_or(true, |value| value.get("error").is_none())
 }
 
+/// Whether to ask Ollama for `think: true` — reasoning in a separate
+/// `message.thinking` field rather than inline `<think>` tags in `content` —
+/// for `model`: the families known to support it (qwen3, deepseek-r1, qwq).
+/// Asking a model without thinking support is a 400, so this stays a known list.
+fn ollama_separates_thinking(model: &str) -> bool {
+    let model = model.to_lowercase();
+    ["qwen3", "deepseek-r1", "qwq"]
+        .iter()
+        .any(|family| model.contains(family))
+}
+
 /// Seconds to wait before retrying, as a rate-limited response's headers say.
 ///
 /// `retry-after` wins when present (Anthropic sends it on every 429; plain
@@ -7343,6 +7359,31 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Both Ollama paths ask a thinking model for separated reasoning; the
+    /// streaming one — the agent's own — used to leave it inline.
+    #[test]
+    fn the_stream_body_asks_a_thinking_model_to_separate_its_reasoning() {
+        let request = |model: &str| AnthropicRequest {
+            context_limit: None,
+            model: model.to_string(),
+            messages: vec![],
+            max_tokens: 512,
+            temperature: None,
+            system: None,
+            tools: None,
+            stream: None,
+            thinking: None,
+            cache_control: None,
+        };
+        let body = LlmClient::ollama_stream_body("http://127.0.0.1:9", &request("qwen3.5:9b"));
+        assert_eq!(body["think"], serde_json::json!(true));
+        let plain = LlmClient::ollama_stream_body("http://127.0.0.1:9", &request("gemma3:12b"));
+        assert!(
+            plain.get("think").is_none(),
+            "a model without thinking is not asked"
+        );
+    }
 
     /// Reset values in every form providers send, rounded up to whole seconds.
     #[test]

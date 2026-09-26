@@ -8407,10 +8407,9 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       compression and multi-agent decomposition — now holds to the agent path's rules
       (`ollama_completion_text`): `done: false` is a 502 (an aborted generation became an empty
       or truncated "summary"), and inline `<think>…</think>` is stripped (a reasoning model's think
-      block was stored as memory text). 1 test. **Still open on this line:** native Anthropic
-      stream errors reaching the chain walk as `Err`, `x-ratelimit-reset-*` parsing, `think` on
-      the stream body. *(later)* `done:true` without a trailing newline: `finish` already
-      accepted that last object as a clean stop, but only closed the blocks — the object's own
+      block was stored as memory text). 1 test.
+      *(later)* `done:true` without a trailing newline: `finish` already accepted that last
+      object as a clean stop, but only closed the blocks — the object's own
       text, tool calls and `done_reason` were dropped from a reply reported as complete. It now
       goes through `on_object` like every other line. 1 test.
       *(later)* `x-ratelimit-reset-*`: `OpenAI` sends these as Go durations (`"6m0s"`, `"250ms"`)
@@ -8420,6 +8419,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       rate limit's wait from `retry-after`, else from the reset of each bucket the headers show
       exhausted (`x-ratelimit-remaining-*` = 0; the longest), via `parse_reset_secs` (integer
       millisecond arithmetic, rounded up). 2 tests.
+      *(later)* `think` on the stream body: the non-streaming Ollama path asked qwen3 /
+      deepseek-r1 / qwq for `think: true` (reasoning in `message.thinking`), the streaming one —
+      the agent's own — did not, so its reasoning arrived inline in `content` with only the tag
+      splitter keeping it out of the reply. Both now use `ollama_separates_thinking`. 1 test.
+      **Still open on this line:** native Anthropic stream errors as `Err` to the chain walk
+      (the agent loop side is done; the `LlmClient` stream still yields them as events).
 - [~] *(2026-09-26 — the Boa loop half, plus the `exec`-style cap for `python.exec` noted on the
       "Smaller" line.)* Boa has no interrupt API, so a timed-out script cannot be stopped from
       outside and its blocking thread kept spinning a core for the life of the process. Every tool
