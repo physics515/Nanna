@@ -8151,8 +8151,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       cancels the agent's chat for that session; `killed` is terminal in the store (a late result
       or error is kept, the state is not changed, and `Running` cannot revive it); a run killed
       before it starts returns at once. The dead flag is deleted. 1 e2e test — red without the
-      fix on both counts: the killed run waited out the stub's 20 s reply. **Still open:**
-      `SubSessionInfo` overwrite on other paths, `agent_service` `try_write` dropping deltas.
+      fix on both counts: the killed run waited out the stub's 20 s reply.
+      *(later)* **`try_write` dropping deltas:** the run's four recovery buffers (streamed text
+      and thinking, active and completed tool calls) were tokio `RwLock`s appended to from
+      synchronous stream callbacks with `try_write`, so any delta that met a run-state snapshot's
+      read guard was silently dropped (a remounting client saw text with holes), and the per-
+      iteration checkpoint's `try_read` saved EMPTY text and tools whenever a writer held the lock.
+      They are now `std::sync::Mutex`es behind `lock_buf` (poison-tolerant), as the timeline
+      already was for the same reason — in `agent_service` and in the harness run handle
+      (`tasks.rs`). No critical section awaits. 1 test (a write meeting a held guard lands; a
+      poisoned buffer still reads); daemon 637 + e2e 44 green. **Still open:**
+      `SubSessionInfo` overwrite on other paths.
 - [ ] `chat_harness.rs` park-waiter hot loop and the continuation loop; GUI
       `subscribe_channel_status` task leak, per-channel pinned model, `daemon_client.rs` dead
       "not connected" path.
