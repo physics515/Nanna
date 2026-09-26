@@ -246,24 +246,6 @@ pub async fn get_memory_stats(
     })
 }
 
-/// Set dreaming (memory consolidation) enabled.
-///
-/// The daemon runs consolidation on its own schedule; there is no runtime toggle
-/// for it over IPC yet, so this is a no-op accepted for UI compatibility.
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn set_dreaming_enabled(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-    enabled: bool,
-) -> Result<(), String> {
-    info!("set_dreaming_enabled({enabled}) is a no-op in daemon-only mode (daemon manages consolidation scheduling)");
-    Ok(())
-}
-
 /// Set whether messages are automatically remembered (persisted to config +
 /// pushed to the daemon).
 ///
@@ -646,43 +628,6 @@ pub async fn clear_memories(
 // =============================================================================
 // Similarity Threshold Configuration
 // =============================================================================
-
-/// Get the current similarity threshold.
-///
-/// The daemon owns the memory service and does not expose this over IPC yet, so
-/// the client reports the neutral default.
-///
-/// # Errors
-///
-/// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`.
-#[tauri::command]
-pub async fn get_similarity_threshold(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<f32, String> {
-    Ok(0.0)
-}
-
-/// Set the similarity threshold for memory recall.
-///
-/// No daemon control action exists for this yet; accepted for UI compatibility
-/// (validates the range) but does not change daemon behavior.
-///
-/// # Errors
-///
-/// Returns `Threshold must be between 0.0 and 1.0` for a value outside that
-/// range, NaN included.
-#[tauri::command]
-pub async fn set_similarity_threshold(
-    _state: State<'_, Arc<RwLock<AppState>>>,
-    threshold: f32,
-) -> Result<String, String> {
-    if !(0.0..=1.0).contains(&threshold) {
-        return Err("Threshold must be between 0.0 and 1.0".to_string());
-    }
-    info!("set_similarity_threshold({threshold}) is a no-op in daemon-only mode");
-    Ok(format!("Similarity threshold set to {threshold:.2}"))
-}
 
 #[cfg(test)]
 mod snippet_tests {

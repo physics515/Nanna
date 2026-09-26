@@ -299,7 +299,6 @@ fn ollama_token_status(
 /// Memory consolidation and capture settings.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MemorySettings {
-    pub dreaming_enabled: bool,
     pub auto_remember_messages: bool,
     pub max_compression_ratio: f32,
     pub min_remaining_memories: usize,
@@ -454,9 +453,6 @@ fn build_extended_settings(
         tools,
 
         memory: MemorySettings {
-            // Dreaming has no daemon control action yet; its setter is still a
-            // no-op, so report the enabled default.
-            dreaming_enabled: true,
             auto_remember_messages: config.memory.auto_remember_messages,
             max_compression_ratio: config.memory.max_compression_ratio,
             min_remaining_memories: config.memory.min_remaining_memories,
@@ -2894,7 +2890,6 @@ mod tests {
                 is_user_tool: false,
             }],
             memory: MemorySettings {
-                dreaming_enabled: true,
                 auto_remember_messages: false,
                 max_compression_ratio: 0.5,
                 min_remaining_memories: 20,
@@ -2927,7 +2922,7 @@ mod tests {
             r#""ollama_token_host":"http://127.0.0.1:11434","ollama_token_from_env":false,"#,
             r#""temperature":1.0,"top_p":0.95,"#,
             r#""max_tokens":8192,"tools":[{"name":"exec","description":"run","enabled":true,"is_user_tool":false}],"#,
-            r#""dreaming_enabled":true,"auto_remember_messages":false,"max_compression_ratio":0.5,"#,
+            r#""auto_remember_messages":false,"max_compression_ratio":0.5,"#,
             r#""min_remaining_memories":20,"scheduler_enabled":false,"heartbeat_enabled":true,"#,
             r#""heartbeat_interval_seconds":1800,"agent_max_iterations":null,"#,
             r#""agent_nudge_after_iterations":40,"agent_nudge_interval_iterations":10}"#,

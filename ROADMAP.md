@@ -8020,9 +8020,15 @@ as its turn (`TurnAdmission`, scope default `session`).
       adapters + `channel_secrets` + per-channel pinned models, `scheduler.target_channel/
       target_session`. Update `docs/` and the North Star channel line.
 - [ ] One release carries the migration and the deletion together.
-- [ ] Delete the memory settings that were never real: `set_dreaming_enabled` and
+- [x] Delete the memory settings that were never real: `set_dreaming_enabled` and
       `set_similarity_threshold` are no-ops today. Dreaming is a core feature with no switch
       (owner 2026-09-23); the recall threshold stays the calibrated `min_score` 0.40.
+      *(2026-09-26)* Deleted: the `set_dreaming_enabled`, `get_similarity_threshold` and
+      `set_similarity_threshold` commands and their registrations, `MemorySettings::dreaming_enabled`
+      (a hard-coded `true`), the Memory tab's "Recall Threshold" slider (it showed `0%` — the getter
+      returned `0.0`) and "Enable Dreaming" switch, the "Dream Now" button's dependence on that
+      switch, the TS type field and the e2e mock cases. The settings wire-shape test pins the
+      smaller shape.
 
 #### Code review 2026-09-22 — what P25 deletes, what it must carry
 
