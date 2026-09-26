@@ -8277,7 +8277,18 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       either serialise writes-before-execs or say so in the results (`loop_runner.rs:7442`).
 - [ ] Model routing strips the provider prefix but always calls the primary provider
       (`loop_runner.rs:5361`); the per-member `ModelChain` replaces this path.
-- [ ] LLM: native Anthropic stream errors and `overloaded_error` must surface as `Err` to the
+- [~] *(2026-09-26 — the first finding, the high-severity one, is done; the rest of this line is
+      open.)* **It was wider than Anthropic:** the agent's stream loop matched neither
+      `StreamEvent::Error` *nor* `StreamEvent::RecoverableError` — both fell into `_ => {}` — so
+      every mid-stream failure on any provider (an overload, a 429, a dropped connection that
+      `LlmClient::stream` had already wrapped as recoverable) ended the loop as though the model
+      had finished, and the truncated text became the answer with no retry and no fallback. The
+      loop now runs each event through `stream_failure`, which turns both into `Err`, reaching
+      `call_llm`'s backoff and the caller's escalation like any failed call. The Anthropic SSE
+      `error` event now keeps its `type`: `anthropic_error_status` maps Anthropic's documented set
+      (`overloaded_error`→529, `rate_limit_error`→429, `invalid_request_error`→400, … unknown→500)
+      so `should_fallback` judges an in-stream error exactly as it judges a status. 2 tests.
+      LLM: native Anthropic stream errors and `overloaded_error` must surface as `Err` to the
       chain walk, not `Ok(StreamEvent::…)`; OpenAI stream error envelopes must classify (429) rather
       than close as an empty reply; `complete_ollama` needs `<think>` stripping and `done:false`
       detection like the streaming path; `embed_ollama_one` must read the error body before falling

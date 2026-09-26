@@ -5205,7 +5205,29 @@ struct UsageDelta {
 
 #[derive(Debug, Deserialize)]
 struct ErrorData {
+    /// Anthropic's error type (`overloaded_error`, `rate_limit_error`, …). An
+    /// SSE `error` event carries no HTTP status, so this is the only thing
+    /// that says whether another model is worth trying.
+    #[serde(rename = "type", default)]
+    error_type: String,
     message: String,
+}
+
+/// The HTTP status Anthropic uses for each documented error type, so an error
+/// that arrives inside a 200 stream is judged by the same
+/// [`LlmError::should_fallback`] rule as one that arrives as a status.
+/// Unknown types map to 500, the status of `api_error`.
+fn anthropic_error_status(error_type: &str) -> u16 {
+    match error_type {
+        "invalid_request_error" => 400,
+        "authentication_error" => 401,
+        "permission_error" => 403,
+        "not_found_error" => 404,
+        "request_too_large" => 413,
+        "rate_limit_error" => 429,
+        "overloaded_error" => 529,
+        _ => 500,
+    }
 }
 
 impl LlmClient {
@@ -7132,9 +7154,20 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
             stop_reason: "end_turn".to_string(),
         }),
         AnthropicSSE::Ping => Some(StreamEvent::Ping),
-        AnthropicSSE::Error { error } => Some(StreamEvent::Error {
-            message: error.message,
-        }),
+        // Typed, not flattened to a message: an `overloaded_error` mid-stream
+        // is exactly the failure a fallback model exists for, and as a plain
+        // `Error { message }` nothing downstream could tell it from a bad request.
+        AnthropicSSE::Error { error } => {
+            let status = anthropic_error_status(&error.error_type);
+            Some(stream_error_event(LlmError::Api {
+                status,
+                message: if error.error_type.is_empty() {
+                    error.message
+                } else {
+                    format!("{}: {}", error.error_type, error.message)
+                },
+            }))
+        }
     }
 }
 
@@ -8542,6 +8575,36 @@ mod tests {
         let result = parse_sse_event(event);
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), StreamEvent::SignatureDelta { index: 0, .. }));
+    }
+
+    /// An overload inside a 200 stream is what a fallback model is for. It
+    /// used to parse to a flat `Error { message }` that no consumer could tell
+    /// from a malformed request — and that the agent loop ignored outright.
+    #[test]
+    fn an_sse_error_is_typed_so_an_overload_falls_back() {
+        let overloaded = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
+        match parse_sse_event(overloaded).expect("an error event parses") {
+            StreamEvent::RecoverableError { error, .. } => {
+                assert!(error.should_fallback(), "{error}");
+                assert!(error.to_string().contains("overloaded_error"), "{error}");
+            }
+            other => panic!("an overload must be recoverable, got {other:?}"),
+        }
+        let limited = "data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}";
+        assert!(matches!(
+            parse_sse_event(limited),
+            Some(StreamEvent::RecoverableError { .. })
+        ));
+        let invalid = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}";
+        assert!(
+            matches!(parse_sse_event(invalid), Some(StreamEvent::Error { .. })),
+            "a bad request is final: another model would get the same request"
+        );
+        let untyped = "data: {\"type\":\"error\",\"error\":{\"message\":\"???\"}}";
+        assert!(
+            parse_sse_event(untyped).is_some(),
+            "an untyped error still parses"
+        );
     }
 
     #[test]

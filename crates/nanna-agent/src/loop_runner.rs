@@ -3777,6 +3777,21 @@ async fn race_stream_cancel<F: std::future::Future>(
     }
 }
 
+/// A provider error mid-stream as the `Err` it is; every other event passes.
+///
+/// Both error events used to fall into the stream loop's `_ => {}`: an
+/// overload, a 429 or a dropped connection ended the loop as though the model
+/// had finished, and the truncated text became the answer — no retry, no
+/// fallback model. As `Err` they reach `call_llm`'s backoff and the caller's
+/// escalation like any failed call.
+fn stream_failure(event: StreamEvent) -> Result<StreamEvent, AgentError> {
+    match event {
+        StreamEvent::RecoverableError { error, .. } => Err(error.into()),
+        StreamEvent::Error { message } => Err(nanna_llm::LlmError::Stream(message).into()),
+        other => Ok(other),
+    }
+}
+
 /// The error for a stream that stayed silent past the `watchdog`, logged
 /// loudly as it is built.
 fn stream_watchdog_error(model: &str, watchdog: std::time::Duration) -> AgentError {
@@ -6887,7 +6902,7 @@ impl Agent {
                 Err(_elapsed) => return Err(stream_watchdog_error(&request.model, watchdog)),
             };
             let Some(event) = event else { break };
-            match event? {
+            match stream_failure(event?)? {
                 StreamEvent::TextDelta { text, .. } => {
                     on_text(&text);
                     asm.on_text(&text);
@@ -10252,6 +10267,38 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mid-stream provider errors end the call as a failure — the retry and
+    /// escalation machinery only ever sees an `Err` — while ordinary events
+    /// pass through untouched.
+    #[test]
+    fn a_mid_stream_provider_error_is_a_failed_call() {
+        let overloaded = StreamEvent::RecoverableError {
+            error: nanna_llm::LlmError::Api {
+                status: 529,
+                message: "overloaded_error: Overloaded".to_string(),
+            },
+            partial_text: "half an ans".to_string(),
+            partial_tool_calls: Vec::new(),
+        };
+        match stream_failure(overloaded) {
+            Err(AgentError::Llm(e)) => assert!(e.should_fallback(), "{e}"),
+            other => panic!("an overload must fail the call, got {other:?}"),
+        }
+        assert!(matches!(
+            stream_failure(StreamEvent::Error {
+                message: "bad".to_string()
+            }),
+            Err(AgentError::Llm(nanna_llm::LlmError::Stream(_)))
+        ));
+        assert!(matches!(
+            stream_failure(StreamEvent::TextDelta {
+                index: 0,
+                text: "hi".to_string()
+            }),
+            Ok(StreamEvent::TextDelta { .. })
+        ));
+    }
 
     /// A write that lands and breaks the file is not landed work. The guardrail
     /// matters as much as the finding: only a verdict that actually RAN and
