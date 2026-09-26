@@ -36,7 +36,7 @@ pub async fn execute(
     let timeout_ms = tool.timeout_ms;
 
     let result = tokio::task::spawn_blocking(move || {
-        execute_sync(&source_clone, &input_clone, &bridge_clone)
+        execute_sync(&source_clone, &input_clone, &bridge_clone, timeout_ms)
     });
 
     // Apply timeout
@@ -45,6 +45,33 @@ pub async fn execute(
         Ok(Err(e)) => Err(ScriptError::Execution(format!("Task panicked: {e}"))),
         Err(_) => Err(ScriptError::Timeout(timeout_ms)),
     }
+}
+
+/// Loop iterations per second no Boa loop can exceed on the reference machine.
+///
+/// Bound justification: the simplest possible loop body (`s += i % 7; i++`)
+/// measured 10.0 M iterations/s on the reference AMD Zen 4 in a release build
+/// (2026-09-26); twice that is a ceiling no real loop body reaches.
+const LOOP_ITERATIONS_PER_SEC_CEILING: u64 = 20_000_000;
+
+/// The per-loop iteration limit for a script allowed `timeout_ms`.
+///
+/// Boa cannot be interrupted, so when the caller's timeout fires the blocking
+/// thread keeps running — a `while (true)` in a tool used to spin a core for
+/// the life of the process. This limit makes such a loop THROW. It is sized so
+/// that a loop able to finish within the timeout can never reach it (no loop
+/// runs faster than [`LOOP_ITERATIONS_PER_SEC_CEILING`]), while a runaway loop
+/// stops within about twice the timeout.
+fn loop_iteration_limit(timeout_ms: u64) -> u64 {
+    let limit = timeout_ms
+        .max(1)
+        .saturating_mul(LOOP_ITERATIONS_PER_SEC_CEILING)
+        / 1000;
+    debug_assert!(
+        limit >= LOOP_ITERATIONS_PER_SEC_CEILING / 1000,
+        "at least 1 ms of loop"
+    );
+    limit
 }
 
 /// The exact text Boa is asked to evaluate for a tool.
@@ -126,11 +153,15 @@ fn execute_sync(
     source: &str,
     input: &Value,
     bridge: &Arc<NannaBridge>,
+    timeout_ms: u64,
 ) -> Result<Value> {
     // Store bridge in thread-local for native function access
     BRIDGE.with(|b| *b.borrow_mut() = Some(bridge.clone()));
-    
+
     let mut context = Context::default();
+    context
+        .runtime_limits_mut()
+        .set_loop_iteration_limit(loop_iteration_limit(timeout_ms));
 
     // Register console.log
     register_console(&mut context)?;
@@ -851,6 +882,36 @@ fn transpile_typescript(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Boa cannot be interrupted, so a runaway loop used to outlive its
+    /// timeout forever. The iteration limit makes it throw; a loop that fits
+    /// its budget still completes.
+    #[test]
+    fn a_runaway_loop_ends_and_a_bounded_one_completes() {
+        let bridge = Arc::new(crate::bridge::NannaBridge::new(
+            crate::ToolPermissions::none(),
+        ));
+        let runaway = "export default { name: 'spin', description: 'spin', \
+                       execute: function(input) { while (true) {} } };";
+        let started = std::time::Instant::now();
+        let ended = execute_sync(runaway, &serde_json::json!({}), &bridge, 10);
+        assert!(
+            ended.is_err(),
+            "a while(true) must throw, not spin: {ended:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "bounded by the limit: {:?}",
+            started.elapsed()
+        );
+
+        let bounded = "export default { name: 'count', description: 'count', \
+                       execute: function(input) { let s = 0; \
+                       for (let i = 0; i < 1000; i++) { s += i; } return s; } };";
+        let done = execute_sync(bounded, &serde_json::json!({}), &bridge, 10).expect("fits");
+        assert_eq!(done.as_f64(), Some(499_500.0));
+        assert_eq!(loop_iteration_limit(30_000), 600_000_000);
+    }
 
     #[test]
     fn test_json_roundtrip() {

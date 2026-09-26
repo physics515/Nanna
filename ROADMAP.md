@@ -8384,7 +8384,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       detection like the streaming path; `embed_ollama_one` must read the error body before falling
       back; `x-ratelimit-reset-*` parsing, `think` on the stream body, `done:true` without newline
       (`nanna-llm/src/lib.rs:5096,7165,6593,3977,4815,4364,5603,6330`).
-- [ ] Engines: a timeout must kill — Boa `runtime_limits` + a cancellable thread, Python engine
+- [~] *(2026-09-26 — the Boa loop half, plus the `exec`-style cap for `python.exec` noted on the
+      "Smaller" line.)* Boa has no interrupt API, so a timed-out script cannot be stopped from
+      outside and its blocking thread kept spinning a core for the life of the process. Every tool
+      script now runs with `loop_iteration_limit(timeout_ms)` = timeout × 20 M/s — twice the
+      10.0 M iterations/s measured for the simplest possible loop body on the reference Zen 4
+      (release build, 2026-09-26) — so a loop that could finish within its timeout never reaches
+      the limit, and a runaway `while (true)` throws within about twice the timeout (the test's
+      ends in 0.07 s). **Still open:** regex catastrophic backtracking (not a loop), the Python
+      engine, the `js_to_json` depth bound, `SystemExit` status, manifest skills'
+      `kill_on_drop`, and the registry backstop for undeclared timeouts.
+      Engines: a timeout must kill — Boa `runtime_limits` + a cancellable thread, Python engine
       the same; cap the model-supplied `exec` timeout; `js_to_json` needs a depth bound and a
       visited set; `SystemExit` must carry its status; manifest skills with `kill_on_drop`; the
       registry backstop must extend for undeclared timeouts too (`boa_impl.rs:43,779`,
