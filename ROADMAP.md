@@ -8365,10 +8365,27 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       needs reconnect for real.
 
 **Independent — fix when in the file:**
-- [ ] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
+- [~] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64
       (`lib.rs:174,204`); `nanna-gpu` `search` must check buffer limits, `append` dirty index
       off-by-one; `nanna-bench` fixture divides by 24 576 instead of 2^24; `src/installer/windows/
       Cargo.toml` declares a missing `build.rs`.
+      *(2026-09-26 — four of five.)* **NEON:** reproduced with `cargo check --target
+      aarch64-unknown-linux-gnu` (the target's std is now installed on this host — no linker
+      needed for a check), both arms fixed, re-checked clean: the macOS release target builds
+      again. **GPU `append`:** after the push `vectors.len()` already counts the old length, so
+      `start + len - 1` marked `2·start + k` dirty on a non-empty store and the new vectors never
+      reached the GPU buffer — search ran on stale data; `test_vector_store_append` now covers the
+      non-empty case (runs on the 4070). **Bench fixture:** `/256/96` is `/24 576`, so "unit"
+      spanned [0, 683) and nearly every component came out positive and large — near-parallel
+      "random" vectors; now `/2^24`, pinned by a range test. It feeds only latency benches, so no
+      baseline moves. **Installer manifest:** orphaned (written by an agent run, referenced by
+      nothing, not a workspace member) — deleted. **Still open:** `search` buffer limits.
+- [ ] **aarch64 is lint-dirty and nothing looks.** `cargo clippy -p nanna-simd --target
+      aarch64-unknown-linux-gnu --all-targets` reports ~24 warnings no x86 run can see — 10 lossy
+      `as` casts (owner rule: route through `nanna-numeric`), 4 `mul_add`, doc backticks, a
+      wildcard `std::arch::aarch64::*`, and `wide` unused on that target (make it an
+      x86_64-only dependency). The numeric edits need the NEON tests *run*, not just checked —
+      qemu-user or a CI arm64 runner — so they were not changed blind (2026-09-26).
 
 #### Considered and rejected — do not re-raise
 

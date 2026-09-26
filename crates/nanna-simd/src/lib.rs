@@ -173,7 +173,7 @@ pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { neon::dot_product_f32_neon(a, b) };
+        unsafe { neon::dot_product_f32_neon(a, b) }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -203,7 +203,7 @@ pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { neon::cosine_similarity_f32_neon(a, b) };
+        unsafe { neon::cosine_similarity_f32_neon(a, b) }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
