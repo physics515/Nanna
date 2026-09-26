@@ -8392,8 +8392,14 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (release build, 2026-09-26) — so a loop that could finish within its timeout never reaches
       the limit, and a runaway `while (true)` throws within about twice the timeout (the test's
       ends in 0.07 s). **Still open:** regex catastrophic backtracking (not a loop), the Python
-      engine, the `js_to_json` depth bound, `SystemExit` status, manifest skills'
-      `kill_on_drop`, and the registry backstop for undeclared timeouts.
+      engine, `SystemExit` status, manifest skills' `kill_on_drop`, and the registry backstop
+      for undeclared timeouts.
+      *(2026-09-26, later)* `js_to_json` is bounded: 64 levels deep (`serde_json` refuses past
+      128; real results are a few levels) and 1 M values in total — the depth bound alone lets a
+      DAG whose levels share one sub-object (`n = {a: n, b: n}` ×40) convert 2^40 times. A tool
+      returning a cyclic object used to recurse until the stack overflowed, aborting the whole
+      daemon; both shapes are now a script error that says so. The depth bound makes a visited set
+      unnecessary: a cycle fails on its first trip round. 1 test.
       Engines: a timeout must kill — Boa `runtime_limits` + a cancellable thread, Python engine
       the same; cap the model-supplied `exec` timeout; `js_to_json` needs a depth bound and a
       visited set; `SystemExit` must carry its status; manifest skills with `kill_on_drop`; the
