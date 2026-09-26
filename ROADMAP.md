@@ -8144,8 +8144,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       checkpoint (or legacy file), so the crashed run's output was lost for good. One
       `repost_recovered` now reports whether it posted; a checkpoint whose session is missing is
       kept, with a warning. No new test (boot path of the full server); daemon 638 + e2e 44 green.
-      **Still open:** `update()` not persisting messages, `Fork` copying messages only, the write
-      guard across `persist_message` (visible above in `add_full_message`).
+      *(later)* The write guard over every session was held across `persist_message` — a database
+      write — in `add_message` and `add_full_message`, so each appended message stalled every
+      session read and write in the daemon for a disk write (this host's array measures 36 MB/s).
+      Both now clone the message, release the guard, then persist; order is safe because the
+      store sorts by `created_at`, assigned under the lock. Daemon 638 + e2e 44 green (the
+      restart-persistence e2e included). **Still open:** `update()` not persisting messages,
+      `Fork` copying messages only.
 - [~] `control/session.rs`: sub-session timeout leaking `active_chats`, `KillSubSession` flag
       nobody reads, `SubSessionInfo` state overwritten on finish; `agent_service.rs` `try_write`
       dropping stream deltas into the recovery buffers.

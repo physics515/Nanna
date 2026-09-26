@@ -1342,19 +1342,23 @@ impl SessionManager {
     }
     
     /// Add a message to a session (with write-through to DB)
-    pub async fn add_message(&self, session_id: &str, role: MessageRole, content: impl Into<String>) -> Option<String> {
+    pub async fn add_message(
+        &self,
+        session_id: &str,
+        role: MessageRole,
+        content: impl Into<String>,
+    ) -> Option<String> {
         let content = content.into();
         let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(session_id) {
-            let msg_id = session.add_message(role, content);
-            // Persist the new message synchronously
-            if let Some(msg) = session.messages.last() {
-                self.persist_message(session_id, msg).await;
-            }
-            Some(msg_id)
-        } else {
-            None
+        let session = sessions.get_mut(session_id)?;
+        let msg_id = session.add_message(role, content);
+        let msg = session.messages.last().cloned();
+        // Persist after releasing the lock (see `add_full_message`).
+        drop(sessions);
+        if let Some(msg) = msg {
+            self.persist_message(session_id, &msg).await;
         }
+        Some(msg_id)
     }
 
     /// Append an assistant message outside any streamed turn and announce it
@@ -1399,16 +1403,19 @@ impl SessionManager {
     ) -> Option<String> {
         let content = content.into();
         let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(session_id) {
-            let msg_id = session.add_full_message(role, content, details);
-            // Persist the new message synchronously
-            if let Some(msg) = session.messages.last() {
-                self.persist_message(session_id, msg).await;
-            }
-            Some(msg_id)
-        } else {
-            None
+        let session = sessions.get_mut(session_id)?;
+        let msg_id = session.add_full_message(role, content, details);
+        let msg = session.messages.last().cloned();
+        // Persisted after releasing the lock. The write guard over EVERY
+        // session used to be held across this database write, so each
+        // appended message stalled every session read and write in the daemon
+        // for the length of a disk write. Order is safe: the timestamp the
+        // store sorts by (`created_at`) was assigned above, under the lock.
+        drop(sessions);
+        if let Some(msg) = msg {
+            self.persist_message(session_id, &msg).await;
         }
+        Some(msg_id)
     }
     
     /// Whether a session exists, without loading it.
