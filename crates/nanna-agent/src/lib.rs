@@ -19,10 +19,8 @@ mod numeric;
 pub mod planner;
 pub mod prompts;
 pub mod tool_stats;
-mod registry;
 pub mod spans;
 mod summarizer;
-mod supervisor;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -34,10 +32,6 @@ pub use nanna_workspace::{Workspace, WorkspaceFiles, WorkspaceManager, Workspace
 pub use cancel::CancelToken;
 pub use context::{
     AgentContext, ContextIsolation, ContextSummary, ContextSummarizationConfig, plausible_summary,
-};
-pub use registry::{
-    AgentMetadata, AgentRegistry, AgentRole, AgentState as RegistryAgentState, LifecycleEvent, 
-    RegisteredAgent,
 };
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS, CLAIM_NUDGES_MAX,
@@ -55,10 +49,6 @@ pub use multi::{
     TaskStatus, SwarmConfig, SwarmResult, SwarmTaskResult,
     // Swarm Coordinator
     SwarmCoordinator, DecomposedTask, DomainAgent, Subtask,
-};
-pub use supervisor::{
-    AgentState, AgentStats, HealthCheckConfig, RestartPolicy, SupervisedAgentConfig,
-    SupervisionStrategy, Supervisor, SupervisorEvent, SupervisorEventType,
 };
 pub use summarizer::{
     Summarizer,

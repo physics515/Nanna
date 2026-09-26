@@ -8190,12 +8190,20 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
 - [ ] `chat_harness.rs` park-waiter hot loop and the continuation loop; GUI
       `subscribe_channel_status` task leak, per-channel pinned model, `daemon_client.rs` dead
       "not connected" path.
-- [ ] Exported-but-unused subsystems the review flagged as rotting: `AgentRegistry` (lock-order
+- [~] Exported-but-unused subsystems the review flagged as rotting: `AgentRegistry` (lock-order
       inversion), `Supervisor` (health check every 5 s, never runs an agent), `MultiAgent`
       (`cancel_task` overwritten), the Rust built-in tools (`..` traversal, `ListDirTool` ignores
       `base_dir`, substring denylist, `max_size` unenforced), the Deno path, `WorkspaceManager`
       stale cache, old MCP `HttpTransport`/`McpManager`, `re_embed_mismatched`, `tool_stats`
       per-session half. Delete rather than fix; sub-agents are sub-tasks, tools are `tool.ts`.
+      *(2026-09-26 — three deleted.)* The legacy MCP `HttpTransport` (earlier today, with the MCP
+      line), then `AgentRegistry` (`registry.rs`, 993 lines) and `Supervisor` (`supervisor.rs`,
+      1 089 lines) with their eleven re-exported types: nothing in the workspace, the GUI or the
+      root crate named any of them (the GUI's `AgentStats` is its own type). Workspace clippy clean
+      after. Also `MessageQueue` (`nanna-channels`) has no caller — fixed today rather than
+      deleted only because its deadlock was the finding in hand; it belongs on this list.
+      **Still open:** `MultiAgent`, the Rust built-in tools, the Deno path, `WorkspaceManager`,
+      `McpManager`, `re_embed_mismatched`, `tool_stats` per-session half, `MessageQueue`.
 
 **Stage 1 — store, memory, storage:**
 - [x] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and
