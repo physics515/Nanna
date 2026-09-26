@@ -8151,7 +8151,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
 - [ ] `chunks_needing_embedding` returns fabricated `MemoryChunk` fields — narrow the type;
       `consolidated_metadata` doc says first-writer-wins and implements unanimity; the two dream
       gates are verbatim duplicates (`repositories.rs:1211`, `consolidation.rs:1027`, `dreaming.rs:321`).
-- [ ] `memory.get` performs three full `list_all()` clones (`server.rs:1162`).
+- [x] `memory.get` performs three full `list_all()` clones (`server.rs:1162`).
+      *(2026-09-26)* One snapshot now feeds the resolve, the chunk reassembly and the served-row
+      feedback (`resolve_memory_handle_in`, and the two helpers are pure fns over the slice). The
+      cost was the smaller half: three reads were three *states* of the store, so a dream cycle
+      landing between them could resolve a handle in one state and reassemble its chunks from
+      another. The existing reassembly tests cover the path unchanged.
 
 **Stage 2 — router, scheduler, IPC, config:**
 - [ ] Scheduler: spawn the heartbeat executor like every other due task and start its timer with

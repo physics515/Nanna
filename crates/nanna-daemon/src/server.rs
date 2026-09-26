@@ -393,8 +393,8 @@ fn tags_with_provenance(
 /// of a 42-case test run and being told nothing was missing will report on what
 /// it saw. Reassemble, rather than keep a promise the retrieval path was not
 /// keeping.
-async fn assemble_handle_content(
-    memory: &Arc<MemoryService>,
+fn assemble_handle_content(
+    all: &[nanna_memory::MemoryListEntry],
     entry: &nanna_memory::MemoryListEntry,
 ) -> String {
     let Some(source_id) = entry.metadata.get("source_id") else {
@@ -402,10 +402,8 @@ async fn assemble_handle_content(
     };
     // `chunk` is `"i/N"`: the position, and the count the stub promised.
     let mut expected_count = 0_usize;
-    let mut chunks: Vec<(usize, String)> = memory
-        .list_all()
-        .await
-        .into_iter()
+    let mut chunks: Vec<(usize, &str)> = all
+        .iter()
         .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
         .map(|e| {
             let mark = e.metadata.get("chunk");
@@ -415,7 +413,7 @@ async fn assemble_handle_content(
             if let Some(total) = mark.and_then(|c| c.split('/').nth(1)?.parse::<usize>().ok()) {
                 expected_count = expected_count.max(total);
             }
-            (idx, e.content)
+            (idx, e.content.as_str())
         })
         .collect();
     if chunks.len() <= 1 {
@@ -507,19 +505,17 @@ fn recall_feedback(
 }
 
 /// The ids of the rows a handle's content was assembled from.
-async fn served_row_ids(
-    memory: &Arc<MemoryService>,
+fn served_row_ids(
+    all: &[nanna_memory::MemoryListEntry],
     entry: &nanna_memory::MemoryListEntry,
 ) -> Vec<String> {
     let Some(source_id) = entry.metadata.get("source_id") else {
         return vec![entry.id.clone()];
     };
-    let ids: Vec<String> = memory
-        .list_all()
-        .await
-        .into_iter()
+    let ids: Vec<String> = all
+        .iter()
         .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
-        .map(|e| e.id)
+        .map(|e| e.id.clone())
         .collect();
     if ids.is_empty() {
         vec![entry.id.clone()]
@@ -547,9 +543,19 @@ async fn resolve_memory_handle(
     memory: &Arc<MemoryService>,
     handle: &str,
 ) -> Result<nanna_memory::MemoryListEntry, String> {
+    resolve_memory_handle_in(&memory.list_all().await, handle)
+}
+
+/// [`resolve_memory_handle`] over a snapshot the caller already holds, so a
+/// caller that also assembles content reads ONE state of the store — not a
+/// resolve from one snapshot and a reassembly from a later one, with a dream
+/// cycle free to land in between.
+fn resolve_memory_handle_in(
+    all: &[nanna_memory::MemoryListEntry],
+    handle: &str,
+) -> Result<nanna_memory::MemoryListEntry, String> {
     const MAX_FORWARD_HOPS: usize = 8;
 
-    let all = memory.list_all().await;
     let direct = |needle: &str| -> Option<nanna_memory::MemoryListEntry> {
         all.iter()
             .find(|e| e.id == needle)
@@ -1159,10 +1165,13 @@ fn memory_read_services(
                 // the context the stub existed to protect.
                 let limit = opt_count(&params, "limit")?.unwrap_or(4_000);
 
-                let entry = resolve_memory_handle(&mem, &id).await?;
-                let content = assemble_handle_content(&mem, &entry).await;
+                // One snapshot for the resolve, the reassembly and the
+                // feedback: it used to be three full `list_all()` clones.
+                let all = mem.list_all().await;
+                let entry = resolve_memory_handle_in(&all, &id)?;
+                let content = assemble_handle_content(&all, &entry);
                 if let Some(dreaming) = feedback.as_ref().and_then(|slot| slot.get()) {
-                    let served = served_row_ids(&mem, &entry).await;
+                    let served = served_row_ids(&all, &entry);
                     for (memory_id, signal) in recall_feedback(offset, &served) {
                         dreaming.record_feedback(&memory_id, signal).await;
                     }
@@ -6711,7 +6720,7 @@ mod tests {
         let service = seeded_chunk_store(3, 3).await;
         let entry = first_entry(&service).await;
 
-        let assembled = assemble_handle_content(&service, &entry).await;
+        let assembled = assemble_handle_content(&service.list_all().await, &entry);
 
         assert_eq!(assembled, "part 1\npart 2\npart 3");
         assert!(!assembled.contains("[SYSTEM:"));
@@ -6727,7 +6736,7 @@ mod tests {
         let service = seeded_chunk_store(2, 17).await;
         let entry = first_entry(&service).await;
 
-        let assembled = assemble_handle_content(&service, &entry).await;
+        let assembled = assemble_handle_content(&service.list_all().await, &entry);
 
         assert!(assembled.starts_with("part 1\npart 2"), "content still comes first");
         assert!(assembled.contains("2 of 17 stored chunks"), "{assembled}");
@@ -6750,7 +6759,7 @@ mod tests {
             assert!(stored.metadata.contains_key("source_id"));
         }
 
-        let assembled = assemble_handle_content(&service, &entry).await;
+        let assembled = assemble_handle_content(&service.list_all().await, &entry);
         assert!(!assembled.contains("[SYSTEM:"), "{assembled}");
     }
 
@@ -7530,5 +7539,4 @@ mod tests {
         doc.save_to(&mut bytes).expect("document saves");
         bytes
     }
-
 }
