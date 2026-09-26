@@ -8067,8 +8067,19 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       (`["mine"]` vs `["global","mine"]`); the NaN test likewise. 4 tests.
 - [ ] `MemoryAction::Clear{scope:None}` must be durable or refuse; `save_entry`'s conflict
       fallback must propagate its three errors (`control/memory.rs:194`, `memory_persistence.rs:189`).
-- [ ] `memory.search` and `memory_in_scope` disagree on `scope:"global"`; one meaning
+- [x] `memory.search` and `memory_in_scope` disagree on `scope:"global"`; one meaning
       (`control/memory.rs:14,125`). The board's memory page is the surviving consumer.
+      *(2026-09-26)* `search` mapped `"global"` to *every* memory (its own comment said "global
+      only"), while `list`/`export` meant the global ones — and it could not have done otherwise,
+      because `recall_scoped`'s `Option<&str>` has no way to say "global only". New
+      `nanna_memory::RecallScope { Everything, GlobalOnly, Workspace(id) }` owns the rule
+      (`admits`, plus `sql_workspace` for the chunk SQL prefilter — `GlobalOnly` has no SQL form, so
+      it scans unscoped and `admits` makes the cut on both the row and the chunk-only pass);
+      `recall_in_scope_with_report` takes it, and the `Option<&str>` API is a thin wrapper, so none
+      of the 16 existing callers moved. The daemon parses the wire scope once (`memory_scope`) for
+      all three verbs. `memory_search_and_list_agree_on_the_global_scope` was confirmed red on the
+      old parse (`["global","scoped"]` vs `["global"]`). The GUI sends no scope to search, so it is
+      unaffected.
 - [ ] Migrations: wrap each in a transaction where turso allows, or make `ADD COLUMN` idempotent
       by probing `pragma_table_info` first; add `memory_events` to `SALVAGE_TABLES`; salvage by
       column name, not position (`migrations.rs:111`, `recovery.rs:51,383`).

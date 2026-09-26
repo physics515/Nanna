@@ -7,15 +7,17 @@ impl ControlPlane {
     // Memory Handlers
     // =========================================================================
     
-    /// Does a memory in `workspace_id` belong to `scope`? `None` = every
+    /// The wire `scope` as a [`nanna_memory::RecallScope`]: `None` = every
     /// memory, `"global"` = global memories only, a workspace id = global
-    /// memories plus that workspace's. One rule for `list` and `export`, so the
-    /// two can never disagree about what a scope contains.
-    fn memory_in_scope(scope: Option<&str>, workspace_id: Option<&str>) -> bool {
+    /// memories plus that workspace's. One parse for `search`, `list` and
+    /// `export`, so they can never disagree about what a scope contains —
+    /// `search` used to read `"global"` as *every* memory while the other two
+    /// read it as the global ones.
+    fn memory_scope(scope: Option<&str>) -> nanna_memory::RecallScope<'_> {
         match scope {
-            None => true,
-            Some("global") => workspace_id.is_none(),
-            Some(workspace) => workspace_id.is_none() || workspace_id == Some(workspace),
+            None => nanna_memory::RecallScope::Everything,
+            Some("global") => nanna_memory::RecallScope::GlobalOnly,
+            Some(workspace) => nanna_memory::RecallScope::Workspace(workspace),
         }
     }
 
@@ -120,15 +122,14 @@ impl ControlPlane {
     }
 
     /// `MemoryAction::Search`: scoped recall, saying how much of the store was searchable.
-    async fn memory_search(memory: &MemoryService, query: String, limit: Option<usize>, scope: Option<String>) -> Value {
-        // Use scoped recall: None = all, Some("global") = global only, Some(ws_id) = global + workspace
-        let scope_filter = match &scope {
-            Some(ws_id) if ws_id != "global" => Some(ws_id.as_str()),
-            // "global" or None → all
-            _ => None,
-        };
+    async fn memory_search(
+        memory: &MemoryService,
+        query: String,
+        limit: Option<usize>,
+        scope: Option<String>,
+    ) -> Value {
         let result = memory
-            .recall_scoped_with_report(&query, scope_filter)
+            .recall_in_scope_with_report(&query, Self::memory_scope(scope.as_deref()))
             .await;
         match result {
             Ok(nanna_memory::RecallReport {
@@ -349,7 +350,7 @@ impl ControlPlane {
     async fn memory_list(memory: &MemoryService, scope: Option<String>) -> Value {
         let all_memories = memory.list_all().await;
         let memories: Vec<_> = all_memories.into_iter()
-            .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
+            .filter(|m| Self::memory_scope(scope.as_deref()).admits(m.workspace_id.as_deref()))
             .map(|m| {
                 // Absent provenance is "unknown" — NOT "stated". A legacy
                 // memory stored before provenance was captured must not be
@@ -378,7 +379,11 @@ impl ControlPlane {
     }
 
     /// `MemoryAction::Export`: render the scope's memories as a document.
-    async fn memory_export(memory: &MemoryService, scope: Option<String>, format: crate::protocol::ExportFormat) -> Value {
+    async fn memory_export(
+        memory: &MemoryService,
+        scope: Option<String>,
+        format: crate::protocol::ExportFormat,
+    ) -> Value {
         // Rendered here for the same reason as `session.export`: the
         // store's owner renders once and every client gets that
         // document. Filtered by the same rule `list` uses.
@@ -386,7 +391,7 @@ impl ControlPlane {
             .export_records()
             .await
             .into_iter()
-            .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
+            .filter(|m| Self::memory_scope(scope.as_deref()).admits(m.workspace_id.as_deref()))
             .collect();
         match crate::export::export_memories(
             &records,

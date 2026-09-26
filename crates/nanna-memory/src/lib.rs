@@ -188,21 +188,58 @@ pub struct MemoryStoreHealth {
     pub expected: usize,
 }
 
-/// Whether a memory owned by `memory_workspace` is visible to a recall scoped
-/// to `scope`.
+/// Which memories a recall may return.
 ///
-/// One definition for every recall path. A workspace scope sees that
-/// workspace's memories *and* the global ones; the global scope sees every
-/// memory. The chunk SQL already applies exactly this rule, so a second,
-/// narrower copy downstream silently dropped a global memory that only its
-/// chunks matched — found by the 2026-09-22 review.
-#[must_use]
-pub fn visible_in_scope(memory_workspace: Option<&str>, scope: Option<&str>) -> bool {
-    debug_assert!(
-        scope.is_none_or(|s| !s.is_empty()),
-        "a scope names a workspace"
-    );
-    scope.is_none_or(|ws| memory_workspace.is_none_or(|owner| owner == ws))
+/// One definition for every recall path, and the only place the rule lives.
+/// A second, narrower copy used to sit in the chunk-only pass and silently
+/// dropped a global memory that only its chunks matched (2026-09-22 review);
+/// and the daemon's `memory.search` could not express "global only" at all, so
+/// it answered `scope:"global"` with every memory while `list` and `export`
+/// answered it with the global ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallScope<'a> {
+    /// Every memory, whatever its workspace.
+    Everything,
+    /// Only memories that belong to no workspace.
+    GlobalOnly,
+    /// That workspace's memories plus the global ones — what a workspace sees.
+    Workspace(&'a str),
+}
+
+impl<'a> RecallScope<'a> {
+    /// The historical `Option<&str>` scope: `None` = everything, `Some(id)` =
+    /// that workspace plus the globals.
+    #[must_use]
+    pub const fn from_workspace(workspace_id: Option<&'a str>) -> Self {
+        match workspace_id {
+            None => Self::Everything,
+            Some(ws) => Self::Workspace(ws),
+        }
+    }
+
+    /// Whether a memory owned by `memory_workspace` is visible in this scope.
+    #[must_use]
+    pub fn admits(self, memory_workspace: Option<&str>) -> bool {
+        debug_assert!(
+            !matches!(self, Self::Workspace("")),
+            "a workspace scope names a workspace"
+        );
+        match self {
+            Self::Everything => true,
+            Self::GlobalOnly => memory_workspace.is_none(),
+            Self::Workspace(ws) => memory_workspace.is_none_or(|owner| owner == ws),
+        }
+    }
+
+    /// The workspace a SQL-side prefilter may narrow to. `GlobalOnly` has no
+    /// SQL form, so it scans unscoped and [`Self::admits`] does the cut.
+    #[must_use]
+    pub const fn sql_workspace(self) -> Option<&'a str> {
+        match self {
+            Self::Workspace(ws) => Some(ws),
+            Self::Everything | Self::GlobalOnly => None,
+        }
+    }
 }
 
 /// What a search could actually COMPARE, measured during the scan it describes.
@@ -1149,16 +1186,34 @@ impl VectorStore {
         top_k: usize,
         workspace_id: Option<&str>,
     ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
+        self.search_in_scope_with_coverage(
+            query_embedding,
+            top_k,
+            RecallScope::from_workspace(workspace_id),
+        )
+        .await
+    }
+
+    /// [`Self::search_scoped_with_coverage`] over any [`RecallScope`].
+    pub async fn search_in_scope_with_coverage(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        scope: RecallScope<'_>,
+    ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
         // Get more to filter
         let (all_results, coverage) = self.search_with_coverage(query_embedding, top_k * 3).await;
 
-        // Workspace scope: global + this workspace only; global scope: all.
         let filtered: Vec<(MemoryEntry, f32)> = all_results
             .into_iter()
-            .filter(|(entry, _)| visible_in_scope(entry.workspace_id.as_deref(), workspace_id))
+            .filter(|(entry, _)| scope.admits(entry.workspace_id.as_deref()))
             .take(top_k)
             .collect();
 
+        debug_assert!(
+            filtered.len() <= top_k,
+            "the scoped answer is bounded by top_k"
+        );
         (filtered, coverage)
     }
 
@@ -2207,20 +2262,24 @@ mod tests {
     /// The one scope rule every recall path shares.
     #[test]
     fn a_workspace_scope_sees_its_own_and_the_global_memories() {
+        let ws = RecallScope::Workspace("a");
+        assert!(ws.admits(None), "global is visible in a workspace");
+        assert!(ws.admits(Some("a")), "own workspace");
+        assert!(!ws.admits(Some("b")), "never another workspace");
+
+        assert!(RecallScope::Everything.admits(Some("b")));
+        assert!(RecallScope::Everything.admits(None));
+
+        assert!(RecallScope::GlobalOnly.admits(None));
         assert!(
-            visible_in_scope(None, Some("a")),
-            "global is visible everywhere"
+            !RecallScope::GlobalOnly.admits(Some("a")),
+            "global-only means no workspace's memories"
         );
-        assert!(visible_in_scope(Some("a"), Some("a")), "own workspace");
-        assert!(
-            !visible_in_scope(Some("b"), Some("a")),
-            "never another workspace"
-        );
-        assert!(
-            visible_in_scope(Some("b"), None),
-            "the global scope sees everything"
-        );
-        assert!(visible_in_scope(None, None));
+
+        assert_eq!(RecallScope::from_workspace(None), RecallScope::Everything);
+        assert_eq!(RecallScope::from_workspace(Some("a")), ws);
+        assert_eq!(RecallScope::GlobalOnly.sql_workspace(), None);
+        assert_eq!(ws.sql_workspace(), Some("a"));
     }
 
     /// What the ranking did before `rank_top_k`: a STABLE sort of all N on

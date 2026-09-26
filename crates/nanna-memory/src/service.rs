@@ -1519,6 +1519,23 @@ impl MemoryService {
         query: &str,
         workspace_id: Option<&str>,
     ) -> Result<RecallReport, MemoryError> {
+        self.recall_in_scope_with_report(query, crate::RecallScope::from_workspace(workspace_id))
+            .await
+    }
+
+    /// [`Self::recall_scoped_with_report`] over any [`crate::RecallScope`] —
+    /// including [`crate::RecallScope::GlobalOnly`], which the `Option<&str>`
+    /// form cannot express.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured, or if
+    /// embedding the query fails.
+    pub async fn recall_in_scope_with_report(
+        &self,
+        query: &str,
+        scope: crate::RecallScope<'_>,
+    ) -> Result<RecallReport, MemoryError> {
         let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         let embed_started = std::time::Instant::now();
@@ -1533,11 +1550,7 @@ impl MemoryService {
         // Scoped search
         let (results, coverage) = self
             .store
-            .search_scoped_with_coverage(
-                &query_embedding,
-                self.config.max_results * 2,
-                workspace_id,
-            )
+            .search_in_scope_with_coverage(&query_embedding, self.config.max_results * 2, scope)
             .await;
         let min_score = self.get_min_score();
 
@@ -1558,13 +1571,13 @@ impl MemoryService {
                 &query_embedding,
                 &active_model,
                 self.config.max_results * 2,
-                workspace_id,
+                scope.sql_workspace(),
                 min_score,
             )
             .await;
 
         let filtered = self
-            .rank_and_assemble(results, &chunk_hits, workspace_id, min_score)
+            .rank_and_assemble(results, &chunk_hits, scope, min_score)
             .await;
 
         let timings = RecallTimings {
@@ -1576,7 +1589,7 @@ impl MemoryService {
         // without ever saying how long either half took.
         info!(
             "Recall (scoped {:?}) '{}': embed {} ms, search {} ms, {} results from {} memories",
-            workspace_id,
+            scope,
             truncate(query, 30),
             timings.embed_ms(),
             timings.search_ms(),
@@ -1615,7 +1628,7 @@ impl MemoryService {
         &self,
         results: Vec<(MemoryEntry, f32)>,
         chunk_hits: &HashMap<String, crate::chunk_rank::ChunkHit>,
-        workspace_id: Option<&str>,
+        scope: crate::RecallScope<'_>,
         min_score: f32,
     ) -> Vec<RecallResult> {
         debug_assert!(min_score.is_finite(), "a similarity floor is a number");
@@ -1660,9 +1673,9 @@ impl MemoryService {
             }
             debug_assert!(hit.best >= min_score, "collapse_chunk_hits admits on the floor");
             if let Some(entry) = self.store.get(id).await {
-                // The same rule the chunk SQL applied: a global memory is
-                // visible to a workspace-scoped recall.
-                if !crate::visible_in_scope(entry.workspace_id.as_deref(), workspace_id) {
+                // The same rule the row scan applied. The chunk SQL narrows
+                // only to `sql_workspace`, so `GlobalOnly` is cut here.
+                if !scope.admits(entry.workspace_id.as_deref()) {
                     continue;
                 }
                 scored.push((entry, hit.best, hit.rank(), Some(hit.best_ordinal)));
@@ -4819,6 +4832,15 @@ mod tests {
             ["global", "mine"],
             "global + this workspace, ranked; another workspace's memory stays out"
         );
+
+        // `GlobalOnly` has no SQL form (the chunk scan runs unscoped), so the
+        // cut is `admits` alone — and it must hold on the chunk-only pass too.
+        let global = service
+            .recall_in_scope_with_report("the query", crate::RecallScope::GlobalOnly)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = global.results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["global"], "global-only admits no workspace's memory");
     }
 
     /// NaN compares false against every floor, so `best < min_score` let a
@@ -4838,7 +4860,7 @@ mod tests {
             (scoped_entry("weak", None), 0.2),
         ];
         let out = service
-            .rank_and_assemble(results, &HashMap::new(), None, 0.4)
+            .rank_and_assemble(results, &HashMap::new(), crate::RecallScope::Everything, 0.4)
             .await;
         let ids: Vec<&str> = out.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["real"], "NaN is rejected like any sub-floor score");
@@ -4856,7 +4878,7 @@ mod tests {
             .rank_and_assemble(
                 vec![(scoped_entry("nan", None), f32::NAN)],
                 &hits,
-                None,
+                crate::RecallScope::Everything,
                 0.4,
             )
             .await;

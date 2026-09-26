@@ -2035,3 +2035,82 @@ async fn a_null_set_of_no_secret_leaves_the_store_alone() {
     assert_eq!(resp["status"], "updated", "{resp}");
     assert_eq!(cp.config.read().await.llm.sub_agent_model, None);
 }
+
+/// `memory.search` and `memory.list` must mean the same thing by a scope. They
+/// did not: `search` read `scope:"global"` as *every* memory while `list` and
+/// `export` read it as the global ones, so the board's memory page showed one
+/// set under "Global" and searched another.
+#[tokio::test]
+async fn memory_search_and_list_agree_on_the_global_scope() {
+    let embed: nanna_memory::EmbedFn =
+        Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) }));
+    let memory = Arc::new(
+        nanna_memory::MemoryService::new(nanna_memory::MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        })
+        .with_embed_fn(embed),
+    );
+    for (id, workspace) in [("global", None), ("scoped", Some("ws-a"))] {
+        memory
+            .add_entry(nanna_memory::MemoryEntry {
+                id: id.to_string(),
+                content: format!("memory {id}"),
+                embeddings: std::collections::HashMap::new(),
+                embedding_model: None,
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                metadata: std::collections::HashMap::new(),
+                timestamp: 0,
+                fsrs: nanna_memory::FsrsState::default(),
+                workspace_id: workspace.map(str::to_string),
+            })
+            .await
+            .expect("add");
+    }
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.memory = Some(memory);
+    let cp = Arc::new(cp);
+
+    let ids = |resp: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = resp["memories"]
+            .as_array()
+            .expect("a memories array")
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect();
+        ids.sort();
+        ids
+    };
+    let global = Some("global".to_string());
+    let listed = cp
+        .handle(
+            "test",
+            Action::Memory(MemoryAction::List {
+                scope: global.clone(),
+            }),
+        )
+        .await;
+    let search = MemoryAction::Search {
+        query: "memory".to_string(),
+        limit: None,
+        scope: global,
+    };
+    let searched = cp.handle("test", Action::Memory(search)).await;
+    assert_eq!(ids(&listed), ["global"], "{listed}");
+    assert_eq!(
+        ids(&searched),
+        ids(&listed),
+        "search must scope like list: {searched}"
+    );
+
+    // And a workspace scope is that workspace plus the globals, in both.
+    let ws = Some("ws-a".to_string());
+    let search = MemoryAction::Search {
+        query: "memory".to_string(),
+        limit: None,
+        scope: ws,
+    };
+    let searched = cp.handle("test", Action::Memory(search)).await;
+    assert_eq!(ids(&searched), ["global", "scoped"], "{searched}");
+}
