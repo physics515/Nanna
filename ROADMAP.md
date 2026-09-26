@@ -8520,6 +8520,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       **Still open:** the remaining round trips under a guard (`system_status` at
       `settings.rs:874`, five `config_set` calls), `unsafe set_var`, and `import_config`
       reloading secrets.
+      *(2026-09-26, later)* **Round trips and `set_var`, done.** `get_mcp_servers` uses
+      `backend_handle`, and the four model setters (`set_chat_model_priority`,
+      `set_model_routing`, `set_routing_first_turn_primary`, `set_sub_agent_models` — five
+      `config_set` calls) clone the backend, release the write guard after the save, then call
+      the daemon. The Claude proxy setting is a process-wide in-memory value seeded once from
+      `CLAUDE_PROXY_ENABLED`/`CLAUDE_PROXY_URL`: the three `unsafe set_var`/`remove_var` sites
+      raced every concurrent `getenv` on the multi-threaded runtime only for this same process
+      to read them back — nothing else saw them. 1 test. **Still open:** `import_config`
+      reloading secrets.
 - [x] CLI: `nanna sessions/chat/run` ignore `[general] data_dir` (`cli.rs:390`, `setup.rs:241`);
       `register_discover_tools` `.expect` on a user-editable file (`setup.rs:319`). The CLI's chat
       commands go with the chat; `run` becomes "create a card and watch it".

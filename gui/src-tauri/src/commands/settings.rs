@@ -202,8 +202,50 @@ pub struct LlmApiKeys {
     pub openrouter_key_set: bool,
 }
 
+/// Where the local Claude proxy is expected when nothing says otherwise.
+const CLAUDE_PROXY_DEFAULT_URL: &str = "http://localhost:3456";
+
+/// This GUI process's Claude proxy setting: enabled, and the URL, if one was set.
+///
+/// Seeded once from `CLAUDE_PROXY_ENABLED` / `CLAUDE_PROXY_URL` at first use, so
+/// a launch-time environment still configures it, and changed in memory after
+/// that. The commands used to write the process environment instead —
+/// `unsafe set_var` from a command on the multi-threaded runtime, which races
+/// every concurrent `getenv` (glibc's included) — only for this same process
+/// to read it back; nothing else ever saw those variables.
+static CLAUDE_PROXY: std::sync::LazyLock<std::sync::RwLock<(bool, Option<String>)>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::RwLock::new((
+            std::env::var_os("CLAUDE_PROXY_ENABLED").is_some(),
+            std::env::var("CLAUDE_PROXY_URL").ok(),
+        ))
+    });
+
+/// The current proxy setting as `(enabled, url)`, the URL defaulted.
+fn claude_proxy_setting() -> (bool, String) {
+    let (enabled, url) = CLAUDE_PROXY
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    (
+        enabled,
+        url.unwrap_or_else(|| CLAUDE_PROXY_DEFAULT_URL.to_string()),
+    )
+}
+
+/// Change the proxy setting; `url: None` keeps the current one.
+fn set_claude_proxy_setting(enabled: bool, url: Option<String>) {
+    let mut guard = CLAUDE_PROXY
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.0 = enabled;
+    if url.is_some() {
+        guard.1 = url;
+    }
+}
+
 /// The local Claude proxy: whether it is enabled, and the URL it is expected
-/// at (`CLAUDE_PROXY_ENABLED` / `CLAUDE_PROXY_URL`).
+/// at (see [`CLAUDE_PROXY`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeProxyStatus {
     pub claude_proxy_enabled: bool,
@@ -343,10 +385,12 @@ fn build_extended_settings(
         },
         github_key_set: config.llm.github_token.is_some()
             || std::env::var("GITHUB_TOKEN").is_ok(),
-        claude_proxy: ClaudeProxyStatus {
-            claude_proxy_enabled: std::env::var("CLAUDE_PROXY_ENABLED").is_ok(),
-            claude_proxy_url: std::env::var("CLAUDE_PROXY_URL")
-                .unwrap_or_else(|_| "http://localhost:3456".to_string()),
+        claude_proxy: {
+            let (claude_proxy_enabled, claude_proxy_url) = claude_proxy_setting();
+            ClaudeProxyStatus {
+                claude_proxy_enabled,
+                claude_proxy_url,
+            }
         },
         brave_key_set: config.tools.brave_api_key.is_some()
             || std::env::var("BRAVE_API_KEY").is_ok(),
@@ -497,10 +541,7 @@ pub async fn set_provider_api_key(
         "github" => state_guard.config.llm.github_token = Some(api_key.clone()),
         "claude-proxy" => {
             // For claude-proxy, the "api_key" is actually the proxy URL
-            unsafe {
-                std::env::set_var("CLAUDE_PROXY_URL", &api_key);
-                std::env::set_var("CLAUDE_PROXY_ENABLED", "1");
-            }
+            set_claude_proxy_setting(true, Some(api_key.clone()));
         }
         _ => return Err(format!("Unknown provider: {provider}")),
     }
@@ -880,9 +921,7 @@ pub async fn get_daemon_providers(
 pub async fn get_mcp_servers(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let state_guard = state.read().await;
-    let status = state_guard.backend.system_status().await?;
-    drop(state_guard);
+    let status = backend_handle(&state).await.system_status().await?;
     Ok(status
         .get("mcp_servers")
         .and_then(|v| v.as_array())
@@ -1948,16 +1987,8 @@ pub async fn get_claude_proxy_models(
 /// Never returns `Err`.
 #[tauri::command]
 pub async fn set_claude_proxy(enabled: bool, url: Option<String>) -> Result<(), String> {
-    unsafe {
-        if enabled {
-            std::env::set_var("CLAUDE_PROXY_ENABLED", "1");
-            if let Some(u) = url {
-                std::env::set_var("CLAUDE_PROXY_URL", u);
-            }
-        } else {
-            std::env::remove_var("CLAUDE_PROXY_ENABLED");
-        }
-    }
+    // Disabling keeps the URL, as clearing only the flag always did.
+    set_claude_proxy_setting(enabled, url.filter(|_| enabled));
     Ok(())
 }
 
@@ -1969,8 +2000,7 @@ pub async fn set_claude_proxy(enabled: bool, url: Option<String>) -> Result<(), 
 /// unreachable or unhealthy proxy is `Ok(false)`.
 #[tauri::command]
 pub async fn check_claude_proxy_health() -> Result<bool, String> {
-    let proxy_url = std::env::var("CLAUDE_PROXY_URL")
-        .unwrap_or_else(|_| "http://localhost:3456".to_string());
+    let (_, proxy_url) = claude_proxy_setting();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -2273,11 +2303,14 @@ pub async fn set_chat_model_priority(
         .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon so changes take effect without restart
-    let _ = state_guard.backend.config_set(
+    // Clone the handle and release the lock before the round trip: the
+    // save above stays ordered under it, the daemon call does not need it.
+    let backend = state_guard.backend.clone();
+    drop(state_guard);
+    let _ = backend.config_set(
         "llm.model_priority",
         serde_json::to_value(&priority).unwrap_or_default(),
     ).await;
-    drop(state_guard);
 
     // Emit model-status event so the GUI badge updates
     let _ = app.emit("model-status", ModelStatusEvent {
@@ -2494,11 +2527,14 @@ pub async fn set_model_routing(
         .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
-    let _ = state_guard.backend.config_set(
+    // Clone the handle and release the lock before the round trip: the
+    // save above stays ordered under it, the daemon call does not need it.
+    let backend = state_guard.backend.clone();
+    drop(state_guard);
+    let _ = backend.config_set(
         "llm.model_routing",
         serde_json::to_value(&routes).unwrap_or_default(),
     ).await;
-    drop(state_guard);
 
     info!("Model routing set: {:?}", routes);
     Ok(())
@@ -2538,11 +2574,14 @@ pub async fn set_routing_first_turn_primary(
         .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
-    let _ = state_guard.backend.config_set(
+    // Clone the handle and release the lock before the round trip: the
+    // save above stays ordered under it, the daemon call does not need it.
+    let backend = state_guard.backend.clone();
+    drop(state_guard);
+    let _ = backend.config_set(
         "llm.routing_first_turn_primary",
         serde_json::Value::Bool(enabled),
     ).await;
-    drop(state_guard);
 
     info!("Routing first turn primary set: {}", enabled);
     Ok(())
@@ -2594,17 +2633,20 @@ pub async fn set_sub_agent_models(
         .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
-    let _ = state_guard.backend.config_set(
+    // Clone the handle and release the lock before the round trip: the
+    // save above stays ordered under it, the daemon call does not need it.
+    let backend = state_guard.backend.clone();
+    drop(state_guard);
+    let _ = backend.config_set(
         "llm.sub_agent_models",
         serde_json::json!(models),
     ).await;
-    let _ = state_guard.backend.config_set(
+    let _ = backend.config_set(
         "llm.sub_agent_model",
         serde_json::Value::Null,
     ).await;
 
-    info!("Sub-agent models set: {:?}", state_guard.config.llm.sub_agent_models);
-    drop(state_guard);
+    info!("Sub-agent models set: {:?}", models);
     Ok(())
 }
 
@@ -2732,6 +2774,33 @@ pub async fn save_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The proxy setting lives in memory, not the process environment, and
+    /// keeps the old command semantics: enabling may set a URL, disabling
+    /// keeps it, and no URL means the default. The only test touching the
+    /// process-wide setting, so it cannot race another.
+    #[tokio::test]
+    async fn the_claude_proxy_setting_is_in_memory() {
+        set_claude_proxy(true, Some("http://127.0.0.1:9".into()))
+            .await
+            .expect("never fails");
+        assert_eq!(
+            claude_proxy_setting(),
+            (true, "http://127.0.0.1:9".to_string())
+        );
+        set_claude_proxy(false, Some("http://ignored".into()))
+            .await
+            .expect("never fails");
+        assert_eq!(
+            claude_proxy_setting(),
+            (false, "http://127.0.0.1:9".to_string()),
+            "disabling keeps the URL"
+        );
+        assert!(
+            std::env::var_os("CLAUDE_PROXY_URL").is_none_or(|v| v != "http://127.0.0.1:9"),
+            "the environment is not written"
+        );
+    }
 
     fn sample_settings() -> ExtendedSettings {
         ExtendedSettings {
