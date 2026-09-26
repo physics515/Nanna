@@ -8872,6 +8872,31 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      the only reason for `high`). TypeScript 7 still blocked (`vue-tsc` still 3.3.11).
      Verified: clippy 0 warnings, **2616 Rust tests / 88 binaries, 0 failures**, 403 vitest,
      typecheck clean, `pnpm build` clean. Toolchain pin not moved this run.
+     `tauri 2.12.0` also carries a security fix — channel IPC queue entries are now bound to the
+     webview that created them ([GHSA-w28w-mhc8-qvjv](https://github.com/tauri-apps/tauri/releases/tag/tauri-v2.12.0)).
+     The updater plugin's 2.12 break (`allowDowngrades` left the JS `check()`) does not touch us:
+     `useAppUpdater.ts` never passed it. Re-checked and unchanged: `rustpython-vm` still ends at
+     0.5.0 (both pin-backs stay), `vue-tsc` still 3.3.11, TypeScript 7.1 unreleased.
+     - [ ] **`boa_engine 0.22.0` is on crates.io (2026-08-28) and depends on icu `~2.3`** — try
+           replacing the boa git pin (rev `4f98f644`). The `~` ranges do not mix, so it needs icu
+           2.3 across the whole graph; check what `deno_core`/`turso` resolve before starting.
+           ([deps](https://crates.io/api/v1/crates/boa_engine/0.22.0/dependencies))
+     - [ ] **`turso` 0.7.2 is the latest stable (2026-07-30); we are exact-pinned at `=0.6.1`.** 0.7.0
+           brought MVCC passive checkpoints, recovery fixes and an MVCC-safe AUTOINCREMENT
+           ([notes](https://github.com/tursodatabase/turso/releases/tag/v0.7.0)); 0.8.0 is in
+           pre-release (pre.13, 2026-09-25). Migrate one minor at a time, release-build gated. It does
+           **not** retire RUSTSEC-2026-0253: `tantivy 0.26.2` (2026-09-08) still requires
+           `lru ^0.16.3`, and the fix is `lru ≥ 0.18.2`.
+     - [ ] *(P13, research 2026-09-26)* **FSRS-7 exists but is not shippable yet.** ts-fsrs merged it
+           ([PR #520](https://github.com/open-spaced-repetition/ts-fsrs/pull/520), 2026-09-18,
+           unreleased); `fsrs-rs` is at 6.6.2 with no FSRS-7, and no FSRS-7 default parameters are
+           published (srs-benchmark experiments are still open). Re-check when `fsrs-rs` ships it;
+           adopting it is the same retention-harness A/B the FSRS-6 weight decision needed.
+     - [ ] *(P20, research 2026-09-26)* **IBM Granite 4.2 8B** (Apache-2.0, card dated 2026-08-25,
+           "reasoning-augmented tool calling", 512K context) is the one new tool-calling model in the
+           16 GB class this month ([card](https://huggingface.co/ibm-granite/granite-4.2-8b)). No
+           BFCL/tau-bench numbers are published, so it earns a smoke leg before any endurance leg —
+           the ministral lesson. Needs a model host: this machine has no local Ollama.
    - *(2026-09-23 sweep)* `cargo update` → 4 compatible bumps (`aegis 0.9.16 → 0.9.19`,
      `glib 0.22.9 → 0.22.10`, `libredox 0.1.24 → 0.1.25`, plus `libc`'s usual walk).
      `cargo upgrade --incompatible` offered **nothing at all** — 80 non-local packages already at
