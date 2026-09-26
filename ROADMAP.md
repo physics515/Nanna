@@ -8209,9 +8209,17 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       uses the hourly one's short-circuit-aware increments and the same instant. Session metadata
       is serialized with `serde_json`. `clear` skips only `NotFound` and propagates any other read
       error (no test: a read error cannot be injected into the in-memory store). 3 tests.
-- [ ] `chunks_needing_embedding` returns fabricated `MemoryChunk` fields — narrow the type;
+- [x] `chunks_needing_embedding` returns fabricated `MemoryChunk` fields — narrow the type;
       `consolidated_metadata` doc says first-writer-wins and implements unanimity; the two dream
       gates are verbatim duplicates (`repositories.rs:1211`, `consolidation.rs:1027`, `dreaming.rs:321`).
+      *(2026-09-26)* The queue now returns `QueuedChunk { id, memory_id, ordinal, content }` —
+      the four fields it actually knows — instead of a `MemoryChunk` with nine invented ones
+      (`char_end: 0`, `created_at: ""`) a caller could not tell from real values; every caller
+      already read only those four. A stale stacked doc block on the function went with it. The two
+      comments still describing a first-writer-wins merge now describe the unanimity rule and why
+      monotone provenance is still needed under it (a mixed stated/observed cluster would lose
+      `fact_type` entirely). The gate's cross-check pair is one `debug_check_gate`, called from
+      both entry points.
 - [x] `memory.get` performs three full `list_all()` clones (`server.rs:1162`).
       *(2026-09-26)* One snapshot now feeds the resolve, the chunk reassembly and the served-row
       feedback (`resolve_memory_handle_in`, and the two helpers are pure fns over the slice). The

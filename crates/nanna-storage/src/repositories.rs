@@ -1,6 +1,10 @@
 //! Repository implementations using Turso
 
-use crate::{CronJob, JobRun, Memory, MemoryChunk, MemoryEventRow, MemoryFsrsUpdate, Message, NewCronJob, NewJobRun, NewMemory, NewMemoryChunk, NewMemoryEvent, NewMessage, Session, StorageError, WorkspaceRecord};
+use crate::{
+    CronJob, JobRun, Memory, MemoryChunk, MemoryEventRow, MemoryFsrsUpdate, Message, NewCronJob,
+    NewJobRun, NewMemory, NewMemoryChunk, NewMemoryEvent, NewMessage, QueuedChunk, Session,
+    StorageError, WorkspaceRecord,
+};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -1149,11 +1153,6 @@ impl MemoryRepository {
     /// rebuild: the text is already stored and chunked, so only the vectors
     /// need recomputing — incrementally, and restartably after a crash.
     ///
-    /// # Errors
-    /// Returns [`StorageError`] if the query fails.
-    ///
-    /// # Panics
-    /// Panics if `limit` is 0.
     /// Chunk work for `model`, taken from the durable queue.
     ///
     /// Seeds the queue first so an existing database — whose chunks predate the
@@ -1171,7 +1170,7 @@ impl MemoryRepository {
         model: &str,
         limit: usize,
         seed: bool,
-    ) -> Result<Vec<MemoryChunk>, StorageError> {
+    ) -> Result<Vec<QueuedChunk>, StorageError> {
         assert!(!model.is_empty(), "chunk work must name the model it is for");
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn.lock().await;
@@ -1204,20 +1203,11 @@ impl MemoryRepository {
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(MemoryChunk {
+            out.push(QueuedChunk {
                 id: row.get(0)?,
                 memory_id: row.get(1)?,
                 ordinal: row.get(2)?,
                 content: row.get(3)?,
-                char_start: 0,
-                char_end: 0,
-                embedding: None,
-                embedding_model: None,
-                chunk_max_chars: 0,
-                chunker_version: 0,
-                workspace_id: None,
-                created_at: String::new(),
-                updated_at: String::new(),
             });
         }
         // Held from the seeding through the drained cursor: seeding and

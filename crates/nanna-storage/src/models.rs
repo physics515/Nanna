@@ -357,6 +357,20 @@ pub struct VerdictTally {
     pub failed: u64,
 }
 
+/// One chunk waiting for a vector under some model: exactly what the
+/// embedding queue knows, and nothing more.
+///
+/// The queue used to hand back a whole [`MemoryChunk`] with nine fields filled
+/// by invention (`char_end: 0`, `created_at: ""`, …) — values a caller could
+/// not tell from real ones. A narrow type makes the absence visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedChunk {
+    pub id: i64,
+    pub memory_id: String,
+    pub ordinal: i64,
+    pub content: String,
+}
+
 /// One embedded slice of a memory's content.
 ///
 /// A memory's content is unbounded; an embedding model's input window is not.
