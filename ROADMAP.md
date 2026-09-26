@@ -8390,9 +8390,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
 - [ ] CLI: `nanna sessions/chat/run` ignore `[general] data_dir` (`cli.rs:390`, `setup.rs:241`);
       `register_discover_tools` `.expect` on a user-editable file (`setup.rs:319`). The CLI's chat
       commands go with the chat; `run` becomes "create a card and watch it".
-- [ ] `nanna-client`: `auto_reconnect`/`max_reconnect_attempts`/`Reconnecting` are declared and
+- [x] `nanna-client`: `auto_reconnect`/`max_reconnect_attempts`/`Reconnecting` are declared and
       never read; a failed send leaves a `pending` entry (`connection.rs:28,327`). The board client
       needs reconnect for real.
+      *(2026-09-26)* The three dead fields are **deleted**, not implemented: the CLI and the e2e
+      test set `auto_reconnect = false` believing it mattered, and nothing ever read it — the GUI
+      has its own working reconnect in `daemon_client.rs`, and the board client's is a Stage 4
+      design question, not something to leave half-declared in the meantime. A failed send now
+      removes the entry it just registered (no test: the path is a race between the handler dying
+      and the state flipping, with no deterministic hook). e2e daemon suite: 42/42.
 
 **Independent — fix when in the file:**
 - [~] `nanna-simd` NEON arm has a trailing semicolon and does not compile on aarch64

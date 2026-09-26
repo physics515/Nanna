@@ -196,7 +196,6 @@ impl TestDaemon {
     async fn connect_client(&self) -> Client {
         Client::connect(ClientConfig {
             url: self.url(),
-            auto_reconnect: false,
             connect_timeout: READY_HANG_CEILING,
             request_timeout: READY_HANG_CEILING,
             ..Default::default()
