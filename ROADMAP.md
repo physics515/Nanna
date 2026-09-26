@@ -8133,9 +8133,21 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       tripped `recursion_depth_exceeding_limit` (rust#159228) in every test root holding a
       `Storage` future; boxing it as `dyn Future + Send` ends the proof there instead of adding
       `recursion_limit` to each consumer. 7 tests.
-- [ ] `prune_tool_call_log` cutoff format; hourly vs daily tool aggregates disagree on
+- [x] `prune_tool_call_log` cutoff format; hourly vs daily tool aggregates disagree on
       short-circuited calls; `create_gui_session_with_workspace` unescaped JSON; `tasks.rs:828`
       `clear` treating a read error as "already deleted" (`nanna-storage/src/lib.rs:1226,1034,229`).
+      *(2026-09-26)* All four, plus the one the review missed: **`prune_tool_call_log` had no
+      caller**, so the raw log grew for the daemon's whole life and the cutoff bug was latent. The
+      cutoff is now `datetime('now', '-N days')` in the column's own format (the RFC 3339 string
+      sorted `' '` below `'T'` and deleted the whole cutoff day — the new test is red on it, 2
+      deleted instead of 1), it returns the real affected-row count instead of a hard `0`, and a
+      daily `tool_call_log_prune` scheduled task keeps 30 days (`TOOL_CALL_LOG_KEEP_DAYS`; the
+      aggregates keep history). That task's payload is **deliberately empty**: the executor runs
+      any task name it does not know as an *agent prompt*, so a rolled-back binary would have
+      handed "delete … rows" to the model; an empty payload it skips. The daily aggregate now
+      uses the hourly one's short-circuit-aware increments and the same instant. Session metadata
+      is serialized with `serde_json`. `clear` skips only `NotFound` and propagates any other read
+      error (no test: a read error cannot be injected into the in-memory store). 3 tests.
 - [ ] `chunks_needing_embedding` returns fabricated `MemoryChunk` fields — narrow the type;
       `consolidated_metadata` doc says first-writer-wins and implements unanimity; the two dream
       gates are verbatim duplicates (`repositories.rs:1211`, `consolidation.rs:1027`, `dreaming.rs:321`).

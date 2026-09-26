@@ -234,7 +234,11 @@ impl Storage {
     /// Returns [`StorageError::Database`] if the insert or the read-back
     /// query fails, or [`StorageError::NotFound`] if the new row cannot be
     /// read back.
-    pub async fn create_gui_session_with_workspace(&self, name: &str, workspace_id: Option<&str>) -> Result<Session, StorageError> {
+    pub async fn create_gui_session_with_workspace(
+        &self,
+        name: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Session, StorageError> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
 
@@ -242,10 +246,12 @@ impl Storage {
             "INSERT INTO sessions (session_id, channel, user_id, workspace_id, name, metadata) 
              VALUES (?1, 'gui', NULL, ?2, ?3, ?4)",
             turso::params![
-                session_id.as_str(), 
+                session_id.as_str(),
                 workspace_id,
                 name,
-                format!("{{\"name\":\"{name}\"}}").as_str()
+                // Serialized, never formatted: a name with a quote or a
+                // backslash produced metadata that was not JSON at all.
+                serde_json::json!({ "name": name }).to_string().as_str()
             ],
         )
         .await?;
@@ -536,6 +542,94 @@ const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cutoff is compared in `created_at`'s own format. An RFC 3339 cutoff
+    /// sorted `' '` below `'T'`, so a row one second inside the window, on the
+    /// cutoff DAY, was deleted with the rest of that day.
+    #[tokio::test]
+    async fn the_tool_log_prune_keeps_everything_inside_the_window() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let conn = storage.conn().lock().await;
+        for (tool, age) in [
+            ("stale", "-31 days"),
+            ("edge", "-30 days"),
+            ("fresh", "-1 hours"),
+        ] {
+            conn.execute(
+                "INSERT INTO tool_call_log \
+                 (tool_name, success, duration_ms, error_message, session_id, created_at) \
+                 VALUES (?1, 1, 5, '', '', datetime('now', ?2, '+2 seconds'))",
+                turso::params![tool, age],
+            )
+            .await
+            .expect("insert");
+        }
+        drop(conn);
+
+        let deleted = storage.prune_tool_call_log(30).await.expect("prune");
+        let left: Vec<String> = storage
+            .get_tool_call_log(None, 10)
+            .await
+            .expect("log")
+            .into_iter()
+            .map(|e| e.tool_name)
+            .collect();
+        assert_eq!(deleted, 1, "the real count, not a placeholder 0");
+        assert!(
+            left.contains(&"edge".to_string()),
+            "inside the window by 2 s: {left:?}"
+        );
+        assert!(!left.contains(&"stale".to_string()), "{left:?}");
+    }
+
+    /// A short-circuited call never ran. The hourly aggregate knew that; the
+    /// daily one counted it as a success, so the two disagreed.
+    #[tokio::test]
+    async fn both_aggregates_agree_on_a_short_circuited_call() {
+        let storage = Storage::in_memory().await.expect("storage");
+        for short_circuited in [true, false] {
+            storage
+                .log_tool_call(&NewToolCall {
+                    tool_name: "exec",
+                    success: true,
+                    short_circuited,
+                    duration_ms: 3,
+                    output_size: 0,
+                    error_message: None,
+                    session_id: None,
+                })
+                .await
+                .expect("log");
+        }
+        let hourly = storage
+            .get_tool_stats_hourly(Some("exec"), 2)
+            .await
+            .expect("hourly");
+        let daily = storage
+            .get_tool_stats_daily(Some("exec"), 2)
+            .await
+            .expect("daily");
+        let counts = |b: &ToolStatsTimeBucket| (b.call_count, b.success_count, b.failure_count);
+        assert_eq!(counts(&hourly[0]), (2, 1, 0), "{hourly:?}");
+        assert_eq!(counts(&daily[0]), counts(&hourly[0]), "{daily:?}");
+    }
+
+    /// Session metadata is serialized, not formatted: a quote in the name used
+    /// to produce a string that was not JSON.
+    #[tokio::test]
+    async fn a_session_name_with_quotes_is_stored_as_json() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let name = r#"the "big" plan \ v2"#;
+        let session = storage
+            .create_gui_session_with_workspace(name, None)
+            .await
+            .expect("create");
+        assert_eq!(
+            session.metadata.as_ref().and_then(|m| m["name"].as_str()),
+            Some(name),
+            "{session:?}"
+        );
+    }
 
     async fn table_names(conn: &Connection) -> Vec<String> {
         let mut rows = conn
@@ -1188,8 +1282,13 @@ impl Storage {
             ],
         ).await?;
 
-        // Also update hourly aggregate
-        let hour = chrono::Utc::now().format("%Y-%m-%dT%H:00:00").to_string();
+        // One instant for both aggregates, so a call at 23:59:59.999 cannot
+        // land in one day's hourly row and the next day's daily row.
+        let now = chrono::Utc::now();
+        let hour = now.format("%Y-%m-%dT%H:00:00").to_string();
+        // A short-circuited call never ran: it is neither a success nor a
+        // failure in EITHER aggregate. The daily one used to count it as
+        // `success`, so the two views disagreed about the same calls.
         let success_incr = i64::from(success && !short_circuited);
         let failure_incr = i64::from(!success && !short_circuited);
         conn.execute(
@@ -1211,8 +1310,7 @@ impl Storage {
             ],
         ).await?;
 
-        // Also update daily aggregate
-        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let day = now.format("%Y-%m-%d").to_string();
         conn.execute(
             "INSERT INTO tool_stats_daily (tool_name, day, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
              VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
@@ -1226,8 +1324,8 @@ impl Storage {
             turso::params![
                 tool_name,
                 day,
-                i64::from(success),
-                i64::from(!success),
+                success_incr,
+                failure_incr,
                 duration_ms.cast_signed()
             ],
         ).await?;
@@ -1413,21 +1511,27 @@ impl Storage {
         Ok(result)
     }
 
-    /// Prune old tool call logs (keep last N days).
+    /// Delete raw tool-call rows older than `keep_days`; returns how many.
+    ///
+    /// The cutoff is computed by the database, in the format `created_at` is
+    /// written in (`datetime('now')`, `YYYY-MM-DD HH:MM:SS`). It used to be an
+    /// RFC 3339 string, and `' '` sorts below `'T'`, so every row of the cutoff
+    /// DAY compared as older and the whole day was deleted at any hour. Only
+    /// the raw log is pruned — the hourly and daily aggregates keep history.
     ///
     /// # Errors
     /// Returns [`StorageError::Database`] if the delete fails.
     pub async fn prune_tool_call_log(&self, keep_days: u32) -> Result<u64, StorageError> {
+        let modifier = format!("-{keep_days} days");
         let conn = self.conn.lock().await;
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(keep_days));
-        let cutoff_str = cutoff.to_rfc3339();
-        conn.execute(
-            "DELETE FROM tool_call_log WHERE created_at < ?1",
-            turso::params![cutoff_str],
-        ).await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM tool_call_log WHERE created_at < datetime('now', ?1)",
+                turso::params![modifier],
+            )
+            .await?;
         drop(conn);
-        // Return approximate count (turso doesn't give affected rows easily)
-        Ok(0)
+        Ok(deleted)
     }
 }
 

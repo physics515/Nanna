@@ -1143,9 +1143,14 @@ impl TaskRepository {
                     continue;
                 }
             }
-            // The subtree may already be gone via an earlier parent delete.
-            if self.get_raw(target.id).await.is_ok() {
-                deleted += self.delete(target.id, None).await?;
+            // The subtree may already be gone via an earlier parent delete —
+            // that, and only that, is a skip. A read that FAILED is not
+            // evidence the row is gone; treating it as "already deleted" made
+            // a database error look like a smaller, successful clear.
+            match self.get_raw(target.id).await {
+                Ok(_) => deleted += self.delete(target.id, None).await?,
+                Err(StorageError::NotFound(_)) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(deleted)

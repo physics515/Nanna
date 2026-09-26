@@ -3018,6 +3018,49 @@ async fn run_recurrence_sweep(
     )
 }
 
+/// Name of the scheduled task that prunes the raw tool-call log.
+const TOOL_CALL_LOG_PRUNE_TASK: &str = "tool_call_log_prune";
+
+/// Days of raw `tool_call_log` rows kept.
+///
+/// Bound justification: raw rows back only the "recent calls" view (the last
+/// 50 by default); per-hour and per-day history lives in the aggregate tables,
+/// which this does not touch. A month covers any debugging look-back, and at a
+/// heavy few thousand calls a day holds the table near 100k rows instead of
+/// growing for the daemon's whole life — which it did, because
+/// `prune_tool_call_log` had never had a caller.
+const TOOL_CALL_LOG_KEEP_DAYS: u32 = 30;
+
+/// The daily `tool_call_log_prune` scheduled task.
+///
+/// Returns the scheduler's `(success, output, error)` triple.
+async fn run_tool_call_log_prune(
+    storage: Option<&Arc<nanna_storage::Storage>>,
+) -> (bool, Option<String>, Option<String>) {
+    let Some(storage) = storage else {
+        return (true, Some("Skipped (no storage)".to_string()), None);
+    };
+    match storage.prune_tool_call_log(TOOL_CALL_LOG_KEEP_DAYS).await {
+        Ok(deleted) => {
+            if deleted > 0 {
+                info!(
+                    "Pruned {deleted} tool-call log rows older than {TOOL_CALL_LOG_KEEP_DAYS} days"
+                );
+            }
+            (
+                true,
+                Some(format!("Pruned {deleted} tool-call log rows")),
+                None,
+            )
+        }
+        Err(e) => (
+            false,
+            None,
+            Some(format!("tool-call log prune failed: {e}")),
+        ),
+    }
+}
+
 /// A reminder: delivered as a message, never run as a prompt.
 ///
 /// A reminder needs no model, and must not wait for one (see
@@ -3451,6 +3494,25 @@ impl DaemonServer {
                     .await;
                 info!("Scheduled task recurrence sweep (every 5 minutes)");
             }
+
+            let deduped = scheduler.deduplicate_by_name(TOOL_CALL_LOG_PRUNE_TASK).await;
+            if deduped > 0 {
+                info!("Removed {deduped} duplicate tool-call log prune tasks");
+            }
+            if !scheduler.has_task_named(TOOL_CALL_LOG_PRUNE_TASK).await {
+                scheduler
+                    // Empty payload on purpose: the executor runs any task name
+                    // it does not recognise as an AGENT PROMPT, so a binary older
+                    // than this one (a rollback) would hand a prose payload to the
+                    // model — "delete … rows" included. An empty one it skips.
+                    .add_task(nanna_core::recurring_task(
+                        TOOL_CALL_LOG_PRUNE_TASK,
+                        std::time::Duration::from_hours(24),
+                        "",
+                    ))
+                    .await;
+                info!("Scheduled tool-call log prune (daily, keeping {TOOL_CALL_LOG_KEEP_DAYS} days)");
+            }
         }
 
         let executor = Self::scheduled_task_executor(ScheduledTaskDeps {
@@ -3547,6 +3609,7 @@ impl DaemonServer {
                     "task_recurrence_sweep" => {
                         run_recurrence_sweep(storage.as_ref()).await
                     }
+                    TOOL_CALL_LOG_PRUNE_TASK => run_tool_call_log_prune(storage.as_ref()).await,
                     crate::reminder_service::REMINDER_TASK_NAME => {
                         deliver_scheduled_reminder(&sessions, &events, &task, reminder_tick).await
                     }
