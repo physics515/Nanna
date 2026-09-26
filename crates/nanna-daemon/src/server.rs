@@ -4038,6 +4038,40 @@ impl DaemonServer {
         }
     }
 
+    /// Append a crashed run's recovered output to its session. `false` when
+    /// the session does not exist, so the caller keeps the checkpoint.
+    async fn repost_recovered(
+        &self,
+        session_id: &str,
+        partial: crate::agent_service::ChatResult,
+    ) -> bool {
+        let reasoning = partial.reasoning.clone();
+        let posted = self
+            .sessions
+            .add_full_message(
+                session_id,
+                crate::session::MessageRole::Assistant,
+                &partial.content,
+                crate::session::MessageDetails {
+                    tool_calls: partial.tool_calls,
+                    reasoning,
+                    timeline: partial.timeline,
+                    usage: partial.usage,
+                },
+            )
+            .await
+            .is_some();
+        if posted {
+            info!("Recovered crashed run for session {}", session_id);
+        } else {
+            warn!(
+                "Crashed run's checkpoint names session {} which does not exist — keeping the checkpoint",
+                session_id
+            );
+        }
+        posted
+    }
+
     /// Re-post the partial output of any run that crashed mid-turn.
     ///
     /// A checkpoint is deleted only after a SUCCESSFUL recovery (or when it
@@ -4057,22 +4091,10 @@ impl DaemonServer {
                         let mut recovered = false;
                         if let Ok(Some(data)) = storage.load_checkpoint(&session_id).await {
                             if let Some(partial) = agent.recover_checkpoint_from_data(&data) {
-                                let reasoning = partial.reasoning.clone();
-                                self.sessions
-                                    .add_full_message(
-                                        &session_id,
-                                        crate::session::MessageRole::Assistant,
-                                        &partial.content,
-                                        crate::session::MessageDetails {
-                                            tool_calls: partial.tool_calls,
-                                            reasoning,
-                                            timeline: partial.timeline,
-                                            usage: partial.usage,
-                                        },
-                                    )
-                                    .await;
-                                info!("Recovered crashed run for session {}", session_id);
-                                recovered = true;
+                                // `None` = no such session: the output had nowhere
+                                // to go. It used to be reported recovered and its
+                                // checkpoint deleted — the output lost for good.
+                                recovered = self.repost_recovered(&session_id, partial).await;
                             } else if serde_json::from_str::<serde_json::Value>(&data).is_ok() {
                                 // Parsed fine but held nothing recoverable —
                                 // an empty checkpoint is safe to clean up.
@@ -4111,28 +4133,15 @@ impl DaemonServer {
                             .and_then(|s| s.strip_suffix(".json"))
                             .unwrap_or("");
                         if !session_id.is_empty() {
-                            if let Some(partial) = agent.recover_checkpoint(session_id) {
-                                let reasoning = partial.reasoning.clone();
-                                self.sessions
-                                    .add_full_message(
-                                        session_id,
-                                        crate::session::MessageRole::Assistant,
-                                        &partial.content,
-                                        crate::session::MessageDetails {
-                                            tool_calls: partial.tool_calls,
-                                            reasoning,
-                                            timeline: partial.timeline,
-                                            usage: partial.usage,
-                                        },
-                                    )
-                                    .await;
-                                info!(
-                                    "Recovered crashed run from legacy checkpoint for session {}",
-                                    session_id
-                                );
+                            let reposted = match agent.recover_checkpoint(session_id) {
+                                Some(partial) => self.repost_recovered(session_id, partial).await,
+                                None => true,
+                            };
+                            // Remove the legacy file — unless its output found no
+                            // session to go to, as for the stored checkpoints.
+                            if reposted {
+                                let _ = std::fs::remove_file(entry.path());
                             }
-                            // Remove the legacy file
-                            let _ = std::fs::remove_file(entry.path());
                         }
                     }
                 }

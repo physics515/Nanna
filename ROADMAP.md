@@ -8139,6 +8139,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       paging back was handed the newest page again every time — indistinguishable from "nothing
       older". `history_page` returns the newest `limit` strictly older than the cursor message,
       and an unknown cursor answers `cursor_not_found` rather than a page. 1 test.
+      *(later)* `recover_checkpoints`: `add_full_message` answers `None` for a session that does
+      not exist, and both recovery paths ignored it — logging "Recovered" and deleting the
+      checkpoint (or legacy file), so the crashed run's output was lost for good. One
+      `repost_recovered` now reports whether it posted; a checkpoint whose session is missing is
+      kept, with a warning. No new test (boot path of the full server); daemon 638 + e2e 44 green.
+      **Still open:** `update()` not persisting messages, `Fork` copying messages only, the write
+      guard across `persist_message` (visible above in `add_full_message`).
 - [~] `control/session.rs`: sub-session timeout leaking `active_chats`, `KillSubSession` flag
       nobody reads, `SubSessionInfo` state overwritten on finish; `agent_service.rs` `try_write`
       dropping stream deltas into the recovery buffers.
