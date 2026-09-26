@@ -7928,6 +7928,12 @@ as its turn (`TurnAdmission`, scope default `session`).
       episodes (decision 14). Deterministic and model-free, so it runs whether or not the
       model-driven cycle consolidated anything. **Known gap:** a card reopened and closed again
       keeps its first fold; re-folding on a new verdict is the obvious follow-up. 2 tests.
+      *(later the same day — gap closed.)* A fold records how many episodes it covered
+      (`episode_events`); a closed card with more episodes than its fold saw is folded again and
+      the superseded fold forgotten **after** the new one is written, so a card is never left
+      without one. Still idempotent: a fold that covers everything is skipped. The step-3 test
+      now reopens the card, posts, closes it, and asserts one fold, with the new post, under a new
+      id — and that a further cycle writes nothing.
       **Step (2):
       `nanna_timeline::compress_episode(events, budget)`** — pure, deterministic, no model, no
       clock. Keeps both endpoints, every `outcome` (a transition), and every local salience peak ≥

@@ -389,19 +389,32 @@ pub const FOLD_MIN_EVENTS: usize = 3;
 /// carrying the lineage back to the card. The thread itself is never touched
 /// (decision 14); only its episodes are read.
 ///
-/// Idempotent: a card that already has a fold is skipped, so re-running a
-/// cycle writes nothing twice. Returns how many cards were folded.
+/// Idempotent: a card whose fold already covers every one of its episodes is
+/// skipped, so re-running a cycle writes nothing twice. A card reopened and
+/// closed again has episodes its fold never saw; it is folded again and the
+/// old fold removed — after the new one is written, so the card is never left
+/// with none. Returns how many cards were folded.
 ///
 /// # Errors
-/// Returns a message when the store cannot be read or a memory write fails;
-/// folds written before the failure stay written.
+/// Returns a message when the store cannot be read, a memory write fails, or
+/// a superseded fold cannot be removed; folds written before the failure stay
+/// written.
 pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Result<usize, String> {
-    let already: std::collections::HashSet<String> = memory
+    // Card id → (fold memory id, episodes it covered), for every existing fold.
+    let already: HashMap<String, (String, usize)> = memory
         .list_all()
         .await
         .into_iter()
         .filter(|m| m.metadata.get("board_event").map(String::as_str) == Some("episode"))
-        .filter_map(|m| m.metadata.get("source_task_id").cloned())
+        .filter_map(|m| {
+            let card = m.metadata.get("source_task_id")?.clone();
+            let covered = m
+                .metadata
+                .get("episode_events")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            Some((card, (m.id, covered)))
+        })
         .collect();
     let cards = storage
         .tasks()
@@ -413,15 +426,15 @@ pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Res
         if folded == FOLDS_PER_CYCLE_MAX {
             break;
         }
-        if already.contains(&card.id.to_string()) {
-            continue;
-        }
+        let previous = already.get(&card.id.to_string());
         let events = storage
             .memory_events()
             .for_source(&format!("task:{}", card.id), nanna_storage::MAX_EVENT_PAGE)
             .await
             .map_err(|e| format!("reading card #{}'s episodes: {e}", card.id))?;
-        if events.len() < FOLD_MIN_EVENTS {
+        if events.len() < FOLD_MIN_EVENTS
+            || previous.is_some_and(|(_, covered)| events.len() <= *covered)
+        {
             continue;
         }
         let Some(fold) =
@@ -453,6 +466,12 @@ pub async fn fold_closed_cards(storage: &Storage, memory: &MemoryService) -> Res
             )
             .await
             .map_err(|e| format!("writing card #{}'s folded episode: {e}", card.id))?;
+        if let Some((superseded, _)) = previous {
+            memory
+                .forget(superseded)
+                .await
+                .map_err(|e| format!("removing card #{}'s superseded fold: {e}", card.id))?;
+        }
         folded += 1;
     }
     debug_assert!(folded <= FOLDS_PER_CYCLE_MAX, "the fold phase is bounded");
@@ -625,6 +644,39 @@ mod tests {
             fold_closed_cards(&storage, &memory).await.expect("fold"),
             0,
             "idempotent"
+        );
+
+        // Reopened, worked on, closed again: the fold is replaced, not kept
+        // stale and not duplicated.
+        tasks.reopen(busy.id, Some("gui")).await.expect("reopen");
+        tasks
+            .post(busy.id, Some("gui"), None, TaskNoteKind::Progress, "step 4")
+            .await
+            .expect("post");
+        tasks
+            .complete(busy.id, Some("gui"), None)
+            .await
+            .expect("complete");
+        let before = wait_for_episodes(&storage, 8).await.len();
+        assert!(before >= 8, "the second round's episodes arrived: {before}");
+        assert_eq!(fold_closed_cards(&storage, &memory).await.expect("fold"), 1);
+        let refolded: Vec<_> = memory
+            .list_all()
+            .await
+            .into_iter()
+            .filter(|m| m.metadata.get("board_event").map(String::as_str) == Some("episode"))
+            .collect();
+        assert_eq!(refolded.len(), 1, "the old fold is gone");
+        assert!(
+            refolded[0].content.contains("step 4"),
+            "{}",
+            refolded[0].content
+        );
+        assert_ne!(refolded[0].id, folds[0].id);
+        assert_eq!(
+            fold_closed_cards(&storage, &memory).await.expect("fold"),
+            0,
+            "idempotent again"
         );
     }
 
