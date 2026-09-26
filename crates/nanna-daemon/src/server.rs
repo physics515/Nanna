@@ -919,12 +919,10 @@ fn memory_search_services(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let limit = crate::numeric::usize_saturating(
-                    params
-                        .get("limit")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(10),
-                );
+                // Lenient: a JS number arrives as a float (`10.0`), which a
+                // strict `as_u64` read as absent and silently replaced with
+                // the default. `opt_count` takes it, and names a bad value.
+                let limit = opt_count(&params, "limit")?.unwrap_or(10);
                 // Per-result page budget. Storage is unbounded now, so a
                 // recall that returned whole memories would put an
                 // arbitrarily large payload into a fixed context window —
@@ -932,19 +930,9 @@ fn memory_search_services(
                 // worth of text: the same unit the memory was indexed in,
                 // so a page corresponds to something the retrieval actually
                 // reasoned about rather than to a round number of bytes.
-                let page_chars = params
-                    .get("page_chars")
-                    .and_then(serde_json::Value::as_u64)
-                    .map_or(
-                        nanna_memory::MEMORY_CHUNK_TARGET_CHARS,
-                        crate::numeric::usize_saturating,
-                    );
-                let offset = crate::numeric::usize_saturating(
-                    params
-                        .get("offset")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                );
+                let page_chars = opt_count(&params, "page_chars")?
+                    .unwrap_or(nanna_memory::MEMORY_CHUNK_TARGET_CHARS);
+                let offset = opt_count(&params, "offset")?.unwrap_or(0);
                 let workspace = ws.read().await;
                 match mem
                     .recall_scoped_with_coverage(&query, workspace.as_deref())
@@ -1356,10 +1344,7 @@ fn agent_spawn_services(
                     .and_then(|v| v.as_str())
                     .unwrap_or("sub-task")
                     .to_string();
-                let max_iterations = params
-                    .get("max_iterations")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(crate::numeric::usize_saturating);
+                let max_iterations = opt_count(&params, "max_iterations")?;
                 match spawner.spawn(&prompt, &description, max_iterations).await {
                     Ok(result) => Ok(json!({
                         "text": result.text,
@@ -1375,6 +1360,14 @@ fn agent_spawn_services(
 
     services
 }
+
+/// Longest `python.exec` run a caller may ask for.
+///
+/// Bound justification: five minutes covers a real computation (a data
+/// transform, a small simulation) while a model that asks for hours cannot
+/// hold the call — and, until the engine's timeout kills, the interpreter —
+/// for that long.
+const PYTHON_EXEC_TIMEOUT_MAX_SECS: u64 = 300;
 
 /// `python.exec`: the embedded interpreter (no system Python required).
 fn python_exec_services() -> HashMap<String, ServiceFn> {
@@ -1394,10 +1387,11 @@ fn python_exec_services() -> HashMap<String, ServiceFn> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let timeout = params
-                    .get("timeout")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(30);
+                // Model-supplied, so bounded: an uncapped value held the call
+                // (and its interpreter) for as long as the model asked.
+                let timeout = opt_count(&params, "timeout")?
+                    .map_or(30, |secs| u64::try_from(secs).unwrap_or(u64::MAX))
+                    .min(PYTHON_EXEC_TIMEOUT_MAX_SECS);
                 let workdir = params
                     .get("workdir")
                     .and_then(|v| v.as_str())
@@ -1434,12 +1428,7 @@ fn session_history_services(session_history: SharedSessionHistory) -> HashMap<St
         Arc::new(move |params: Value| {
             let history = history.clone();
             Box::pin(async move {
-                let limit = crate::numeric::usize_saturating(
-                    params
-                        .get("limit")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(20),
-                );
+                let limit = opt_count(&params, "limit")?.unwrap_or(20);
                 let history = history.read().await;
                 let start = if history.len() > limit {
                     history.len() - limit
@@ -6544,6 +6533,37 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A JS number reaches a service as a float (`2.0`). A strict `as_u64`
+    /// read it as absent and silently used the default instead; the model's
+    /// `limit` had no effect at all.
+    #[tokio::test]
+    async fn a_float_count_from_script_is_the_count_it_says() {
+        let history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(
+            (0..5)
+                .map(|n| crate::session::SessionMessage {
+                    id: n.to_string(),
+                    role: crate::session::MessageRole::User,
+                    content: format!("message {n}"),
+                    timestamp: chrono::Utc::now(),
+                    tool_calls: Vec::new(),
+                    attachments: Vec::new(),
+                    reasoning: None,
+                    timeline: Vec::new(),
+                    usage: None,
+                })
+                .collect(),
+        ));
+        let services = session_history_services(history);
+        let two = services["session.history"](serde_json::json!({ "limit": 2.0 }))
+            .await
+            .expect("a float count is read");
+        assert_eq!(two.as_array().map(Vec::len), Some(2), "{two}");
+        let refused = services["session.history"](serde_json::json!({ "limit": "lots" }))
+            .await
+            .expect_err("a count that is not a number is named, not defaulted");
+        assert!(refused.contains("limit"), "{refused}");
+    }
 
     /// With no Settings summarization list, `memory.summarize` walks the chat
     /// models in their configured order — the rule every memory consumer

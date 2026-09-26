@@ -8339,7 +8339,16 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `tool.ts` anywhere could be overwritten. `delete_skill`'s check is now the shared
       `validate_existing_skill_name`, and `update_skill` also canonicalises the resolved directory
       against the skills root (a symlinked skill dir). 3 tests.
-- [ ] Smaller: `strip_ansi_escapes` OSC/non-CSI; missing `workdir` misreported as missing command;
+- [~] *(2026-09-26 — the `as_u64` one, plus the uncapped model-supplied `python.exec` timeout from
+      the Engines line; the rest of this line is open.)* Six service params (`memory.search`
+      `limit`/`page_chars`/`offset`, `agent.spawn` `max_iterations`, `python.exec` `timeout`,
+      `session.history` `limit`) were read with a strict `as_u64` — but Boa hands every JS number
+      over as a float, so `limit: 2` arrived as `2.0`, read as *absent*, and silently became the
+      default: the model's argument had no effect. All six now go through the lenient
+      `opt_count` (integral floats and digit strings accepted, garbage **named** instead of
+      defaulted), and the dead `numeric::usize_saturating` is gone. `python.exec`'s timeout is
+      capped at `PYTHON_EXEC_TIMEOUT_MAX_SECS` (300). 1 test.
+      Smaller: `strip_ansi_escapes` OSC/non-CSI; missing `workdir` misreported as missing command;
       `Nanna.readFile` size ceiling; `timeout_secs * 1000` overflow; `run_git` buffers before the
       cap; `dump_empty_step` unbounded log outside the data dir; strict `as_u64` where Boa hands
       over `f64`; `fit_image_to_limit` ignores `quality` (`bridge.rs`, `scripted.rs:83`,
