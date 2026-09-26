@@ -6363,16 +6363,17 @@ impl OllamaStreamState {
         // A final NDJSON object that arrived without its trailing newline
         // would otherwise sit in `buffer` unparsed and be reported as an
         // aborted generation. Cheap to honour, and it can only ever turn
-        // a false 502 into the success it actually was.
+        // a false 502 into the success it actually was. It is translated like
+        // any other line: this used to only close the blocks, so whatever the
+        // object itself carried — its last text, a tool call, its
+        // `done_reason` — was dropped from a reply reported as complete.
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(buffer.trim())
-            && obj["done"].as_bool().unwrap_or(false) {
-                self.flush_content(&mut items);
-                if self.thinking_block_started || self.text_block_started {
-                    items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
-                }
-                items.push(Ok(StreamEvent::MessageStop { stop_reason: self.stop_reason().to_string() }));
-                return items;
-            }
+            && obj["done"].as_bool().unwrap_or(false)
+        {
+            let (items, finished) = self.on_object(&obj, bytes_received);
+            debug_assert!(finished, "a done object ends the stream");
+            return items;
+        }
 
         // A sentinel-terminated stream is a COMPLETE turn.
         //
@@ -9510,7 +9511,35 @@ mod inline_think_tests {
         assert_eq!(unique.len(), ids.len(), "ids repeat: {ids:?}");
     }
 
-    /// Through the NDJSON translator: the reply's text deltas carry no tag
+    /// A last line without its newline is translated in full: its text and
+    /// tool call reach the reply, and the turn stops as a tool turn.
+    #[test]
+    fn an_unterminated_final_line_keeps_what_it_carries() {
+        let mut state = OllamaStreamState::default();
+        let first = serde_json::json!({ "message": { "content": "Hello" }, "done": false });
+        let (mut items, _) = state.on_object(&first, 0);
+        let last = r#"{"message":{"content":" world","tool_calls":[{"function":{"name":"read","arguments":{}}}]},"done":true,"done_reason":"stop"}"#;
+        items.extend(state.finish(last, None, 0, 1));
+        let events: Vec<StreamEvent> = items.into_iter().map(|i| i.expect("no error")).collect();
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello world", "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { tool_name: Some(n), .. } if n == "read")),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(StreamEvent::MessageStop { stop_reason }) if stop_reason == "tool_use"),
+            "{events:?}"
+        );
+    }
+
+/// Through the NDJSON translator: the reply's text deltas carry no tag
     /// and no reasoning, and the reasoning arrives as thinking.
     #[test]
     fn the_stream_translator_separates_inline_reasoning() {

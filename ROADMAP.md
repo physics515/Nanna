@@ -8409,7 +8409,10 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       or truncated "summary"), and inline `<think>…</think>` is stripped (a reasoning model's think
       block was stored as memory text). 1 test. **Still open on this line:** native Anthropic
       stream errors reaching the chain walk as `Err`, `x-ratelimit-reset-*` parsing, `think` on
-      the stream body, `done:true` without a trailing newline.
+      the stream body. *(later)* `done:true` without a trailing newline: `finish` already
+      accepted that last object as a clean stop, but only closed the blocks — the object's own
+      text, tool calls and `done_reason` were dropped from a reply reported as complete. It now
+      goes through `on_object` like every other line. 1 test.
 - [~] *(2026-09-26 — the Boa loop half, plus the `exec`-style cap for `python.exec` noted on the
       "Smaller" line.)* Boa has no interrupt API, so a timed-out script cannot be stopped from
       outside and its blocking thread kept spinning a core for the life of the process. Every tool
