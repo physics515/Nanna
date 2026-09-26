@@ -8224,10 +8224,22 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       clones the sender and releases the clients guard before the bounded send, so one client
       that stops reading no longer blocks every connect and disconnect. 1 test covering all four
       shapes plus wire round-trip.
-- [ ] `SchedulerAction::Update` reports success for unknown ids; `reminder_service` bound check
+- [~] `SchedulerAction::Update` reports success for unknown ids; `reminder_service` bound check
       under a read guard; `windows_service` reports Running after an early daemon exit; service
       plist/unit paths unquoted (`control/scheduler.rs:37`, `reminder_service.rs:218`,
       `windows_service.rs:362`, `service.rs:297`).
+      *(2026-09-26 — three of four, plus two the review missed.)* **`update_schedule` never
+      persisted the new expression**: it wrote `next_run` and an empty string over `last_run`, so a
+      rescheduled job reverted on restart. Every edit now goes through one `modify_task` that
+      re-writes the whole row with the same upsert `add_task` uses. `Update` answers `not_found`
+      for an unknown id whatever was asked (enable/disable of a missing job used to "succeed"), and
+      a new payload — accepted and silently dropped before — is now applied (`update_payload`).
+      `an_edited_job_survives_a_reload`. The reminder bound is checked under the **write** guard,
+      so two concurrent adds can no longer both see room. The systemd unit's `ExecStart` quotes
+      each word (`systemd_quote`: `"…"`, `\` and `"` escaped, `%` doubled) — an install path with a
+      space started the wrong program. **Still open:** the launchd plist (`cfg(target_os =
+      "macos")`, XML-escape its strings) and `windows_service` Running-after-exit — neither
+      compiles on this Linux host, so neither is changed blind.
 - [x] Config: `file_encryption_key` must pick one key source and stick to it; `SecureStore::set`
       must remove the file copy like `delete` does; `save_to` writes atomically (tmp + rename)
       because the daemon watches the file; document env precedence (`credentials.rs:639,224`,

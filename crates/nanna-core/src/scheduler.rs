@@ -550,56 +550,60 @@ impl Scheduler {
 
     /// Update a task's schedule
     ///
-    /// Returns `Ok(false)` when no task has `task_id`. The storage update is
-    /// best-effort and its failure is ignored.
+    /// Returns `Ok(false)` when no task has `task_id`. The new schedule is
+    /// persisted like a new task is (a failure is logged, as in
+    /// [`Self::add_task`]). It used to write only `next_run` — and an empty
+    /// `last_run` over the real one — so the new expression never reached the
+    /// store and a restart put the old schedule back.
     ///
     /// # Errors
     ///
     /// Returns the [`CronError`] from [`CronExpr::parse`] when `schedule` is not
     /// a valid cron expression; the task is left unchanged.
-    pub async fn update_schedule(
-        &self,
-        task_id: &str,
-        schedule: &str,
-    ) -> Result<bool, CronError> {
+    pub async fn update_schedule(&self, task_id: &str, schedule: &str) -> Result<bool, CronError> {
         let parsed = CronExpr::parse(schedule)?;
         let next_run = parsed.next_from_now();
-
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.get_mut(task_id) {
-            task.task_type = TaskType::Cron {
-                schedule: schedule.to_string(),
-                parsed: Some(Box::new(parsed)),
-                next_run,
-            };
-
-            // Update storage
-            if let Some(storage) = &self.storage {
-                let next_run_str = next_run.map(|dt| dt.to_rfc3339());
-                let _ = storage
-                    .cron_jobs()
-                    .update_last_run(task_id, "", next_run_str.as_deref())
-                    .await;
-            }
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let updated = self
+            .modify_task(task_id, |task| {
+                task.task_type = TaskType::Cron {
+                    schedule: schedule.to_string(),
+                    parsed: Some(Box::new(parsed)),
+                    next_run,
+                };
+            })
+            .await;
+        Ok(updated)
     }
 
-    /// Enable/disable a task (persisted)
-    pub async fn set_task_enabled(&self, task_id: &str, enabled: bool) {
-        // Update storage
-        if let Some(storage) = &self.storage
-            && let Err(e) = storage.cron_jobs().set_enabled(task_id, enabled).await {
-                warn!("Failed to update task {} enabled state: {}", task_id, e);
-            }
+    /// Enable/disable a task (persisted). `false` when no task has `task_id`.
+    pub async fn set_task_enabled(&self, task_id: &str, enabled: bool) -> bool {
+        self.modify_task(task_id, |task| task.enabled = enabled)
+            .await
+    }
 
+    /// Replace a task's payload (persisted). `false` when no task has
+    /// `task_id`.
+    pub async fn update_payload(&self, task_id: &str, payload: &str) -> bool {
+        self.modify_task(task_id, |task| task.payload = payload.to_string())
+            .await
+    }
+
+    /// Apply `change` to the task in RAM and persist the whole row, the same
+    /// upsert [`Self::add_task`] writes, so every field changed together
+    /// reaches the store together. `false` when no task has `task_id`.
+    async fn modify_task(&self, task_id: &str, change: impl FnOnce(&mut ScheduledTask)) -> bool {
         let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.get_mut(task_id) {
-            task.enabled = enabled;
+        let Some(task) = tasks.get_mut(task_id) else {
+            return false;
+        };
+        change(task);
+        let snapshot = task.clone();
+        drop(tasks);
+        debug_assert_eq!(snapshot.id, task_id, "the change kept the task's id");
+        if let Err(e) = self.persist_task(&snapshot).await {
+            warn!("Failed to persist the change to task {task_id}: {e}");
         }
+        true
     }
 
     /// Get all tasks
@@ -1378,6 +1382,52 @@ mod tests {
             after > before,
             "due tasks keep running beside a stuck heartbeat ({before} → {after})"
         );
+    }
+
+    /// An edited job must come back edited after a restart. `update_schedule`
+    /// wrote only `next_run` (and blanked `last_run`), so the new expression
+    /// never reached the store; a payload edit was not even attempted.
+    #[tokio::test]
+    async fn an_edited_job_survives_a_reload() {
+        let storage = Arc::new(Storage::in_memory().await.expect("in-memory storage"));
+        let scheduler = Scheduler::new(SchedulerConfig::default()).with_storage(storage.clone());
+        let task = Scheduler::cron_task("digest", "0 9 * * *", "old prompt").expect("cron");
+        let id = task.id.clone();
+        scheduler.add_task(task).await;
+
+        assert!(
+            scheduler
+                .update_schedule(&id, "30 18 * * *")
+                .await
+                .expect("valid")
+        );
+        assert!(scheduler.update_payload(&id, "new prompt").await);
+        assert!(scheduler.set_task_enabled(&id, false).await);
+        assert!(
+            !scheduler.set_task_enabled("no-such-job", true).await,
+            "unknown is not updated"
+        );
+        assert!(!scheduler.update_payload("no-such-job", "x").await);
+        assert!(
+            !scheduler
+                .update_schedule("no-such-job", "0 1 * * *")
+                .await
+                .expect("valid")
+        );
+
+        let reloaded = Scheduler::new(SchedulerConfig::default()).with_storage(storage);
+        reloaded.load_jobs().await.expect("load");
+        let job = reloaded
+            .get_task(&id)
+            .await
+            .expect("the job is still there");
+        assert!(
+            matches!(&job.task_type, TaskType::Cron { schedule, .. } if schedule == "30 18 * * *"),
+            "{:?}",
+            job.task_type
+        );
+        assert_eq!(job.payload, "new prompt");
+        assert!(!job.enabled);
     }
 
     #[tokio::test]
