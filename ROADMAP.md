@@ -8365,8 +8365,15 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       An allowlist on purpose: an unknown tool — a new skill, any MCP tool — counts as mutating.
       Cancellation still races the whole batch. The test pins both halves: a slow write finishes
       before the test starts in a mutating batch; reads still overlap.
-- [ ] Model routing strips the provider prefix but always calls the primary provider
+- [~] Model routing strips the provider prefix but always calls the primary provider
       (`loop_runner.rs:5361`); the per-member `ModelChain` replaces this path.
+      *(2026-09-26 — the harm stopped; the replacement is still Stage 3's.)* `route_model` now
+      skips a tier entry whose explicit prefix names a provider this agent's client is not
+      (`provider_serves`: `openai/gpt-4o` on an Anthropic client), warning once per process. Such
+      an entry was a guaranteed 4xx that `should_escalate` then retried on the primary — a wasted
+      round trip on every routed step and a false failure charged to the routed model. Bare names
+      are still the client's to resolve. **Still open:** actually calling the routed provider,
+      which is the per-member `ModelChain`. 1 test.
 - [~] *(2026-09-26 — the first finding, the high-severity one, is done; the rest of this line is
       open.)* **It was wider than Anthropic:** the agent's stream loop matched neither
       `StreamEvent::Error` *nor* `StreamEvent::RecoverableError` — both fell into `_ => {}` — so

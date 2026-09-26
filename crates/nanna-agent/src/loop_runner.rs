@@ -8488,6 +8488,21 @@ impl Agent {
                         continue;
                     }
 
+                if !provider_serves(self.llm.provider(), &tier_entry.model) {
+                    // Once per process: the config does not change between
+                    // iterations, so repeating this is noise.
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        warn!(
+                            model = %tier_entry.model,
+                            provider = ?self.llm.provider(),
+                            "Model routing: skipping an entry this agent's provider cannot serve"
+                        );
+                    }
+                    continue;
+                }
+
                 if tier_entry.model != self.config.model {
                     info!(
                         routed_model = %tier_entry.model,
@@ -9597,6 +9612,33 @@ Example: [{{"content": "User prefers dark mode", "category": "preference", "prov
     )
 }
 
+/// Whether a client for `provider` can serve the routing entry `model`.
+///
+/// Routing rewrites only the request's model name — the request still goes to
+/// this agent's one client — so an entry whose explicit prefix names ANOTHER
+/// provider (`openai/gpt-4o` on an Anthropic client) is a guaranteed 4xx. That
+/// failure was then escalated to the primary: every such routed step paid a
+/// wasted round trip plus a false failure against the routed model. Only the
+/// explicit prefixes are judged; a bare name is left to the client, as before.
+fn provider_serves(provider: nanna_llm::Provider, model: &str) -> bool {
+    use nanna_llm::Provider as P;
+    const PREFIXES: [(&str, &[P]); 5] = [
+        ("openrouter/", &[P::OpenRouter]),
+        ("github/", &[P::GitHubModels]),
+        ("ollama/", &[P::Ollama]),
+        ("anthropic/", &[P::Anthropic, P::ClaudeProxy]),
+        ("openai/", &[P::OpenAI]),
+    ];
+    PREFIXES
+        .iter()
+        .find(|(prefix, _)| {
+            model
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+        .is_none_or(|(_, served_by)| served_by.contains(&provider))
+}
+
 /// The structural complexity heuristic behind `Agent::classify_complexity`,
 /// over the context's messages and the run's iteration count.
 fn classify_messages(messages: &[AnthropicMessage], iterations: usize) -> TaskComplexity {
@@ -10435,6 +10477,37 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    /// A routing entry is judged by its explicit prefix only; a bare name is
+    /// the client's to resolve, as it always was.
+    #[test]
+    fn routing_skips_entries_another_provider_serves() {
+        use super::provider_serves;
+        use nanna_llm::Provider;
+        assert!(!provider_serves(Provider::Anthropic, "openai/gpt-4o"));
+        assert!(!provider_serves(
+            Provider::Anthropic,
+            "OpenRouter/anthropic/claude-haiku-4.5"
+        ));
+        assert!(!provider_serves(
+            Provider::Ollama,
+            "anthropic/claude-haiku-4-5"
+        ));
+        assert!(provider_serves(
+            Provider::OpenRouter,
+            "openrouter/anthropic/claude-haiku-4.5"
+        ));
+        assert!(provider_serves(
+            Provider::ClaudeProxy,
+            "anthropic/claude-sonnet-5"
+        ));
+        assert!(provider_serves(Provider::Ollama, "ollama/qwen3.5:9b"));
+        assert!(
+            provider_serves(Provider::Anthropic, "claude-haiku-4-5"),
+            "bare names pass"
+        );
+        assert!(provider_serves(Provider::Ollama, "qwen3.5:9b"));
+    }
+
     use super::*;
 
     fn tool_result_ids(message: &AnthropicMessage) -> Vec<String> {
