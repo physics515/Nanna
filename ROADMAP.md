@@ -8182,9 +8182,20 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
 - [ ] Scheduler: spawn the heartbeat executor like every other due task and start its timer with
       `interval_at(now + period)`; `nanna server` must not run a second scheduler over the same
       table (`nanna-core/src/scheduler.rs:752,768`, `src/commands/serve.rs:187`).
-- [ ] `llm_router::model_health` cooldown never expires (`retry_after` recomputed per call);
+- [x] `llm_router::model_health` cooldown never expires (`retry_after` recomputed per call);
       `dream_summarizer` double-waits and exits without waiting on the last round
       (`llm_router.rs:508`, `dream_summarizer.rs:228`).
+      *(2026-09-26)* **The cooldown was worse than "never expires": it was permanent.** A model in
+      cooldown is skipped, so no request could succeed and reset its failure streak — five
+      failures in a row (a short provider outage) retired a model until the daemon restarted,
+      whenever another model was healthy enough to take its place. `last_failure_epoch_ms` was
+      already tracked per model and simply never reached `ModelStatsSummary`; it does now, and
+      `cooldown_retry_after_ms(failures, last_failure)` anchors the deadline to it (30 s doubling,
+      10 min cap, unchanged). `a_cooldown_deadline_does_not_move_between_calls` pins the fix.
+      `dream_summarizer`: one wait per congested round via `next_wait_secs` — the provider's
+      `retry_after` now *replaces* the schedule instead of being slept on top of it, is bounded at
+      10 min (`RETRY_AFTER_MAX_SECS`), and the final round gives up without announcing a wait it
+      never takes. Same 7 attempts, same schedule. 3 tests.
 - [ ] `ipc::send_response` clones the `Sender` out of the guard before awaiting; `Action`'s
       `Debug` must redact `ValidateApiKey.key` and `ConfigAction::Set` secret values
       (`ipc.rs:396,664`, `protocol.rs:711`).
