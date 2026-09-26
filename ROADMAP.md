@@ -8132,9 +8132,13 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       before ack, own replay check, webhook-reply Markdown, Signal bypassing `process_message`,
       unbounded `AppState.agents`. What stays of `nanna-server` is decided when remote board access
       is designed (collaboration); until then it is not a supported surface.
-- [ ] `session.rs`: `update()` persisting the row but not the messages, `Fork` copying messages
+- [~] `session.rs`: `update()` persisting the row but not the messages, `Fork` copying messages
       only, `History` ignoring `before`, write guard held across `persist_message`,
       `recover_checkpoints` reporting success into a missing session.
+      *(2026-09-26 — `History`'s `before`.)* It was destructured as `before: _`, so a client
+      paging back was handed the newest page again every time — indistinguishable from "nothing
+      older". `history_page` returns the newest `limit` strictly older than the cursor message,
+      and an unknown cursor answers `cursor_not_found` rather than a page. 1 test.
 - [~] `control/session.rs`: sub-session timeout leaking `active_chats`, `KillSubSession` flag
       nobody reads, `SubSessionInfo` state overwritten on finish; `agent_service.rs` `try_write`
       dropping stream deltas into the recovery buffers.

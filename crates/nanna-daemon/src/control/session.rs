@@ -330,7 +330,9 @@ impl ControlPlane {
             SessionAction::Delete { id } => self.session_delete(id).await,
             SessionAction::DeleteAll => self.delete_all_sessions().await,
             SessionAction::Clear { id } => self.session_clear(id).await,
-            SessionAction::History { id, limit, before: _ } => self.session_history(id, limit).await,
+            SessionAction::History { id, limit, before } => {
+                self.session_history(id, limit, before).await
+            }
             SessionAction::Export { id, format } => self.session_export(id, format).await,
             SessionAction::Switch { id } => self.session_switch(client_id, id).await,
             SessionAction::GetRunState { id, light } => self.session_run_state(id, light).await,
@@ -613,21 +615,29 @@ Your task: {task}")
         body
     }
 
-    /// `SessionAction::History`: the newest `limit` messages (all by default), oldest first.
-    async fn session_history(&self, id: String, limit: Option<usize>) -> Value {
+    /// `SessionAction::History`: the newest `limit` messages (all by default),
+    /// oldest first — or, with `before`, the newest `limit` older than that
+    /// message (the next page back).
+    async fn session_history(
+        &self,
+        id: String,
+        limit: Option<usize>,
+        before: Option<String>,
+    ) -> Value {
         if let Some(session) = self.sessions.get(&id).await {
             // No limit = the WHOLE session. A long-horizon run's chat
             // page must be able to reload every message after
             // navigation — a silent default cap made remounts drop
             // history (observed live: a 4-hour mission showing only
             // its final slice).
-            let mut messages: Vec<_> = session.messages.iter()
-                .rev()
-                .take(limit.unwrap_or(usize::MAX))
-                .cloned()
-                .collect();
-            messages.reverse(); // Back to chronological order (oldest first)
-            json!({ "messages": messages })
+            let Some(page) = history_page(&session.messages, |m| &m.id, limit, before.as_deref())
+            else {
+                return json!({
+                    "error": "cursor_not_found",
+                    "message": format!("No message {} in session {id}", before.unwrap_or_default()),
+                });
+            };
+            json!({ "messages": page })
         } else {
             json!({ "error": "not_found", "message": format!("Session {} not found", id) })
         }
@@ -871,5 +881,58 @@ Your task: {task}")
         } else {
             json!({ "is_running": false })
         }
+    }
+}
+
+/// One page of a session's history: the newest `limit` of `items` (all by
+/// default), oldest first, or — with `before` — the newest `limit` strictly
+/// older than the message with that id. `None` for a `before` that names no
+/// message.
+///
+/// `before` used to be accepted and ignored (`before: _`), so a client paging
+/// back through a long session was handed the newest page again every time,
+/// indistinguishable from "there is nothing older".
+fn history_page<'a, T>(
+    items: &'a [T],
+    id_of: impl Fn(&T) -> &str,
+    limit: Option<usize>,
+    before: Option<&str>,
+) -> Option<&'a [T]> {
+    let end = match before {
+        None => items.len(),
+        Some(cursor) => items.iter().position(|item| id_of(item) == cursor)?,
+    };
+    let start = end.saturating_sub(limit.unwrap_or(usize::MAX));
+    debug_assert!(
+        start <= end && end <= items.len(),
+        "the page lies inside the history"
+    );
+    Some(&items[start..end])
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::history_page;
+
+    /// Paging back with `before` walks the history without repeats or gaps,
+    /// and an unknown cursor is an answer of its own, not the newest page.
+    #[test]
+    fn before_pages_back_through_the_history() {
+        let ids: Vec<String> = (1..=5).map(|n| format!("m{n}")).collect();
+        let page = |limit, before| {
+            history_page(&ids, String::as_str, limit, before)
+                .map(|p| p.iter().map(String::as_str).collect::<Vec<_>>())
+        };
+        assert_eq!(page(Some(2), None), Some(vec!["m4", "m5"]));
+        assert_eq!(page(Some(2), Some("m4")), Some(vec!["m2", "m3"]));
+        assert_eq!(page(Some(2), Some("m2")), Some(vec!["m1"]));
+        assert_eq!(page(Some(2), Some("m1")), Some(vec![]), "nothing older");
+        assert_eq!(page(None, Some("m3")), Some(vec!["m1", "m2"]));
+        assert_eq!(
+            page(None, None).map(|p| p.len()),
+            Some(5),
+            "no limit = everything"
+        );
+        assert_eq!(page(Some(2), Some("gone")), None);
     }
 }
