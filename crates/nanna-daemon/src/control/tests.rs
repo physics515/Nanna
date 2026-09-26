@@ -2231,3 +2231,78 @@ async fn a_clear_storage_refused_is_reported_not_claimed() {
         "the refused memory is still visible, as it is still on disk"
     );
 }
+
+/// `task.verdicts` reaches the rollup from the wire, and a window outside the
+/// store's bound is refused as a reply rather than tripping its assert.
+#[tokio::test]
+async fn task_verdicts_answers_the_rollup_over_ipc() {
+    let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+    storage
+        .members()
+        .create(nanna_storage::NewMember {
+            id: "agent-a".to_string(),
+            name: "Agent A".to_string(),
+            avatar: None,
+            kind: nanna_storage::MemberKind::Agent,
+            owner_kind: nanna_storage::MemberOwner::Workspace,
+            owner_id: None,
+            status: nanna_storage::MemberStatus::Idle,
+            profile: serde_json::json!({}),
+        })
+        .await
+        .expect("member");
+    let id = storage
+        .tasks()
+        .create(nanna_storage::NewTask {
+            scope: "workspace".to_string(),
+            scope_id: Some("ws1".to_string()),
+            title: "card".to_string(),
+            priority: 3,
+            labels: vec!["rust".to_string()],
+            assignee: Some("agent-a".to_string()),
+            ..nanna_storage::NewTask::default()
+        })
+        .await
+        .expect("card")
+        .id;
+    storage
+        .tasks()
+        .log_activity(
+            id,
+            Some("harness"),
+            "acceptance_checked",
+            Some(serde_json::json!({ "passed": true })),
+        )
+        .await
+        .expect("verdict");
+
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.storage = Some(storage);
+    let cp = Arc::new(cp);
+    let ask = |raw: Value| {
+        let cp = Arc::clone(&cp);
+        async move {
+            let action: Action = serde_json::from_value(raw).expect("parses");
+            cp.handle("test", action).await
+        }
+    };
+
+    let resp = ask(serde_json::json!({ "type": "task", "action": "verdicts" })).await;
+    assert_eq!(
+        resp["window"],
+        crate::protocol::TASK_VERDICT_WINDOW_DEFAULT,
+        "{resp}"
+    );
+    let verdicts = resp["verdicts"].as_array().expect("verdicts array");
+    assert_eq!(verdicts.len(), 2, "overall + the one label: {resp}");
+    assert!(
+        verdicts
+            .iter()
+            .any(|v| v["member_id"] == "agent-a" && v["label"] == "rust" && v["passed"] == 1),
+        "{resp}"
+    );
+
+    let refused =
+        ask(serde_json::json!({ "type": "task", "action": "verdicts", "window": 0 })).await;
+    assert_eq!(refused["error"], "bad_window", "{refused}");
+}

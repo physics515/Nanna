@@ -7906,7 +7906,24 @@ as its turn (`TurnAdmission`, scope default `session`).
       budget beside `dreaming.compression`. Not a dream on/off switch: dreaming has none, by design
       (owner 2026-09-23) — the GUI's `set_dreaming_enabled` and `set_similarity_threshold` no-ops
       are deleted in Stage 4.
-- [ ] Per-member-per-label verdict rollup (a query over `task_activity` is enough) for the router.
+- [x] Per-member-per-label verdict rollup (a query over `task_activity` is enough) for the router.
+      *(2026-09-26)* **"A query over `task_activity` is enough" was one column short.** A verdict
+      row's `actor` is whoever *ran* the check (`harness`, `gui`), never the member being judged,
+      and joining to `tasks.assignee` reads the assignee *now* — wrong exactly when it matters,
+      because a failed verdict sends the card back to the router, which may reassign it, and the
+      second member would inherit the first one's failure. Migration `021` adds
+      `task_activity.assignee`, stamped by `log_activity` **inside the INSERT**
+      (`(SELECT assignee FROM tasks WHERE id = ?1)`), so no writer supplies it and no re-assignment
+      can land between a read and the write; pre-021 rows stay NULL and are left out rather than
+      guessed. `TaskRepository::verdict_rollup(window)` → `VerdictTally { member_id, label, passed,
+      failed }`: `label: None` is the member's total, a multi-label card counts once per label, and
+      `unknown` verdicts or rows without a boolean `passed` say nothing about a member and are
+      skipped. Bounded to the most recent `window` verdicts (`VERDICT_WINDOW_MAX` 100 000). Reachable
+      as IPC `task.verdicts {window?}` (default 500; out-of-range is a `bad_window` reply, not the
+      store's assert) so it is not a query with no caller before Stage 2's router exists. The
+      load-bearing test is `a_verdict_stays_with_the_member_who_was_judged`. 5 tests.
+      **Note for the salvage item below:** `recovery.rs` copies `task_activity` positionally, so
+      this appended column joins the tables that item already covers.
 
 **Stage 2 — the router as a daemon role.**
 - [ ] `RouterService` per workspace subscribed to the bus; decisions are small structured outputs

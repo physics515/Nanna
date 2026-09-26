@@ -82,10 +82,14 @@ pub enum Action {
 // Task Actions (P15 store + P14 long-horizon runs)
 // =============================================================================
 
+/// Verdicts `task.verdicts` scans when the caller names no window: enough
+/// recent history to tell members apart on the labels they share, small enough
+/// to answer from one indexed scan in well under a frame.
+pub const TASK_VERDICT_WINDOW_DEFAULT: usize = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum TaskAction {
-    /// List tasks in a scope
+pub enum TaskAction {    /// List tasks in a scope
     List {
         #[serde(default)]
         scope: Option<String>,
@@ -197,6 +201,13 @@ pub enum TaskAction {
         scope: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
+    },
+    /// Each member's acceptance verdicts per label and overall, over the most
+    /// recent `window` of them (default [`TASK_VERDICT_WINDOW_DEFAULT`]) — the
+    /// history the P25 router reads to choose a member.
+    Verdicts {
+        #[serde(default)]
+        window: Option<usize>,
     },
 }
 

@@ -22,6 +22,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("018_task_deadline", MIGRATION_018),
     ("019_task_thread", MIGRATION_019),
     ("020_task_time_announcements", MIGRATION_020),
+    ("021_task_activity_assignee", MIGRATION_021),
 ];
 
 const MIGRATION_001: &str = r"
@@ -677,6 +678,24 @@ const MIGRATION_020: &str = r"
 ALTER TABLE tasks ADD COLUMN due_announced_at TEXT;
 
 ALTER TABLE tasks ADD COLUMN overdue_announced_at TEXT;
+";
+
+const MIGRATION_021: &str = r"
+-- P25 Stage 1: the router reads each member's verdict history per label, and a
+-- verdict belongs to the member who was assigned WHEN it was judged. The
+-- current assignee is the wrong answer exactly when it matters: a failed
+-- verdict sends the card back to the router, which may hand it to someone
+-- else, and reading the assignee at query time would charge the first
+-- member's failure to the second.
+--
+-- So every activity row carries the card's assignee at the moment it was
+-- written. The store stamps it inside the INSERT itself, never a caller, so no
+-- writer can forget it or name the wrong member. Rows written before this
+-- migration are NULL, which reads correctly: their attribution is unknown, and
+-- the rollup leaves them out rather than guessing.
+ALTER TABLE task_activity ADD COLUMN assignee TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_task_activity_action ON task_activity(action, assignee);
 ";
 
 /// Lexer state while splitting a migration.
