@@ -27,7 +27,7 @@ pub mod mcp;
 
 // Re-export workspace crate for convenience
 pub use nanna_workspace;
-pub use nanna_workspace::{Workspace, WorkspaceFiles, WorkspaceManager, WorkspaceTemplate};
+pub use nanna_workspace::{Workspace, WorkspaceFiles, WorkspaceTemplate};
 
 pub use cancel::CancelToken;
 pub use context::{

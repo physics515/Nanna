@@ -8204,8 +8204,12 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       deleted only because its deadlock was the finding in hand; it belongs on this list.
       *(later)* `McpManager` (the standalone multi-server manager in `nanna-mcp`'s adapter) and
       `VectorStore::re_embed_mismatched` (with `preview`, its only helper) — no callers. **Still
-      open:** `MultiAgent`, the Rust built-in tools, the Deno path, `WorkspaceManager` (still
-      re-exported by `nanna-agent`), `tool_stats` per-session half, `MessageQueue`.
+      open:** `MultiAgent`, the Rust built-in tools, the Deno path, `tool_stats` per-session half
+      (its totals are shown on the GUI's tool-stats page, LLM time always 0 — a GUI change),
+      `MessageQueue` (its `QueueStats` is embedded in the channel status wire shape).
+      *(later)* `WorkspaceManager` (the multi-workspace switcher in `nanna-workspace`, 160 lines
+      + its test, re-exported by `nanna-agent`) — no caller; `Workspace`/`WorkspaceConfig`,
+      which the context and the root crate use, stay.
 
 **Stage 1 — store, memory, storage:**
 - [x] `VectorStore::update_content` must also clear `memories.embedding`/`embedding_model` and
