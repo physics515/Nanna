@@ -8210,9 +8210,20 @@ P25. Grouped by the stage that owns the path; "delete" lines are here so nobody 
       `retry_after` now *replaces* the schedule instead of being slept on top of it, is bounded at
       10 min (`RETRY_AFTER_MAX_SECS`), and the final round gives up without announcing a wait it
       never takes. Same 7 attempts, same schedule. 3 tests.
-- [ ] `ipc::send_response` clones the `Sender` out of the guard before awaiting; `Action`'s
+- [x] `ipc::send_response` clones the `Sender` out of the guard before awaiting; `Action`'s
       `Debug` must redact `ValidateApiKey.key` and `ConfigAction::Set` secret values
       (`ipc.rs:396,664`, `protocol.rs:711`).
+      *(2026-09-26)* **Three leaks, not two:** the IPC layer logs every request as `{:?}` at debug
+      level, and that printed the key under validation, a `config.set` of any secret path —
+      including a whole section like `path: "llm"` with `api_key` inside — and **a whole imported
+      config**. The key is now a `SecretInput` newtype (`serde(transparent)`, so the wire is
+      byte-identical; `Debug` prints `[redacted N bytes]`; the handler takes `expose()`), and
+      `ConfigAction` has a hand-written `Debug` that walks the value and redacts every string at a
+      path `nanna_config::Config::names_a_secret` recognises — the same catalogue a save strips,
+      so there is no second list to drift. Non-secret values still print. `send_response` now
+      clones the sender and releases the clients guard before the bounded send, so one client
+      that stops reading no longer blocks every connect and disconnect. 1 test covering all four
+      shapes plus wire round-trip.
 - [ ] `SchedulerAction::Update` reports success for unknown ids; `reminder_service` bound check
       under a read guard; `windows_service` reports Running after an early daemon exit; service
       plist/unit paths unquoted (`control/scheduler.rs:37`, `reminder_service.rs:218`,
